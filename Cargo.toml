@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/splayed-format",
+    "crates/splayed-codec",
+    "crates/splayed-core",
+    "crates/splayed-arrow",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+splayed-format = { path = "crates/splayed-format" }
+splayed-codec = { path = "crates/splayed-codec" }
+splayed-core = { path = "crates/splayed-core" }
+splayed-arrow = { path = "crates/splayed-arrow" }
+
+# Arrow stack (pinned for reproducibility)
+arrow = "53"
+arrow-array = "53"
+arrow-schema = "53"
+half = "2"

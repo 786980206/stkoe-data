@@ -1,0 +1,12 @@
+[package]
+name = "splayed-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Encoding (PLAIN/DELTA/RLE/BITPACK) and compression (NONE/ZSTD/LZ4) for Splayed V1"
+
+[dependencies]
+splayed-format.workspace = true
+zstd = "0.13"
+bytemuck = "1"

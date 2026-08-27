@@ -1,0 +1,13 @@
+[package]
+name = "splayed-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Core read/write engine for Splayed V1 (reader, field_writer, dataset, scanner)"
+
+[dependencies]
+splayed-format.workspace = true
+splayed-codec.workspace = true
+memmap2 = "0.9"
+bytemuck = "1"

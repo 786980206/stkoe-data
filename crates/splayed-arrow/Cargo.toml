@@ -1,0 +1,16 @@
+[package]
+name = "splayed-arrow"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Arrow exchange layer for Splayed V1 (create_meta, create_table, update_table)"
+
+[dependencies]
+splayed-format.workspace = true
+splayed-core.workspace = true
+splayed-codec.workspace = true
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+half = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "splayed-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Binary format definitions for Splayed V1 (META + FIELD headers, types, NULL encoding)"
+
+[dependencies]
+bytemuck = "1"
