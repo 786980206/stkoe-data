@@ -5,11 +5,17 @@
 //! - `create_table` — one-shot create_meta + create_field + update_field.
 //! - `update_table` — update existing fields from an Arrow RecordBatch.
 //!
-//! Also provides Splayed ↔ Arrow conversion (plan §10.1).
+//! Also provides Splayed ↔ Arrow conversion (plan §10.1):
+//! - `column_view_to_arrow` — ColumnView → Arrow ArrayRef (NULL/NaN semantics)
+//! - `arrow_to_splayed_type` / `splayed_to_arrow_type` — type mapping
 
 pub mod arrow_conv;
 pub mod meta_writer;
 pub mod table_writer;
 
+pub use arrow_conv::{
+    arrow_to_splayed_type, arrow_time_type, arrow_value_to_raw, column_view_to_arrow,
+    splayed_to_arrow_type,
+};
 pub use meta_writer::{create_meta, CreateMetaError};
 pub use table_writer::{create_table, update_table, TableError};
