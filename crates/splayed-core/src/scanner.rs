@@ -90,6 +90,10 @@ pub enum Filter {
     Equal { field: String, value: FilterValue },
     /// `field != value`
     NotEqual { field: String, value: FilterValue },
+    /// `field IS NULL` — matches the type's NULL sentinel (null cells only).
+    IsNull { field: String },
+    /// `field IS NOT NULL` — matches non-NULL cells.
+    IsNotNull { field: String },
 }
 
 /// A comparison value for filtering.  Typed to match the field's DataType.
@@ -735,7 +739,9 @@ impl Filter {
             | Self::LessThan { field, .. }
             | Self::LessOrEqual { field, .. }
             | Self::Equal { field, .. }
-            | Self::NotEqual { field, .. } => field,
+            | Self::NotEqual { field, .. }
+            | Self::IsNull { field }
+            | Self::IsNotNull { field } => field,
         }
     }
 }
@@ -867,6 +873,9 @@ fn simd_batch_filter_f64(data: &[u8], threshold: f64, row_count: usize, filter: 
         Filter::LessOrEqual { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v <= t),
         Filter::Equal { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v == t),
         Filter::NotEqual { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v != t),
+        // Only reachable for comparison filters (extract_f64_threshold filters
+        // out the NULL-check variants before dispatching here).
+        Filter::IsNull { .. } | Filter::IsNotNull { .. } => unreachable!("null-check is scalar"),
     }
 }
 
@@ -879,21 +888,30 @@ fn simd_batch_filter_i64(data: &[u8], threshold: i64, row_count: usize, filter: 
         Filter::LessOrEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v <= t),
         Filter::Equal { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v == t),
         Filter::NotEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v != t),
+        Filter::IsNull { .. } | Filter::IsNotNull { .. } => unreachable!("null-check is scalar"),
     }
 }
 
 fn filter_passes(filter: &Filter, val: &splayed_format::RawValue) -> bool {
-    // NULL values never pass comparison filters.
-    if val.is_null() {
-        return false;
-    }
     match filter {
-        Filter::GreaterThan { value, .. } => compare(val, value).map_or(false, |c| c > 0),
-        Filter::GreaterOrEqual { value, .. } => compare(val, value).map_or(false, |c| c >= 0),
-        Filter::LessThan { value, .. } => compare(val, value).map_or(false, |c| c < 0),
-        Filter::LessOrEqual { value, .. } => compare(val, value).map_or(false, |c| c <= 0),
-        Filter::Equal { value, .. } => compare(val, value).map_or(false, |c| c == 0),
-        Filter::NotEqual { value, .. } => compare(val, value).map_or(false, |c| c != 0),
+        // NULL checks inspect the NULL sentinel directly.
+        Filter::IsNull { .. } => val.is_null(),
+        Filter::IsNotNull { .. } => !val.is_null(),
+        // NULL values never pass value-comparison filters.
+        _ => {
+            if val.is_null() {
+                return false;
+            }
+            match filter {
+                Filter::GreaterThan { value, .. } => compare(val, value).map_or(false, |c| c > 0),
+                Filter::GreaterOrEqual { value, .. } => compare(val, value).map_or(false, |c| c >= 0),
+                Filter::LessThan { value, .. } => compare(val, value).map_or(false, |c| c < 0),
+                Filter::LessOrEqual { value, .. } => compare(val, value).map_or(false, |c| c <= 0),
+                Filter::Equal { value, .. } => compare(val, value).map_or(false, |c| c == 0),
+                Filter::NotEqual { value, .. } => compare(val, value).map_or(false, |c| c != 0),
+                Filter::IsNull { .. } | Filter::IsNotNull { .. } => unreachable!("handled above"),
+            }
+        }
     }
 }
 

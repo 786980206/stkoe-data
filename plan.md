@@ -890,22 +890,30 @@ Layer 1   SplayedDatasetProvider 单个 dataset 目录（对标一个 parquet �
 | 谓词 | 处理 | 标记 |
 | --- | --- | --- |
 | `sym = 'X'`（单个已知 SYM） | → `SymbolSelection` | `Exact` |
+| `sym IN ('A','B',...)`（非取反） | 已知 SYM 并集 → `SymbolSelection`；字面量全未知 → 该分区 0 行 | `Exact` |
+| `sym = 'X'` / `sym IN (...)`，同一合取中出现 ≥2 个 SYM 过滤表达式 | 选择只能表达并集，交集交由 DF 重滤 | `Inexact` |
 | `sym = '<未知>'` | 该分区返回 0 行（不报错） | `Exact` |
-| 同一合取中出现多个不同 SYM 字面量 | 选择只能表达并集，交集交由 DF 重滤 | `Inexact` |
 | `time` 比较 | → `TimeRange`（半开区间，溢出用 saturating） | `Exact` |
 | FIELD 值比较（可转换） | → `Filter`，**合取全部生效** | `Exact` |
-| 其它（`IN`、`IS NULL`、cast、非列比较） | 不下推，DF 自行过滤 | `Unsupported` |
+| `field IS [NOT] NULL` | → `Filter::IsNull / IsNotNull`（NULL 哨兵匹配） | `Exact` |
+| 恒等 `CAST(col AS 同型)` 包裹的列比较 | 剥除 cast 后按普通比较下推；非恒等 cast 不下推 | `Exact` / `Unsupported` |
+| 其它（`IS NULL` 于非空列、非列比较、`NOT IN`） | 不下推，DF 自行过滤 | `Unsupported` |
 
 执行计划：`SplayedScanExec`（单分区叶子，`UnknownPartitioning(1)`，有界 mpsc
 通道 + `spawn_blocking` 流式产出，`LIMIT` 提前截断）与 `SplayedTableScanExec`
 （`UnknownPartitioning(plans.len())`，每个物理分区 = 一个输出分区）。
 没有命中分区时返回 `EmptyExec`（如 `COUNT(*)` → 0）。
 
+有序性：单个 dataset 的 Scanner 按 `(SYM, TIME)` 升序产出（META 的 symbols 与
+time_axis 均升序，range 依 SYM INDEX 顺序生成）。因此 Layer 1 在
+`SymbolSelection::All`（无 SYM 过滤，避免过滤字面量顺序打乱）且投影保留
+`sym`/`time` 两列时，通过 `EquivalenceProperties` 声明 `(sym, time)` 有序，
+使 `ORDER BY sym, time`（如 TOP-N）可免排序；SYM 过滤与非全序多分区情形不声明。
+
 重点支持：Projection Pushdown、Predicate Pushdown、SYM pruning、TIME pruning、
 Batch scan、LIMIT。
 
-未来（暂缓）：`sym IN (...)`、`IS NULL`/`IS NOT NULL`、cast 剥离、零拷贝
-Arrow 转换、`INSERT INTO` 写回、通过 EquivalenceProperties 声明 TIME 有序。
+未来（暂缓）：零拷贝 Arrow 转换、`INSERT INTO` 写回（`update_table`）。
 
 ## 10.4 DuckDB 集成
 

@@ -305,3 +305,112 @@ async fn contradictory_sym_filters_empty() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Deferred items now implemented: sym IN (...), IS [NOT] NULL, identity casts
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_filter_known_symbols() {
+    let dir = temp_dir("in_known");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym IN ('SYM02')").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 5); // SYM02 only
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Unknown literals in an IN list must not leak rows from the known ones.
+#[tokio::test]
+async fn in_filter_mixed_unknown() {
+    let dir = temp_dir("in_mixed");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym IN ('SYM01', 'NOPE')").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 5); // SYM01 only — 'NOPE' yields nothing
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// An IN list with only unknown symbols must return 0 rows.
+#[tokio::test]
+async fn in_filter_all_unknown_empty() {
+    let dir = temp_dir("in_unknown");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym IN ('NOPE1','NOPE2')").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A batch whose `close` column contains a NULL (Float64 canonical NaN).
+fn make_null_close_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", ArrowDT::Date32, false),
+        Field::new("sym", ArrowDT::Utf8, false),
+        Field::new("close", ArrowDT::Float64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(vec![0, 1, 2])),
+            Arc::new(StringArray::from(vec![Some("SYM01"), Some("SYM01"), Some("SYM01")])),
+            Arc::new(Float64Array::from(vec![Some(100.0), None, Some(102.0)])),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn is_null_filter() {
+    let dir = temp_dir("is_null");
+    create_table(&dir, &make_null_close_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE close IS NULL").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 1);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn is_not_null_filter() {
+    let dir = temp_dir("is_not_null");
+    create_table(&dir, &make_null_close_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE close IS NOT NULL").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 2); // skips the NULL row
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// An identity cast (`CAST(close AS DOUBLE)` on a Float64 column) must still
+/// push down as a plain value filter.
+#[tokio::test]
+async fn identity_cast_filter() {
+    let dir = temp_dir("cast_id");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches =
+        run_query(&dir, "SELECT close FROM splayed WHERE CAST(close AS DOUBLE) > 103").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // close > 103: SYM01 day 4 (104) → 1; SYM02 all of 200-204 → 5. Total 6.
+    assert_eq!(total_rows, 6);
+    let batch = &batches[0];
+    let close = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    for i in 0..batch.num_rows() {
+        assert!(close.value(i) > 103.0);
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}

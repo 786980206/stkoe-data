@@ -54,42 +54,131 @@ pub(crate) struct PushdownPlan {
     pub value_filters: Vec<SplayedFilter>,
 }
 
-/// A literal `Column <op> Literal` (either operand order).
-fn binary_col_literal(expr: &Expr) -> Option<(String, ScalarValue, bool, Operator)> {
-    let Expr::BinaryExpr(bin) = expr else {
-        return None;
-    };
-    match (bin.left.as_ref(), bin.right.as_ref()) {
-        (Expr::Column(c), Expr::Literal(v, _)) => {
-            Some((c.name.clone(), v.clone(), false, bin.op.clone()))
-        }
-        (Expr::Literal(v, _), Expr::Column(c)) => {
-            Some((c.name.clone(), v.clone(), true, bin.op.clone()))
+/// The name of the column behind an expression, stripping *identity* casts
+/// (cast target == the column's declared type). Non-identity casts return
+/// `None` so they are never pushed down.
+fn column_ref<'a>(expr: &'a Expr, schema: &ArrowSchema) -> Option<&'a str> {
+    match expr {
+        Expr::Column(c) => Some(&c.name),
+        Expr::Cast(cast) => {
+            if let Expr::Column(c) = cast.expr.as_ref() {
+                let is_identity = schema
+                    .field_with_name(&c.name)
+                    .map(|f| f.data_type() == cast.field.data_type())
+                    .unwrap_or(false);
+                is_identity.then_some(c.name.as_str())
+            } else {
+                None
+            }
         }
         _ => None,
     }
 }
 
+/// A column reference (`Ok`) or a literal (`Err`), cast-stripped.
+fn col_or_literal(expr: &Expr, schema: &ArrowSchema) -> Option<Result<String, ScalarValue>> {
+    if let Some(c) = column_ref(expr, schema) {
+        return Some(Ok(c.to_string()));
+    }
+    match expr {
+        Expr::Literal(v, _) => Some(Err(v.clone())),
+        _ => None,
+    }
+}
+
+/// A literal `Column <op> Literal` (either operand order), with identity casts
+/// stripped from the column side.
+fn binary_col_literal(
+    expr: &Expr,
+    schema: &ArrowSchema,
+) -> Option<(String, ScalarValue, bool, Operator)> {
+    let Expr::BinaryExpr(bin) = expr else {
+        return None;
+    };
+    let l = col_or_literal(bin.left.as_ref(), schema)?;
+    let r = col_or_literal(bin.right.as_ref(), schema)?;
+    match (l, r) {
+        (Ok(col), Err(v)) => Some((col, v, false, bin.op.clone())),
+        (Err(v), Ok(col)) => Some((col, v, true, bin.op.clone())),
+        _ => None,
+    }
+}
+
+/// The symbol literals referenced by a sym filter expression: `sym = 'X'` or a
+/// non-negated `sym IN ('A', ...)`. Returns `None` for anything else.
+fn sym_literals(expr: &Expr, schema: &ArrowSchema) -> Option<Vec<String>> {
+    if let Some((col, lit, _, op)) = binary_col_literal(expr, schema) {
+        if col != "sym" || op != Operator::Eq {
+            return None;
+        }
+        return scalar_to_string(&lit).map(|s| vec![s]);
+    }
+    if let Expr::InList(in_list) = expr {
+        if in_list.negated || column_ref(in_list.expr.as_ref(), schema)? != "sym" {
+            return None;
+        }
+        let mut out = Vec::with_capacity(in_list.list.len());
+        for e in &in_list.list {
+            let Expr::Literal(v, _) = e else { return None; };
+            out.push(scalar_to_string(v)?);
+        }
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// If `expr` is `IS NULL` / `IS NOT NULL` on a FIELD column, return the field
+/// name and whether it tests for NULL. `time`/`sym` are non-nullable and are
+/// left to DataFusion.
+fn null_check_field(expr: &Expr, schema: &ArrowSchema) -> Option<(String, bool)> {
+    let (inner, is_null) = match expr {
+        Expr::IsNull(inner) => (inner, true),
+        Expr::IsNotNull(inner) => (inner, false),
+        _ => return None,
+    };
+    let col = column_ref(inner, schema)?;
+    if col == "time" || col == "sym" || schema.field_with_name(col).is_err() {
+        return None;
+    }
+    Some((col.to_string(), is_null))
+}
+
 /// Analyze one filter expression against this dataset's schema and symbol set.
 fn analyze(expr: &Expr, schema: &ArrowSchema, known_symbols: &HashSet<String>) -> Analysis {
-    let Some((col, lit, swapped, op)) = binary_col_literal(expr) else {
+    // sym IN (...): a single union → selection (drop literals unknown to this
+    // dataset; if none remain, the scan contributes zero rows).
+    if let Some(literals) = sym_literals(expr, schema) {
+        let known: Vec<String> = literals
+            .into_iter()
+            .filter(|s| known_symbols.contains(s))
+            .collect();
+        return if known.is_empty() {
+            Analysis::SymUnknown
+        } else {
+            Analysis::Applied(Fragment::Symbols(known))
+        };
+    }
+
+    // field IS [NOT] NULL → NULL-sentinel value filter.
+    if let Some((field, is_null)) = null_check_field(expr, schema) {
+        let f = if is_null {
+            SplayedFilter::IsNull { field }
+        } else {
+            SplayedFilter::IsNotNull { field }
+        };
+        return Analysis::Applied(Fragment::Value(f));
+    }
+
+    let Some((col, lit, swapped, op)) = binary_col_literal(expr, schema) else {
         return Analysis::NotPushdownable;
     };
     let op = if swapped { invert_op(&op) } else { op };
 
     match col.as_str() {
         "sym" => {
-            if op != Operator::Eq {
-                return Analysis::NotPushdownable;
-            }
-            let Some(s) = scalar_to_string(&lit) else {
-                return Analysis::NotPushdownable;
-            };
-            if known_symbols.contains(&s) {
-                Analysis::Applied(Fragment::Symbols(vec![s]))
-            } else {
-                Analysis::SymUnknown
-            }
+            // Non-Eq sym comparisons (`!=`, `<`, ...) are not pushable.
+            Analysis::NotPushdownable
         }
         "time" => {
             let Some(t) = extract_int_from_scalar(&lit) else {
@@ -128,21 +217,15 @@ pub(crate) fn classify(
     schema: &ArrowSchema,
     known_symbols: &HashSet<String>,
 ) -> Vec<TableProviderFilterPushDown> {
-    // If one conjunction mentions more than one distinct symbol, the symbol
-    // selection can only express a *union*, but the conjunction needs an
-    // *intersection* — so DataFusion must re-apply those filters.
-    let distinct_syms: HashSet<String> = filters
+    // If a conjunction carries more than one sym filter, the symbol selection
+    // can only express one *union*, but the conjunction needs an *intersection*
+    // of per-filter unions — so DataFusion must re-apply those filters. A
+    // single `sym IN ('A','B')` is still one union and stays Exact.
+    let sym_filter_count = filters
         .iter()
-        .filter_map(|f| {
-            let (col, lit, _, op) = binary_col_literal(f)?;
-            if col == "sym" && op == Operator::Eq {
-                scalar_to_string(&lit)
-            } else {
-                None
-            }
-        })
-        .collect();
-    let multi_sym = distinct_syms.len() > 1;
+        .filter(|f| sym_literals(f, schema).is_some())
+        .count();
+    let multi_sym = sym_filter_count > 1;
 
     filters
         .iter()
@@ -381,5 +464,152 @@ mod tests {
             Some(SymbolSelection::Symbols(v)) => assert!(v.is_empty()),
             other => panic!("expected Some(Symbols([])), got {other:?}"),
         }
+    }
+
+    // --- sym IN (...) pushdown ---
+
+    #[test]
+    fn classify_in_single_filter_exact() {
+        let s = schema();
+        // A single IN is one union — must stay Exact (not Inexact).
+        let f = col("sym").in_list(vec![lit("SYM01"), lit("SYM02")], false);
+        let v = classify(&[&f], &s, &known());
+        assert_eq!(v[0], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn classify_in_with_unknown_literal_exact() {
+        let s = schema();
+        let f = col("sym").in_list(vec![lit("SYM01"), lit("NOPE")], false);
+        let v = classify(&[&f], &s, &known());
+        assert_eq!(v[0], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn classify_in_all_unknown_exact() {
+        let s = schema();
+        let f = col("sym").in_list(vec![lit("NOPE1"), lit("NOPE2")], false);
+        let v = classify(&[&f], &s, &known());
+        assert_eq!(v[0], TableProviderFilterPushDown::Exact);
+    }
+
+    #[test]
+    fn classify_in_plus_eq_inexact() {
+        let s = schema();
+        // Two sym filters in one conjunction → intersection needed → Inexact.
+        let f1 = col("sym").in_list(vec![lit("SYM01"), lit("SYM02")], false);
+        let f2 = col("sym").eq(lit("SYM01"));
+        let v = classify(&[&f1, &f2], &s, &known());
+        assert_eq!(v[0], TableProviderFilterPushDown::Inexact);
+        assert_eq!(v[1], TableProviderFilterPushDown::Inexact);
+    }
+
+    #[test]
+    fn classify_negated_in_unsupported() {
+        let s = schema();
+        let f = col("sym").in_list(vec![lit("SYM01")], true); // NOT IN
+        let v = classify(&[&f], &s, &known());
+        assert_eq!(v[0], TableProviderFilterPushDown::Unsupported);
+    }
+
+    #[test]
+    fn parse_in_known_symbols() {
+        let s = schema();
+        let f = col("sym").in_list(vec![lit("SYM02"), lit("SYM01")], false);
+        let p = parse_filters(&[f], &s, &known());
+        match p.symbols {
+            Some(SymbolSelection::Symbols(v)) => {
+                // Both literals known → both selected (union).
+                assert_eq!(v.len(), 2);
+            }
+            other => panic!("expected Some(Symbols(..)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_in_mixed_unknown_drops_unknown() {
+        let s = schema();
+        let f = col("sym").in_list(vec![lit("SYM01"), lit("NOPE")], false);
+        let p = parse_filters(&[f], &s, &known());
+        match p.symbols {
+            Some(SymbolSelection::Symbols(v)) => {
+                assert_eq!(v, vec!["SYM01"]);
+            }
+            other => panic!("expected Some(Symbols(..)), got {other:?}"),
+        }
+    }
+
+    // --- field IS [NOT] NULL ---
+
+    #[test]
+    fn parse_is_null() {
+        let s = schema();
+        let f = col("close").is_null();
+        let p = parse_filters(&[f], &s, &known());
+        assert_eq!(p.value_filters.len(), 1);
+        assert!(matches!(
+            p.value_filters[0],
+            SplayedFilter::IsNull { .. }
+        ));
+    }
+
+    #[test]
+    fn parse_is_not_null() {
+        let s = schema();
+        let f = col("close").is_not_null();
+        let p = parse_filters(&[f], &s, &known());
+        assert_eq!(p.value_filters.len(), 1);
+        assert!(matches!(
+            p.value_filters[0],
+            SplayedFilter::IsNotNull { .. }
+        ));
+    }
+
+    #[test]
+    fn is_null_on_sym_not_pushable() {
+        let s = schema();
+        let f = col("sym").is_null();
+        assert!(matches!(analyze(&f, &s, &known()), Analysis::NotPushdownable));
+        let p = parse_filters(&[f], &s, &known());
+        assert!(p.value_filters.is_empty());
+    }
+
+    // --- identity cast stripping ---
+
+    #[test]
+    fn identity_cast_value_filter_pushable() {
+        let s = schema();
+        // CAST(close AS DOUBLE) > 100 — close is already Float64 (identity).
+        let cast = Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(col("close")),
+            A::Float64,
+        ));
+        let f = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+            Box::new(cast),
+            Operator::Gt,
+            Box::new(lit(100.0f64)),
+        ));
+        let p = parse_filters(&[f], &s, &known());
+        assert_eq!(p.value_filters.len(), 1);
+        assert!(matches!(
+            p.value_filters[0],
+            SplayedFilter::GreaterThan { .. }
+        ));
+    }
+
+    #[test]
+    fn non_identity_cast_not_pushable() {
+        let s = schema();
+        // CAST(close AS INT) > 100 — narrows Float64, must not be pushed.
+        let cast = Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(col("close")),
+            A::Int32,
+        ));
+        let f = Expr::BinaryExpr(datafusion::logical_expr::BinaryExpr::new(
+            Box::new(cast),
+            Operator::Gt,
+            Box::new(lit(100i32)),
+        ));
+        assert!(matches!(analyze(&f, &s, &known()), Analysis::NotPushdownable));
     }
 }

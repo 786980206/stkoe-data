@@ -7,15 +7,17 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{tree_node::TreeNodeRecursion, DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::{EquivalenceProperties, PhysicalSortExpr};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     stream::RecordBatchStreamAdapter,
 };
 
-use splayed_core::{scan_owned, Dataset, ScanRequest, Scanner};
+use splayed_core::{scan_owned, Dataset, ScanRequest, Scanner, SymbolSelection};
 
 use crate::convert::batch_to_record_batch;
 
@@ -46,7 +48,7 @@ impl SplayedScanExec {
         limit: Option<usize>,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
-            datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
+            equivalence_properties(&output_schema, &scan_request.symbols),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
@@ -59,6 +61,45 @@ impl SplayedScanExec {
             limit,
             properties,
         }
+    }
+}
+
+/// Equivalence properties for a single-dataset scan.
+///
+/// The scanner emits rows in `(sym, time)` ascending order — *provided* no sym
+/// filter reorders the selection (`SymbolSelection::All`) — and the projected
+/// output keeps both columns. Advertise that ordering so `ORDER BY sym, time`
+/// (e.g. TOP-N) can be satisfied without a sort. A filtered selection may come
+/// back in query-literal order, so it never advertises.
+fn equivalence_properties(
+    output_schema: &SchemaRef,
+    symbols: &SymbolSelection,
+) -> EquivalenceProperties {
+    let plain = || EquivalenceProperties::new(Arc::clone(output_schema));
+    if !matches!(symbols, SymbolSelection::All)
+        || output_schema.field_with_name("sym").is_err()
+        || output_schema.field_with_name("time").is_err()
+    {
+        return plain();
+    }
+    match (
+        datafusion::physical_expr::expressions::col("sym", output_schema),
+        datafusion::physical_expr::expressions::col("time", output_schema),
+    ) {
+        (Ok(sym), Ok(time)) => EquivalenceProperties::new_with_orderings(
+            Arc::clone(output_schema),
+            vec![vec![
+                PhysicalSortExpr {
+                    expr: sym,
+                    options: SortOptions::default(),
+                },
+                PhysicalSortExpr {
+                    expr: time,
+                    options: SortOptions::default(),
+                },
+            ]],
+        ),
+        _ => plain(),
     }
 }
 
