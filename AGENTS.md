@@ -11,13 +11,16 @@ Splayed V1 is a Rust columnar storage engine for `SYM × TIME × FIELD` financia
 ```
 Cargo.toml                 # workspace root
 crates/
-  splayed-format/           # NO deps — binary format definitions (types, headers, meta, field)
+  splayed-format/          # NO deps — binary format definitions (types, headers, meta, field)
   splayed-codec/           # depends on format — encoding + compression (PLAIN, ZSTD, compact_field)
   splayed-core/            # depends on format + codec — reader (mmap), field_writer, dataset, scanner
   splayed-arrow/           # depends on core — Arrow conversion, create_meta/create_table/update_table
+  splayed-datafusion/      # depends on arrow — DataFusion TableProvider, SQL queries
 ```
 
-**Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`.
+**Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`. DataFusion lives in `splayed-datafusion`.
+
+**Arrow version:** The workspace pins Arrow 59 to match DataFusion 55. DataFusion re-exports Arrow as `datafusion::arrow::*` — use those re-exports in `splayed-datafusion` to avoid version mismatches.
 
 ## Build & Test
 
@@ -86,7 +89,8 @@ cargo test         # all tests must pass
 ## Current Phase Status
 
 - Phase 1–3: **Complete** (Format, Reader, Writer function interfaces).
-- Phase 4: **In progress** (Scanner, ColumnView).
+- Phase 4: **Complete** (Scanner, ColumnView, batch API, filter pushdown).
 - Phase 6: Partial (ZSTD done, LZ4/DELTA/RLE planned).
-- Phase 7: In progress (Arrow conversion).
-- Phase 8–9: Planned (DataFusion, DuckDB).
+- Phase 7: **Complete** (Arrow conversion, NULL/NaN semantics, type mapping).
+- Phase 8: **Complete** (DataFusion TableProvider, ExecutionPlan, pushdown).
+- Phase 9: Planned (DuckDB).

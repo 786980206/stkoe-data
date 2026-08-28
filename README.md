@@ -50,13 +50,14 @@ Designed for **extremely low I/O, O(1) row location, mmap/zero-copy reads, and h
 
 ```text
 splayed/
-├── splayed-format/   # Binary format: META + FIELD headers, types, NULL encoding (no deps)
-├── splayed-codec/    # Encoding (PLAIN) + compression (NONE/ZSTD/LZ4)
-├── splayed-core/     # Reader (mmap), field writer, dataset, scanner (no Arrow)
-└── splayed-arrow/    # Arrow exchange: create_meta, create_table, update_table
+├── splayed-format/      # Binary format: META + FIELD headers, types, NULL encoding (no deps)
+├── splayed-codec/       # Encoding (PLAIN) + compression (NONE/ZSTD/LZ4)
+├── splayed-core/        # Reader (mmap), field writer, dataset, scanner (no Arrow)
+├── splayed-arrow/       # Arrow exchange: create_meta, create_table, update_table, ColumnView→Arrow
+└── splayed-datafusion/  # DataFusion TableProvider: SQL queries with pushdown
 ```
 
-Dependency direction: `format ← codec ← core → arrow → datafusion / duckdb`
+Dependency direction: `format ← codec ← core → arrow → datafusion`
 
 ---
 
@@ -97,6 +98,23 @@ create_table("my_dataset", &batch, true).unwrap();
 let dataset = open_dataset("my_dataset").unwrap();
 let reader = FieldReader::open("my_dataset/close").unwrap();
 assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(100.0));
+```
+
+### Example: SQL Queries via DataFusion
+
+```rust
+use datafusion::prelude::SessionContext;
+use splayed_arrow::create_table;
+use splayed_datafusion::SplayedTableProvider;
+// ... create_table as above ...
+
+let ctx = SessionContext::new();
+ctx.register_table("splayed", Arc::new(SplayedTableProvider::new("my_dataset").unwrap()))
+    .unwrap();
+
+// SQL with pushdown: SYM filter → SymbolSelection, TIME filter → TimeRange
+let batches = ctx.sql("SELECT close FROM splayed WHERE sym = 'AAPL' AND time >= 1")
+    .await.unwrap().collect().await.unwrap();
 ```
 
 ---
@@ -182,11 +200,11 @@ dataset/
 | 1 | ✅ Done | Format: META + FIELD binary read/write, types, NULL encoding |
 | 2 | ✅ Done | Reader: mmap, SYM/TIME lookup, row range, column read |
 | 3 | ✅ Done | Writer: all 7 function interfaces, generation, crash recovery |
-| 4 | 🚧 In Progress | Scanner: projection/predicate/filter pushdown, batch, parallelism |
+| 4 | ✅ Done | Scanner: projection/predicate/filter pushdown, batch API, ColumnView |
 | 5 | ⬜ Planned | Performance: SIMD, parallel scan, prefetch |
 | 6 | 🚧 In Progress | Compression: ZSTD (done), LZ4/DELTA/RLE (planned) |
-| 7 | 🚧 In Progress | Arrow: Splayed↔Arrow conversion, NULL/NaN semantics |
-| 8 | ⬜ Planned | DataFusion: TableProvider, ExecutionPlan, pushdown |
+| 7 | ✅ Done | Arrow: ColumnView→Arrow, NULL/NaN semantics, type mapping |
+| 8 | ✅ Done | DataFusion: TableProvider, ExecutionPlan, pushdown |
 | 9 | ⬜ Planned | DuckDB: Arrow bridge, then Native ColumnView |
 
 ---
