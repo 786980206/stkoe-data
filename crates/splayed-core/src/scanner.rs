@@ -110,7 +110,8 @@ pub struct ScanRequest {
     pub columns: Vec<String>,
     pub symbols: SymbolSelection,
     pub time_range: TimeRange,
-    pub filter: Option<Filter>,
+    /// Conjunctive value-level filters applied during the scan (AND semantics).
+    pub filters: Vec<Filter>,
     pub batch_size: usize,
     pub parallelism: usize,
 }
@@ -122,7 +123,7 @@ impl ScanRequest {
             columns,
             symbols: SymbolSelection::All,
             time_range: TimeRange::all(),
-            filter: None,
+            filters: vec![],
             batch_size: 65536,
             parallelism: 1,
         }
@@ -292,7 +293,7 @@ impl<'ds> Scanner<'ds> {
             readers.push((col_name.clone(), reader));
         }
 
-        // V1: the filter field must be in the projection (verified at scan time).
+        // V1: every filter field must be in the projection (verified at scan time).
         // If there's a filter on a field not in the projection, it will error
         // during next_batch with FilterFieldNotProjected.
 
@@ -300,7 +301,7 @@ impl<'ds> Scanner<'ds> {
             dataset: self.dataset,
             ranges: &plan.ranges,
             readers,
-            filter: request.filter.clone(),
+            filters: request.filters.clone(),
             batch_size: request.batch_size,
             current_range_idx: 0,
             current_row_in_range: 0,
@@ -346,7 +347,7 @@ impl<'ds> Scanner<'ds> {
             .map(|name| (name.clone(), self.dataset.field_path(name)))
             .collect();
 
-        let filter = request.filter.clone();
+        let filters = request.filters.clone();
         let batch_size = request.batch_size;
         // Wrap in Arc to avoid cloning the full time_axis per thread (P2).
         let time_axis: Arc<[i64]> = Arc::from(self.dataset.meta.time_axis.as_slice());
@@ -356,7 +357,7 @@ impl<'ds> Scanner<'ds> {
             .into_iter()
             .map(|chunk| {
                 let col_paths = col_paths.clone();
-                let filter = filter.clone();
+                let filters = filters.clone();
                 let time_axis = Arc::clone(&time_axis); // cheap ref-count clone
 
                 std::thread::spawn(move || -> Result<Vec<ScanBatchOwned>, ScannerError> {
@@ -407,31 +408,16 @@ impl<'ds> Scanner<'ds> {
 
                             let mut row_count = to_read;
 
-                            // Apply filter if present (shared logic with next_batch).
-                            if let Some(ref f) = filter {
-                                let filter_field = f.field_name();
-                                let idx = col_data
-                                    .iter()
-                                    .position(|(n, _, _)| n == filter_field)
-                                    .ok_or_else(|| {
-                                        ScannerError::FilterFieldNotProjected(
-                                            filter_field.to_string(),
-                                        )
-                                    })?;
-                                let filter_dt = col_data[idx].2;
-                                let filter_bytes = &col_data[idx].1;
-
-                                let passing =
-                                    passing_indices(f, filter_dt, filter_bytes, row_count);
-                                let (new_data, passing_count) = compact_passing(
-                                    col_data,
-                                    &mut sym_indices,
-                                    &mut time_values,
-                                    &passing,
-                                );
-                                col_data = new_data;
-                                row_count = passing_count;
-                            }
+                            // Apply all pushed-down value filters (shared with next_batch).
+                            let (new_data, new_count) = apply_filters(
+                                col_data,
+                                &mut sym_indices,
+                                &mut time_values,
+                                &filters,
+                                row_count,
+                            )?;
+                            col_data = new_data;
+                            row_count = new_count;
 
                             if row_count > 0 {
                                 out.push(ScanBatchOwned {
@@ -475,7 +461,7 @@ pub struct ScanBatches<'ds, 'r> {
     dataset: &'ds Dataset,
     ranges: &'r [RowRange],
     readers: Vec<(String, FieldReader)>,
-    filter: Option<Filter>,
+    filters: Vec<Filter>,
     batch_size: usize,
     current_range_idx: usize,
     current_row_in_range: u32,
@@ -548,34 +534,20 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
             .collect();
 
-        // Apply filter if present (shared with scan_all_parallel for identical behavior).
-        if let Some(ref filter) = self.filter {
-            let filter_field = filter.field_name();
-            let idx = col_data
-                .iter()
-                .position(|(n, _, _)| n == filter_field)
-                .ok_or_else(|| ScannerError::FilterFieldNotProjected(filter_field.to_string()))?;
-            let filter_dt = col_data[idx].2;
-            let filter_bytes = &col_data[idx].1;
-
-            let passing = passing_indices(filter, filter_dt, filter_bytes, row_count);
-            let (new_col_data, passing_count) =
-                compact_passing(col_data, &mut sym_indices, &mut time_values, &passing);
-
-            self.exhausted = self.current_range_idx >= self.ranges.len();
-            if passing_count == 0 && self.exhausted {
-                return Ok(None);
-            }
-
-            return Ok(Some(ScanBatchOwned {
-                columns: new_col_data,
-                row_count: passing_count,
-                sym_indices,
-                time_values,
-            }));
-        }
+        // Apply all pushed-down value filters (AND semantics; shared with
+        // scan_all_parallel and scan_owned for identical behavior).
+        let (col_data, row_count) = apply_filters(
+            col_data,
+            &mut sym_indices,
+            &mut time_values,
+            &self.filters,
+            row_count,
+        )?;
 
         self.exhausted = self.current_range_idx >= self.ranges.len();
+        if row_count == 0 && self.exhausted {
+            return Ok(None);
+        }
 
         Ok(Some(ScanBatchOwned {
             columns: col_data,
@@ -607,6 +579,151 @@ impl ScanBatchOwned {
 }
 
 // ---------------------------------------------------------------------------
+// Owned scan iterator (for cross-thread / async streaming)
+// ---------------------------------------------------------------------------
+
+/// An owned, `Send + 'static` scan batch iterator over an `Arc<Dataset>`.
+///
+/// DataFusion's provider needs a stream that can cross `spawn_blocking`
+/// boundaries, so this owns the dataset, row ranges, readers, and filters —
+/// it has no borrows and can be moved into a blocking task.
+pub struct OwnedScanBatches {
+    dataset: Arc<Dataset>,
+    ranges: Vec<RowRange>,
+    readers: Vec<(String, FieldReader)>,
+    filters: Vec<Filter>,
+    batch_size: usize,
+    current_range_idx: usize,
+    current_row_in_range: u32,
+    exhausted: bool,
+}
+
+/// Create an owned scan iterator over an `Arc<Dataset>` (no borrows).
+///
+/// This is the async-streaming entry point used by the DataFusion provider.
+/// The returned iterator shares the exact batch/filter semantics of
+/// [`ScanBatches`].
+pub fn scan_owned(
+    dataset: Arc<Dataset>,
+    plan: &ScanPlan,
+    request: &ScanRequest,
+) -> Result<OwnedScanBatches, ScannerError> {
+    // Verify all requested columns exist and open their readers.
+    let mut readers: Vec<(String, FieldReader)> = Vec::with_capacity(plan.columns.len());
+    for col_name in &plan.columns {
+        let path = dataset.field_path(col_name);
+        if !path.exists() {
+            return Err(ScannerError::FieldNotFound(col_name.clone()));
+        }
+        let reader = FieldReader::open(&path)
+            .map_err(|e| ScannerError::ReaderError(col_name.clone(), e))?;
+        readers.push((col_name.clone(), reader));
+    }
+
+    Ok(OwnedScanBatches {
+        dataset,
+        ranges: plan.ranges.clone(),
+        readers,
+        filters: request.filters.clone(),
+        batch_size: request.batch_size,
+        current_range_idx: 0,
+        current_row_in_range: 0,
+        exhausted: false,
+    })
+}
+
+impl OwnedScanBatches {
+    /// Get the next batch of rows, or `None` if exhausted.
+    ///
+    /// Identical semantics to [`ScanBatches::next_batch`], but with owned
+    /// state so the iterator is `Send + 'static`.
+    pub fn next_batch(&mut self) -> Result<Option<ScanBatchOwned>, ScannerError> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        // Accumulate column data per column (concatenated across ranges).
+        let mut col_bufs: Vec<Vec<u8>> = vec![Vec::new(); self.readers.len()];
+        let mut sym_indices: Vec<usize> = Vec::new();
+        let mut time_values: Vec<i64> = Vec::new();
+        let mut row_count = 0usize;
+
+        let batch_capacity = self.batch_size;
+
+        while row_count < batch_capacity && self.current_range_idx < self.ranges.len() {
+            let range = self.ranges[self.current_range_idx];
+            let remaining_in_range = range.count - self.current_row_in_range;
+            if remaining_in_range == 0 {
+                self.current_range_idx += 1;
+                self.current_row_in_range = 0;
+                continue;
+            }
+
+            let to_read = remaining_in_range
+                .min((batch_capacity - row_count) as u32)
+                as usize;
+
+            // Read `to_read` rows from each column reader and append.
+            let start_row = range.row_start + self.current_row_in_range;
+            for (i, (_, reader)) in self.readers.iter().enumerate() {
+                let raw = reader
+                    .read_range_raw(start_row, to_read)
+                    .map_err(|e| ScannerError::ReaderError(self.readers[i].0.clone(), e))?;
+                col_bufs[i].extend_from_slice(raw);
+            }
+
+            // Fill sym_indices and time_values for these rows.
+            let meta = &self.dataset.meta;
+            for i in 0..to_read {
+                sym_indices.push(range.sym_idx);
+                let time_idx = range.time_start_idx as usize + self.current_row_in_range as usize + i;
+                if time_idx < meta.time_axis.len() {
+                    time_values.push(meta.time_axis[time_idx]);
+                } else {
+                    time_values.push(0);
+                }
+            }
+
+            row_count += to_read;
+            self.current_row_in_range += to_read as u32;
+        }
+
+        if row_count == 0 {
+            self.exhausted = true;
+            return Ok(None);
+        }
+
+        // Build col_data from accumulated buffers.
+        let col_data: Vec<(String, Vec<u8>, DataType)> = self
+            .readers
+            .iter()
+            .zip(col_bufs.into_iter())
+            .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
+            .collect();
+
+        let (col_data, row_count) = apply_filters(
+            col_data,
+            &mut sym_indices,
+            &mut time_values,
+            &self.filters,
+            row_count,
+        )?;
+
+        self.exhausted = self.current_range_idx >= self.ranges.len();
+        if row_count == 0 && self.exhausted {
+            return Ok(None);
+        }
+
+        Ok(Some(ScanBatchOwned {
+            columns: col_data,
+            row_count,
+            sym_indices,
+            time_values,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filter evaluation
 // ---------------------------------------------------------------------------
 
@@ -621,6 +738,36 @@ impl Filter {
             | Self::NotEqual { field, .. } => field,
         }
     }
+}
+
+/// Apply a conjunction of value filters to a batch's column data, compacting
+/// to only the rows that pass **all** of them (AND semantics).
+///
+/// Shared between `ScanBatches::next_batch`, `scan_all_parallel`, and
+/// `OwnedScanBatches::next_batch` so every path behaves identically.
+fn apply_filters(
+    mut col_data: Vec<(String, Vec<u8>, DataType)>,
+    sym_indices: &mut Vec<usize>,
+    time_values: &mut Vec<i64>,
+    filters: &[Filter],
+    mut row_count: usize,
+) -> Result<(Vec<(String, Vec<u8>, DataType)>, usize), ScannerError> {
+    for filter in filters {
+        let filter_field = filter.field_name();
+        let idx = col_data
+            .iter()
+            .position(|(n, _, _)| n == filter_field)
+            .ok_or_else(|| ScannerError::FilterFieldNotProjected(filter_field.to_string()))?;
+        let filter_dt = col_data[idx].2;
+        let filter_bytes = &col_data[idx].1;
+
+        let passing = passing_indices(filter, filter_dt, filter_bytes, row_count);
+        let (new_data, passing_count) =
+            compact_passing(col_data, sym_indices, time_values, &passing);
+        col_data = new_data;
+        row_count = passing_count;
+    }
+    Ok((col_data, row_count))
 }
 
 /// Compute the row indices that pass the filter on a given column.

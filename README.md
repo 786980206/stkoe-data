@@ -102,20 +102,38 @@ assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(100.0));
 
 ### Example: SQL Queries via DataFusion
 
+Three layers: a single `.meta` folder is one dataset (like one Parquet file);
+a directory of dataset folders is a partitioned table (like a Hive partitioned
+table); `splayed-datafusion` binds them to DataFusion.
+
 ```rust
 use datafusion::prelude::SessionContext;
 use splayed_arrow::create_table;
-use splayed_datafusion::SplayedTableProvider;
-// ... create_table as above ...
+use splayed_datafusion::{register_splayed_table, SplayedTableFunction};
+// ... create_table as above (writes "my_dataset/.meta" + FIELD files) ...
 
 let ctx = SessionContext::new();
-ctx.register_table("splayed", Arc::new(SplayedTableProvider::new("my_dataset").unwrap()))
-    .unwrap();
+// Layer 3 — auto-detects single dataset vs. partitioned table:
+register_splayed_table(&ctx, "splayed", "my_dataset").unwrap();
 
-// SQL with pushdown: SYM filter → SymbolSelection, TIME filter → TimeRange
+// SQL with pushdown: SYM filter → SymbolSelection, TIME filter → TimeRange,
+// FIELD value filters → Scanner (conjunction).
 let batches = ctx.sql("SELECT close FROM splayed WHERE sym = 'AAPL' AND time >= 1")
     .await.unwrap().collect().await.unwrap();
 ```
+
+Partitioned table (each sub-directory with its own `.meta` is a partition):
+
+```rust
+// my_table/2024/.meta, my_table/2025/.meta, ...  → one partition each
+register_splayed_table(&ctx, "prices", "my_table").unwrap();
+let batches = ctx.sql("SELECT COUNT(*) FROM prices WHERE time < 2025-01-01")
+    .await.unwrap().collect().await.unwrap(); // prunes whole partitions
+```
+
+Also available: `read_splayed('/path/to/dir')` table function and
+`CREATE EXTERNAL TABLE ... STORED AS SPLAYED LOCATION 'dir'`
+(via `SplayedTableFactory`).
 
 ---
 

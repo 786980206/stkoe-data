@@ -77,7 +77,7 @@ fn scan_projection_and_sym_filter() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::syms(["SYM02"]),
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -118,7 +118,7 @@ fn scan_time_range_filter() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::new(2, 4), // days 2,3
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -155,7 +155,7 @@ fn scan_sym_and_time_combined() {
         columns: vec!["close".into(), "volume".into()],
         symbols: SymbolSelection::syms(["SYM01"]),
         time_range: TimeRange::new(1, 4), // days 1,2,3
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -201,10 +201,10 @@ fn scan_with_value_filter() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: Some(Filter::GreaterThan {
+        filters: vec![Filter::GreaterThan {
             field: "close".into(),
             value: FilterValue::Float64(150.0),
-        }),
+        }],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -245,7 +245,7 @@ fn scan_batch_iteration() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 3,
         parallelism: 1,
     };
@@ -281,7 +281,7 @@ fn scan_empty_result() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::syms(["NOEXIST"]),
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -294,7 +294,7 @@ fn scan_empty_result() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::new(100, 200), // no data in days 100-200
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -329,7 +329,7 @@ fn scan_compressed_field_zstd() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -374,10 +374,10 @@ fn scan_compressed_field_lz4_with_filter() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: Some(Filter::GreaterThan {
+        filters: vec![Filter::GreaterThan {
             field: "close".into(),
             value: FilterValue::Float64(150.0),
-        }),
+        }],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -416,7 +416,7 @@ fn scan_parallel_matches_sequential() {
         columns: vec!["close".into(), "volume".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -433,7 +433,7 @@ fn scan_parallel_matches_sequential() {
         columns: vec!["close".into(), "volume".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 3,
     };

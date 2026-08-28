@@ -63,7 +63,7 @@ fn scan_to_arrow_float64_with_null() {
         columns: vec!["close".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -104,7 +104,7 @@ fn scan_to_arrow_int64_with_null() {
         columns: vec!["vol".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -140,7 +140,7 @@ fn scan_to_arrow_bool_with_null() {
         columns: vec!["flag".into()],
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };
@@ -176,7 +176,7 @@ fn scan_to_arrow_multi_column() {
         columns: vec!["close".into(), "vol".into()],
         symbols: SymbolSelection::syms(["SYM02"]),
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };

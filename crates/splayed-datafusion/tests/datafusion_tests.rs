@@ -195,3 +195,113 @@ async fn count_rows() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// P0 correctness regressions
+// ---------------------------------------------------------------------------
+
+/// Every pushed-down value filter must be applied — not just the first.
+#[tokio::test]
+async fn multi_value_filters_all_applied() {
+    let dir = temp_dir("multi_val");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches =
+        run_query(&dir, "SELECT close, volume FROM splayed WHERE close > 100 AND volume > 3000").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // SYM01: close>100 (days 1-4) ∩ volume>3000 (days 3,4) = days 3,4 → 2
+    // SYM02: close>100 (all)     ∩ volume>3000 (days 2,3,4) = days 2,3,4 → 3
+    assert_eq!(total_rows, 5);
+
+    let batch = &batches[0];
+    let close = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let volume = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for i in 0..batch.num_rows() {
+        assert!(close.value(i) > 100.0, "close must be > 100");
+        assert!(volume.value(i) > 3000, "volume must be > 3000");
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `sym = '<missing>'` must return 0 rows — never an error.
+#[tokio::test]
+async fn unknown_sym_returns_empty() {
+    let dir = temp_dir("unknown_sym");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym = 'NOPE'").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A value filter on a column that is not projected must still filter rows.
+#[tokio::test]
+async fn filter_column_not_projected() {
+    let dir = temp_dir("not_proj");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE volume > 5000").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    // volume > 5000: only SYM02 day 4 (6000) → 1 row, close = 204
+    assert_eq!(total_rows, 1);
+    let batch = &batches[0];
+    let close = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(close.value(0), 204.0);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// LIMIT must return at most n rows.
+#[tokio::test]
+async fn limit_rows() {
+    let dir = temp_dir("limit");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed LIMIT 3").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `sym IN (...)` is not pushed down (P2) but must still be correct via
+/// DataFusion's own filter.
+#[tokio::test]
+async fn sym_in_list_correct() {
+    let dir = temp_dir("sym_in");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym IN ('SYM01','SYM02')").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 10);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Contradictory symbol conjunction must return empty (intersection semantics).
+#[tokio::test]
+async fn contradictory_sym_filters_empty() {
+    let dir = temp_dir("contra_sym");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE sym = 'SYM01' AND sym = 'SYM02'").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 0);
+
+    fs::remove_dir_all(&dir).ok();
+}

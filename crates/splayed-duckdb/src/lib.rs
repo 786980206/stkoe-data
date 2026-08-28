@@ -173,7 +173,7 @@ pub fn export_to_arrow_ipc(dataset_dir: &Path, output_path: &Path) -> Result<usi
         columns: field_names.clone(),
         symbols: SymbolSelection::All,
         time_range: TimeRange::all(),
-        filter: None,
+        filters: vec![],
         batch_size: 65536,
         parallelism: 1,
     };

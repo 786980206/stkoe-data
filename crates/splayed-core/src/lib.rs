@@ -19,8 +19,8 @@ pub use field_writer::{
 };
 pub use reader::{FieldReader, ReaderError};
 pub use scanner::{
-    Filter, FilterValue, ScanBatchOwned, ScanBatches, ScanPlan, ScanRequest, Scanner,
-    ScannerError, SymbolSelection, TimeRange,
+    Filter, FilterValue, OwnedScanBatches, ScanBatchOwned, ScanBatches, ScanPlan, ScanRequest,
+    Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
 };
 
 // Re-export compact_field from splayed-codec (plan §8.4 places it in splayed-codec).

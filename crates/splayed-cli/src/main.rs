@@ -30,7 +30,7 @@ use splayed_core::{
     compact_field as core_compact, open_dataset,
     update_field, FieldReader, UpdateItem,
 };
-use splayed_datafusion::SplayedTableProvider;
+use splayed_datafusion::register_splayed_table;
 use splayed_format::{Compression, DataType, RawValue};
 
 #[derive(Parser)]
@@ -253,8 +253,8 @@ fn cmd_read(dir: &PathBuf, field: &str, sym_filter: Option<&str>) {
 
 async fn cmd_sql(dir: &PathBuf, query: &str) {
     let ctx = SessionContext::new();
-    let provider = SplayedTableProvider::new(dir).unwrap();
-    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+    // Layer 3: auto-detect single dataset vs partitioned table.
+    register_splayed_table(&ctx, "splayed", dir).unwrap();
 
     println!("SQL: {query}");
     let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
@@ -321,8 +321,8 @@ fn print_record_batch(batch: &RecordBatch) {
 /// Export the full dataset to a CSV file via DataFusion + arrow-csv.
 async fn cmd_export(dir: &PathBuf, output: &PathBuf) {
     let ctx = SessionContext::new();
-    let provider = SplayedTableProvider::new(dir).unwrap();
-    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+    // Layer 3: auto-detect single dataset vs partitioned table.
+    register_splayed_table(&ctx, "splayed", dir).unwrap();
 
     let batches = ctx.sql("SELECT * FROM splayed").await.unwrap().collect().await.unwrap();
 

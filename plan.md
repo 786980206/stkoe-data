@@ -669,7 +669,7 @@ Scanner
 | `columns` | FieldId[] | 要读取的字段 |
 | `symbols` | SymbolSelection | SYM 过滤 |
 | `time_range` | TimeRange | 时间过滤 |
-| `filter` | Filter | FIELD 值过滤 |
+| `filters` | Filter[] | FIELD 值过滤（**合取**语义，全部生效） |
 | `batch_size` | usize | Batch 大小 |
 | `parallelism` | usize | 并行度 |
 
@@ -679,7 +679,7 @@ Scanner
 columns:     [close, volume]
 symbols:     [AAPL, MSFT]
 time_range:  [2026-01-01, 2026-03-01)
-filter:      close > 100
+filters:     [close > 100, volume > 5000]
 batch_size:  65536
 parallelism: auto
 ```
@@ -863,31 +863,49 @@ Splayed Core
 
 ## 10.3 DataFusion 集成
 
-实现：
+三层对接，每层职责单一：
 
 ```text
-SplayedTableProvider
+Layer 3   register             register_splayed_table / SplayedTableFactory
+                              (CREATE EXTERNAL TABLE ... STORED AS SPLAYED) /
+                              SplayedTableFunction (read_splayed('dir'))
+Layer 2   SplayedTableProvider  分区表（对标 Hive 分区表）：自动探测分区、
+                              schema 校验、TIME 分区裁剪
+Layer 1   SplayedDatasetProvider 单个 dataset 目录（对标一个 parquet 文件）：
+                              自带 schema / statistics / 严格谓词下推
 ```
 
-链路：
+- **Layer 1**：一个含 `.meta` 的目录 = 一个分区（自包含、可直接查询）。实现
+  `schema`、`table_type`、`statistics`（精确行数/字节数/各 FIELD null_count、
+  TIME min/max、SYM distinct）、`get_table_definition`、`supports_filters_pushdown`
+  （严格 `Exact`）、`scan`。
+- **Layer 2**：顶层目录 = 表，直接子目录（各含 `.meta`）= 分区。所有分区 schema
+  必须一致（否则构造报错）；基于各分区 META 的 TIME AXIS `[min,max]` 做分区裁剪。
+  自动探测：目录本身含 `.meta` 时退化为单分区表（向后兼容旧 API）。
+- **Layer 3**：`register_splayed_table(ctx, name, dir)`（自动探测）、
+  `SplayedTableFactory`（`STORED AS SPLAYED`）、`read_splayed('dir')` 表函数。
 
-```text
-DataFusion
-    |
-    v
-TableProvider
-    |
-    v
-SplayedExecutionPlan
-    |
-    v
-SplayedScanner
-    |
-    v
-RecordBatch
-```
+谓词下推（Layer 1/2 共用同一套解析，保证一致性 = 正确性）：
 
-重点支持：Projection Pushdown、Predicate Pushdown、SYM pruning、TIME pruning、Batch scan。
+| 谓词 | 处理 | 标记 |
+| --- | --- | --- |
+| `sym = 'X'`（单个已知 SYM） | → `SymbolSelection` | `Exact` |
+| `sym = '<未知>'` | 该分区返回 0 行（不报错） | `Exact` |
+| 同一合取中出现多个不同 SYM 字面量 | 选择只能表达并集，交集交由 DF 重滤 | `Inexact` |
+| `time` 比较 | → `TimeRange`（半开区间，溢出用 saturating） | `Exact` |
+| FIELD 值比较（可转换） | → `Filter`，**合取全部生效** | `Exact` |
+| 其它（`IN`、`IS NULL`、cast、非列比较） | 不下推，DF 自行过滤 | `Unsupported` |
+
+执行计划：`SplayedScanExec`（单分区叶子，`UnknownPartitioning(1)`，有界 mpsc
+通道 + `spawn_blocking` 流式产出，`LIMIT` 提前截断）与 `SplayedTableScanExec`
+（`UnknownPartitioning(plans.len())`，每个物理分区 = 一个输出分区）。
+没有命中分区时返回 `EmptyExec`（如 `COUNT(*)` → 0）。
+
+重点支持：Projection Pushdown、Predicate Pushdown、SYM pruning、TIME pruning、
+Batch scan、LIMIT。
+
+未来（暂缓）：`sym IN (...)`、`IS NULL`/`IS NOT NULL`、cast 剥离、零拷贝
+Arrow 转换、`INSERT INTO` 写回、通过 EquivalenceProperties 声明 TIME 有序。
 
 ## 10.4 DuckDB 集成
 
@@ -1010,7 +1028,11 @@ splayed/
 
 ## Phase 8：DataFusion ✅ Done
 
-实现 TableProvider、ExecutionPlan、Projection Pushdown、Predicate Pushdown。
+三层对接（见 §10.3）：`SplayedDatasetProvider`（单目录=一个分区，对标一个
+parquet 文件）→ `SplayedTableProvider`（分区表，对标 Hive 分区表，含自动
+探测/schema 校验/TIME 分区裁剪）→ `register`（`register_splayed_table` /
+`SplayedTableFactory` / `read_splayed`）。支持 Projection/Predicate Pushdown、
+SYM/TIME pruning、合取值过滤、LIMIT、统计信息、`get_table_definition`。
 
 ## Phase 9：DuckDB ✅ Done (Arrow IPC bridge)
 

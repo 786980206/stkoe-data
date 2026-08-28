@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use splayed_format::{MetaFile, META_FILE_NAME};
 
 /// An open dataset: a directory with a `.meta` file and zero or more FIELD files.
+#[derive(Debug)]
 pub struct Dataset {
     pub dir: PathBuf,
     pub meta: MetaFile,
