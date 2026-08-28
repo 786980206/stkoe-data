@@ -305,6 +305,171 @@ impl<'ds> Scanner<'ds> {
             exhausted: false,
         })
     }
+
+    /// Execute the scan plan with cross-SYM parallelism.
+    ///
+    /// Splits the row ranges into `request.parallelism` partitions at SYM
+    /// boundaries, then reads each partition in a separate thread. Returns
+    /// all batches collected from all threads, preserving SYM order.
+    ///
+    /// For `parallelism = 1`, falls through to the single-threaded path.
+    pub fn scan_all_parallel(
+        &self,
+        plan: &ScanPlan,
+        request: &ScanRequest,
+    ) -> Result<Vec<ScanBatchOwned>, ScannerError> {
+        if request.parallelism <= 1 || plan.ranges.len() <= 1 {
+            // Single-threaded path: use the existing iterator.
+            let mut batches = self.scan(plan, request)?;
+            let mut out = Vec::new();
+            while let Some(batch) = batches.next_batch()? {
+                out.push(batch);
+            }
+            return Ok(out);
+        }
+
+        // Partition ranges across threads (clone to make them 'static/Send).
+        let n_threads = request.parallelism.min(plan.ranges.len());
+        let chunk_size = (plan.ranges.len() + n_threads - 1) / n_threads;
+        let range_chunks: Vec<Vec<RowRange>> = plan
+            .ranges
+            .chunks(chunk_size)
+            .map(|c| c.to_vec())
+            .collect();
+
+        // Prepare column paths (Send-safe: paths are just PathBuf).
+        let col_paths: Vec<(String, std::path::PathBuf)> = plan
+            .columns
+            .iter()
+            .map(|name| (name.clone(), self.dataset.field_path(name)))
+            .collect();
+
+        let filter = request.filter.clone();
+        let batch_size = request.batch_size;
+        let time_axis = self.dataset.meta.time_axis.clone();
+        // symbols is not needed — sym_idx is already in RowRange.
+
+        // Spawn threads.
+        let handles: Vec<_> = range_chunks
+            .into_iter()
+            .map(|chunk| {
+                let col_paths = col_paths.clone();
+                let filter = filter.clone();
+                let time_axis = time_axis.clone();
+
+                std::thread::spawn(move || -> Result<Vec<ScanBatchOwned>, ScannerError> {
+                    // Open readers in this thread.
+                    let mut readers: Vec<(String, FieldReader)> = Vec::with_capacity(col_paths.len());
+                    for (name, path) in &col_paths {
+                        let reader = FieldReader::open(path)
+                            .map_err(|e| ScannerError::ReaderError(name.clone(), e))?;
+                        readers.push((name.clone(), reader));
+                    }
+
+                    let mut out = Vec::new();
+                    for range in chunk {
+                        let mut current_row = 0u32;
+                        let remaining = range.count;
+
+                        while current_row < remaining {
+                            let to_read = remaining - current_row;
+                            let to_read = to_read.min(batch_size as u32) as usize;
+
+                            let start_row = range.row_start + current_row;
+
+                            // Read each column.
+                            let mut col_data: Vec<(String, Vec<u8>, DataType)> =
+                                Vec::with_capacity(readers.len());
+                            for (name, reader) in &readers {
+                                let dt = reader.data_type();
+                                let raw = reader
+                                    .read_range_raw(start_row, to_read)
+                                    .map_err(|e| ScannerError::ReaderError(name.clone(), e))?;
+                                col_data.push((name.clone(), raw.to_vec(), dt));
+                            }
+
+                            // Fill sym_indices and time_values.
+                            let mut sym_indices = Vec::with_capacity(to_read);
+                            let mut time_values = Vec::with_capacity(to_read);
+                            for i in 0..to_read {
+                                sym_indices.push(range.sym_idx);
+                                let time_idx = range.time_start_idx as usize
+                                    + current_row as usize
+                                    + i;
+                                if time_idx < time_axis.len() {
+                                    time_values.push(time_axis[time_idx]);
+                                } else {
+                                    time_values.push(0);
+                                }
+                            }
+
+                            let mut row_count = to_read;
+
+                            // Apply filter if present.
+                            if let Some(ref f) = filter {
+                                let filter_field = f.field_name();
+                                if let Some(idx) =
+                                    col_data.iter().position(|(n, _, _)| n == filter_field)
+                                {
+                                    let filter_dt = col_data[idx].2;
+                                    let filter_bytes = &col_data[idx].1;
+                                    let view = ColumnView::new(filter_dt, filter_bytes, row_count);
+                                    let mut passing = Vec::with_capacity(row_count);
+                                    for i in 0..row_count {
+                                        let val = view.get(i).unwrap();
+                                        if filter_passes(f, &val) {
+                                            passing.push(i);
+                                        }
+                                    }
+                                    let passing_count = passing.len();
+                                    let mut new_data = Vec::with_capacity(col_data.len());
+                                    for (name, bytes, dt) in col_data {
+                                        let sz = dt.size_of();
+                                        let mut compacted =
+                                            Vec::with_capacity(passing_count * sz);
+                                        for &i in &passing {
+                                            let off = i * sz;
+                                            compacted.extend_from_slice(&bytes[off..off + sz]);
+                                        }
+                                        new_data.push((name, compacted, dt));
+                                    }
+                                    col_data = new_data;
+                                    sym_indices =
+                                        passing.iter().map(|&i| sym_indices[i]).collect();
+                                    time_values =
+                                        passing.iter().map(|&i| time_values[i]).collect();
+                                    row_count = passing_count;
+                                }
+                            }
+
+                            if row_count > 0 {
+                                out.push(ScanBatchOwned {
+                                    columns: col_data,
+                                    row_count,
+                                    sym_indices,
+                                    time_values,
+                                });
+                            }
+
+                            current_row += to_read as u32;
+                        }
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+
+        // Collect results in order.
+        let mut all_batches = Vec::new();
+        for handle in handles {
+            let batches = handle
+                .join()
+                .map_err(|_| ScannerError::ParallelScanPanic)?;
+            all_batches.extend(batches?);
+        }
+
+        Ok(all_batches)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +721,7 @@ pub enum ScannerError {
     FieldNotFound(String),
     ReaderError(String, crate::ReaderError),
     FilterFieldNotProjected(String),
+    ParallelScanPanic,
 }
 
 impl std::fmt::Display for ScannerError {
@@ -567,6 +733,7 @@ impl std::fmt::Display for ScannerError {
             Self::FilterFieldNotProjected(s) => {
                 write!(f, "filter field '{s}' must be in projection (V1)")
             }
+            Self::ParallelScanPanic => write!(f, "parallel scan thread panicked"),
         }
     }
 }

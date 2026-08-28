@@ -2668,9 +2668,11 @@ name = "splayed-core"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "lz4_flex 0.11.6",
  "memmap2",
  "splayed-codec",
  "splayed-format",
+ "zstd",
 ]
 
 [[package]]

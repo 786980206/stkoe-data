@@ -1,11 +1,14 @@
 //! Encoding (PLAIN/DELTA/RLE/BITPACK) and compression (NONE/ZSTD/LZ4) for Splayed V1.
 //!
-//! Phase 1 implements PLAIN + NONE.  `compact_field` (ZSTD) is implemented
-//! for Phase 3's function interface.  LZ4, DELTA, RLE, BITPACK are stubbed
-//! for later phases.
+//! - PLAIN + NONE: fastest path, mmap zero-copy (Phase 1)
+//! - ZSTD/LZ4 compression: cold data path (Phase 3/6)
+//! - DELTA/RLE/BITPACK encodings: column-specific encoding (Phase 6)
 
+pub mod bitpack;
 pub mod compact;
+pub mod delta;
 pub mod plain;
+pub mod rle;
 
 pub use compact::{compact_field, decompress_field_data, CompactError, DecompressError};
 pub use plain::PlainCodec;

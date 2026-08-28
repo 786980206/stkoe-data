@@ -7,7 +7,8 @@ use arrow_array::{Date32Array, Float64Array, Int64Array, RecordBatch, StringArra
 use arrow_schema::{DataType as ArrowDT, Field, Schema};
 use splayed_arrow::create_table;
 use splayed_core::{
-    open_dataset, Filter, FilterValue, ScanRequest, Scanner, SymbolSelection, TimeRange,
+    compact_field, open_dataset, Filter, FilterValue, ScanRequest, Scanner, SymbolSelection,
+    TimeRange,
 };
 
 fn make_batch() -> RecordBatch {
@@ -303,6 +304,158 @@ fn scan_empty_result() {
 
     let mut batches = scanner.scan(&plan, &req).unwrap();
     assert!(batches.next_batch().unwrap().is_none());
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Compressed field scan (ZSTD)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_compressed_field_zstd() {
+    let dir = temp_dir("comp_zstd");
+    let _ = fs::remove_dir_all(&dir);
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    // Compact the close field with ZSTD (must drop readers first on Windows).
+    let dataset = open_dataset(&dir).unwrap();
+    let close_path = dataset.field_path("close");
+    compact_field(&close_path, splayed_format::Compression::Zstd).unwrap();
+
+    // Now scan the compressed field — FieldReader should decompress on open.
+    let scanner = Scanner::new(&dataset);
+    let req = ScanRequest {
+        columns: vec!["close".into()],
+        symbols: SymbolSelection::All,
+        time_range: TimeRange::all(),
+        filter: None,
+        batch_size: 65536,
+        parallelism: 1,
+    };
+
+    let plan = scanner.plan(&req).unwrap();
+    assert_eq!(plan.total_rows, 13);
+
+    let mut batches = scanner.scan(&plan, &req).unwrap();
+    let batch = batches.next_batch().unwrap().unwrap();
+    assert_eq!(batch.row_count, 13);
+
+    // Verify values: SYM01 close = 100..104, SYM02 = 200..204, SYM03 = 300..302
+    let view = batch.column_view("close").unwrap();
+    // Row 0 = SYM01 day 0 = 100.0
+    assert_eq!(view.get(0).unwrap().as_f64(), Some(100.0));
+    // Row 5 = SYM02 day 0 = 200.0
+    assert_eq!(view.get(5).unwrap().as_f64(), Some(200.0));
+    // Row 10 = SYM03 day 0 = 300.0
+    assert_eq!(view.get(10).unwrap().as_f64(), Some(300.0));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Compressed field scan with filter (LZ4)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_compressed_field_lz4_with_filter() {
+    let dir = temp_dir("comp_lz4_filter");
+    let _ = fs::remove_dir_all(&dir);
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    // Compact with LZ4.
+    let dataset = open_dataset(&dir).unwrap();
+    let close_path = dataset.field_path("close");
+    compact_field(&close_path, splayed_format::Compression::Lz4).unwrap();
+
+    // Scan with value filter: close > 150
+    let scanner = Scanner::new(&dataset);
+    let req = ScanRequest {
+        columns: vec!["close".into()],
+        symbols: SymbolSelection::All,
+        time_range: TimeRange::all(),
+        filter: Some(Filter::GreaterThan {
+            field: "close".into(),
+            value: FilterValue::Float64(150.0),
+        }),
+        batch_size: 65536,
+        parallelism: 1,
+    };
+
+    let plan = scanner.plan(&req).unwrap();
+    let mut batches = scanner.scan(&plan, &req).unwrap();
+    let batch = batches.next_batch().unwrap().unwrap();
+
+    // close > 150: SYM02 (5 rows) + SYM03 (3 rows) = 8 rows
+    assert_eq!(batch.row_count, 8);
+
+    let view = batch.column_view("close").unwrap();
+    for i in 0..batch.row_count {
+        let v = view.get(i).unwrap();
+        assert!(v.as_f64().unwrap() > 150.0);
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Parallel scan
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_parallel_matches_sequential() {
+    let dir = temp_dir("parallel");
+    let _ = fs::remove_dir_all(&dir);
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let dataset = open_dataset(&dir).unwrap();
+    let scanner = Scanner::new(&dataset);
+
+    // Sequential scan
+    let req_seq = ScanRequest {
+        columns: vec!["close".into(), "volume".into()],
+        symbols: SymbolSelection::All,
+        time_range: TimeRange::all(),
+        filter: None,
+        batch_size: 65536,
+        parallelism: 1,
+    };
+    let plan_seq = scanner.plan(&req_seq).unwrap();
+    let mut seq_batches = scanner.scan(&plan_seq, &req_seq).unwrap();
+    let mut seq_rows = 0;
+    while let Some(b) = seq_batches.next_batch().unwrap() {
+        seq_rows += b.row_count;
+    }
+    assert_eq!(seq_rows, 13);
+
+    // Parallel scan (3 threads, one per SYM)
+    let req_par = ScanRequest {
+        columns: vec!["close".into(), "volume".into()],
+        symbols: SymbolSelection::All,
+        time_range: TimeRange::all(),
+        filter: None,
+        batch_size: 65536,
+        parallelism: 3,
+    };
+    let plan_par = scanner.plan(&req_par).unwrap();
+    let par_batches = scanner.scan_all_parallel(&plan_par, &req_par).unwrap();
+    let par_rows: usize = par_batches.iter().map(|b| b.row_count).sum();
+    assert_eq!(par_rows, 13);
+
+    // Verify data correctness: check close values
+    let plan_seq2 = scanner.plan(&req_seq).unwrap();
+    let mut seq_iter = scanner.scan(&plan_seq2, &req_seq).unwrap();
+    let seq_batch = seq_iter.next_batch().unwrap().unwrap();
+    let par_batch = &par_batches[0];
+
+    let seq_close = seq_batch.column_view("close").unwrap();
+    let par_close = par_batch.column_view("close").unwrap();
+    for i in 0..seq_batch.row_count.min(par_batch.row_count) {
+        assert_eq!(
+            seq_close.get(i).unwrap().as_f64(),
+            par_close.get(i).unwrap().as_f64()
+        );
+    }
 
     fs::remove_dir_all(&dir).ok();
 }

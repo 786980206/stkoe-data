@@ -11,3 +11,5 @@ splayed-format.workspace = true
 splayed-codec.workspace = true
 memmap2 = "0.9"
 bytemuck = "1"
+zstd = "0.13"
+lz4_flex = "0.11"

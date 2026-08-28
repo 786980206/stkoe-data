@@ -996,13 +996,13 @@ splayed/
 
 实现 Projection、SYM filter、TIME filter、FIELD filter、batch、parallelism。
 
-## Phase 5：性能优化 ⬜ Planned
+## Phase 5：性能优化 🚧 In Progress (parallel scan done)
 
 加入 SIMD、parallel scan、parallel field read、page-cache friendly access、prefetch。
 
-## Phase 6：Compression 🚧 In Progress (ZSTD + LZ4 done)
+## Phase 6：Compression ✅ Done
 
-加入 ZSTD、LZ4、DELTA、RLE，但不破坏 PLAIN + NONE 这条最快路径。
+加入 ZSTD、LZ4、DELTA、RLE、BITPACK，但不破坏 PLAIN + NONE 这条最快路径。
 
 ## Phase 7：Arrow ✅ Done
 
