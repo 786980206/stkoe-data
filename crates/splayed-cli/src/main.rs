@@ -1,0 +1,340 @@
+//! Splayed V1 CLI tool — create datasets and run SQL queries.
+//!
+//! This binary provides subcommands that the Python example scripts call
+//! via subprocess to demonstrate the full Splayed workflow:
+//!
+//! 1. `init`   — create a sample stock dataset (SYM×TIME×FIELD)
+//! 2. `update` — update field values (in-place write)
+//! 3. `compact`— compress a field with ZSTD or LZ4
+//! 4. `read`   — read a field's raw values back
+//! 5. `sql`    — run a SQL query via DataFusion TableProvider
+//!
+//! Usage:
+//!   splayed init  <dataset_dir>
+//!   splayed update <dataset_dir> --field close --sym AAPL --time 0 --value 999.99
+//!   splayed compact <dataset_dir> --field close --algo zstd
+//!   splayed read   <dataset_dir> --field close
+//!   splayed sql     <dataset_dir> --query "SELECT * FROM splayed"
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use arrow_array::{
+    Array, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType as ArrowDT, Field, Schema};
+use clap::{Parser, Subcommand};
+use datafusion::prelude::SessionContext;
+use splayed_arrow::create_table;
+use splayed_core::{
+    compact_field as core_compact, open_dataset,
+    update_field, FieldReader, UpdateItem,
+};
+use splayed_datafusion::SplayedTableProvider;
+use splayed_format::{Compression, DataType, RawValue};
+
+#[derive(Parser)]
+#[command(name = "splayed", about = "Splayed V1 CLI — columnar storage engine")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Create a sample stock dataset with 3 symbols × 5 days.
+    Init {
+        dataset_dir: PathBuf,
+    },
+    /// Update a single cell value (in-place).
+    Update {
+        dataset_dir: PathBuf,
+        #[arg(long)]
+        field: String,
+        #[arg(long)]
+        sym: String,
+        #[arg(long)]
+        time: i64,
+        #[arg(long)]
+        value: f64,
+    },
+    /// Compress a field (ZSTD or LZ4). After compaction the field is read-only.
+    Compact {
+        dataset_dir: PathBuf,
+        #[arg(long)]
+        field: String,
+        #[arg(long, default_value = "zstd")]
+        algo: String,
+    },
+    /// Read a field's raw values and print to stdout.
+    Read {
+        dataset_dir: PathBuf,
+        #[arg(long)]
+        field: String,
+        #[arg(long)]
+        sym: Option<String>,
+    },
+    /// Run a SQL query via DataFusion TableProvider.
+    Sql {
+        dataset_dir: PathBuf,
+        #[arg(long, default_value = "SELECT * FROM splayed LIMIT 20")]
+        query: String,
+    },
+    /// Export the full dataset as a CSV file (for DuckDB / pandas / Excel).
+    Export {
+        dataset_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+}
+
+fn make_sample_batch() -> RecordBatch {
+    // 3 symbols × 5 days each = 15 rows
+    // AAPL: days 0-4  close = 150..154  volume = 1000..4000
+    // GOOG: days 0-4  close = 280..284  volume = 2000..6000
+    // MSFT: days 0-4  close = 380..384  volume = 3000..7000
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", ArrowDT::Date32, false),
+        Field::new("sym", ArrowDT::Utf8, false),
+        Field::new("close", ArrowDT::Float64, true),
+        Field::new("volume", ArrowDT::Int64, true),
+    ]));
+
+    let time = Date32Array::from(vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+    let sym = StringArray::from(vec![
+        Some("AAPL"), Some("AAPL"), Some("AAPL"), Some("AAPL"), Some("AAPL"),
+        Some("GOOG"), Some("GOOG"), Some("GOOG"), Some("GOOG"), Some("GOOG"),
+        Some("MSFT"), Some("MSFT"), Some("MSFT"), Some("MSFT"), Some("MSFT"),
+    ]);
+    let close = Float64Array::from(vec![
+        Some(150.0), Some(151.0), Some(152.0), Some(153.0), Some(154.0),
+        Some(280.0), Some(281.0), Some(282.0), Some(283.0), Some(284.0),
+        Some(380.0), Some(381.0), Some(382.0), Some(383.0), Some(384.0),
+    ]);
+    let volume = Int64Array::from(vec![
+        Some(1000), Some(2000), Some(3000), Some(4000), Some(5000),
+        Some(2000), Some(3000), Some(4000), Some(5000), Some(6000),
+        Some(3000), Some(4000), Some(5000), Some(6000), Some(7000),
+    ]);
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(time),
+            Arc::new(sym),
+            Arc::new(close),
+            Arc::new(volume),
+        ],
+    )
+    .unwrap()
+}
+
+/// Resolve the global row index for a given (sym, time) pair.
+fn resolve_row(dataset: &splayed_core::Dataset, sym: &str, time_val: i64) -> Option<usize> {
+    let meta = &dataset.meta;
+    let sym_idx = meta.symbols.iter().position(|s| s == sym)?;
+    let sym_rec = &meta.sym_index[sym_idx];
+    // Find the local time index within this symbol's time range.
+    let time_start = sym_rec.time_start as i64;
+    let time_count = sym_rec.time_count as i64;
+    let local_idx = time_val - time_start;
+    if local_idx < 0 || local_idx >= time_count {
+        return None;
+    }
+    Some(sym_rec.row_start as usize + local_idx as usize)
+}
+
+fn cmd_init(dir: &PathBuf) {
+    // Clean + create dataset
+    let _ = std::fs::remove_dir_all(dir);
+    create_table(dir, &make_sample_batch(), true).unwrap();
+    println!("✓ Created dataset: {}", dir.display());
+    let ds = open_dataset(dir).unwrap();
+    println!("  Symbols: {:?}", ds.meta.symbols);
+    println!("  Fields: {:?}", ds.list_fields().unwrap());
+    println!("  Total rows: {}", ds.meta.total_rows());
+}
+
+fn cmd_update(dir: &PathBuf, field: &str, sym: &str, time_val: i64, value: f64) {
+    let ds = open_dataset(dir).unwrap();
+    let row = resolve_row(&ds, sym, time_val).unwrap_or_else(|| {
+        panic!("Symbol '{sym}' has no time point {time_val}");
+    });
+    let field_path = ds.field_path(field);
+    let raw = RawValue::from_f64(value);
+    let mut value_bytes = vec![0u8; 8]; // 8 bytes for Float64
+    raw.write_le(&mut value_bytes, 0);
+    update_field(&field_path, &[UpdateItem::new(row as u32, value_bytes)]).unwrap();
+    println!("✓ Updated {field}[{sym}, time={time_val}] = {value}");
+}
+
+fn cmd_compact(dir: &PathBuf, field: &str, algo: &str) {
+    let ds = open_dataset(dir).unwrap();
+    let field_path = ds.field_path(field);
+    // Drop any reader before compacting (Windows mmap).
+    let comp = match algo.to_lowercase().as_str() {
+        "zstd" => Compression::Zstd,
+        "lz4" => Compression::Lz4,
+        _ => panic!("Unknown algorithm: {algo} (use zstd or lz4)"),
+    };
+    core_compact(&field_path, comp).unwrap();
+    println!("✓ Compacted {field} with {algo}");
+}
+
+fn cmd_read(dir: &PathBuf, field: &str, sym_filter: Option<&str>) {
+    let ds = open_dataset(dir).unwrap();
+    let field_path = ds.field_path(field);
+    let reader = FieldReader::open(&field_path).unwrap();
+
+    let dt = reader.data_type();
+    let total = reader.row_count();
+    println!("Field '{field}': type={dt:?}, rows={total}");
+
+    let symbols = match sym_filter {
+        Some(s) => vec![s.to_string()],
+        None => ds.meta.symbols.clone(),
+    };
+
+    for sym_name in &symbols {
+        let sym_idx = ds.meta.symbols.iter().position(|s| s == sym_name).unwrap();
+        let sym_rec = &ds.meta.sym_index[sym_idx];
+        let row_start = sym_rec.row_start as usize;
+        let row_count = sym_rec.time_count as usize;
+        let time_start = sym_rec.time_start as usize;
+        print!("  {sym_name:6}: ");
+        for i in 0..row_count {
+            let row = (row_start + i) as u32;
+            let t = ds.meta.time_axis[time_start + i];
+            match dt {
+                DataType::Float64 => {
+                    let v = reader.read_row(row).unwrap();
+                    match v.as_f64() {
+                        Some(f) => print!("[t={t}: {f:.1}] "),
+                        None => print!("[t={t}: NULL] "),
+                    }
+                }
+                DataType::Int64 => {
+                    let v = reader.read_row(row).unwrap();
+                    match v.as_i64() {
+                        Some(v) => print!("[t={t}: {v}] "),
+                        None => print!("[t={t}: NULL] "),
+                    }
+                }
+                _ => print!("[t={t}: ?] "),
+            }
+        }
+        println!();
+    }
+}
+
+async fn cmd_sql(dir: &PathBuf, query: &str) {
+    let ctx = SessionContext::new();
+    let provider = SplayedTableProvider::new(dir).unwrap();
+    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+
+    println!("SQL: {query}");
+    let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
+
+    for batch in &batches {
+        print_record_batch(batch);
+    }
+}
+
+/// Print a RecordBatch as a simple table.
+fn print_record_batch(batch: &RecordBatch) {
+    let schema = batch.schema();
+
+    // Column headers
+    let headers: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    let sep: String = headers.iter().map(|h| "-".repeat(h.len().max(8) + 2)).collect::<Vec<_>>().join("+");
+    let header_line: String = headers
+        .iter()
+        .map(|h| format!(" {:<w$} ", h, w = h.len().max(8)))
+        .collect::<Vec<_>>()
+        .join("|");
+    println!("{header_line}");
+    println!("{sep}");
+
+    // Rows
+    for row_idx in 0..batch.num_rows() {
+        let cells: Vec<String> = (0..batch.num_columns())
+            .map(|col_idx| {
+                let col = batch.column(col_idx);
+                let dt = schema.field(col_idx).data_type();
+                use arrow_schema::DataType;
+                match dt {
+                    DataType::Utf8 => {
+                        let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+                        if arr.is_null(row_idx) { "NULL".to_string() } else { arr.value(row_idx).to_string() }
+                    }
+                    DataType::Float64 => {
+                        let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
+                        if arr.is_null(row_idx) { "NULL".to_string() } else { format!("{:.2}", arr.value(row_idx)) }
+                    }
+                    DataType::Int64 => {
+                        let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
+                        if arr.is_null(row_idx) { "NULL".to_string() } else { arr.value(row_idx).to_string() }
+                    }
+                    DataType::Date32 => {
+                        let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
+                        arr.value(row_idx).to_string()
+                    }
+                    _ => "?".to_string(),
+                }
+            })
+            .collect();
+        let line: String = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" {:<w$} ", c, w = headers.get(i).map_or(8, |h| h.len().max(8))))
+            .collect::<Vec<_>>()
+            .join("|");
+        println!("{line}");
+    }
+    println!();
+}
+
+/// Export the full dataset to a CSV file via DataFusion + arrow-csv.
+async fn cmd_export(dir: &PathBuf, output: &PathBuf) {
+    let ctx = SessionContext::new();
+    let provider = SplayedTableProvider::new(dir).unwrap();
+    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+
+    let batches = ctx.sql("SELECT * FROM splayed").await.unwrap().collect().await.unwrap();
+
+    // Write CSV
+    use arrow_csv::WriterBuilder;
+    let file = std::fs::File::create(output).unwrap();
+    let mut writer = WriterBuilder::new().with_header(true).build(file);
+    for batch in &batches {
+        writer.write(batch).unwrap();
+    }
+    println!("✓ Exported {} rows to {}", batches.iter().map(|b| b.num_rows()).sum::<usize>(), output.display());
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::Init { dataset_dir } => cmd_init(&dataset_dir),
+        Commands::Update {
+            dataset_dir,
+            field,
+            sym,
+            time,
+            value,
+        } => cmd_update(&dataset_dir, &field, &sym, time, value),
+        Commands::Compact {
+            dataset_dir,
+            field,
+            algo,
+        } => cmd_compact(&dataset_dir, &field, &algo),
+        Commands::Read {
+            dataset_dir,
+            field,
+            sym,
+        } => cmd_read(&dataset_dir, &field, sym.as_deref()),
+        Commands::Sql { dataset_dir, query } => cmd_sql(&dataset_dir, &query).await,
+        Commands::Export { dataset_dir, output } => cmd_export(&dataset_dir, &output).await,
+    }
+}
