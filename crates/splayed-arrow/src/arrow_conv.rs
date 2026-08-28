@@ -10,10 +10,7 @@
 
 use splayed_format::{DataType, RawValue, TimeType};
 use arrow_array::{
-    builder::{
-        BooleanBuilder, Date32Builder, Float32Builder, Float64Builder, Int32Builder,
-        Int64Builder, TimestampMicrosecondBuilder,
-    },
+    builder::BooleanBuilder,
     Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
     Int64Array, TimestampMicrosecondArray,
 };
@@ -119,76 +116,102 @@ pub fn arrow_value_to_raw(arr: &dyn Array, i: usize, splayed_ty: DataType) -> Op
 /// - canonical NaN → Arrow validity = 0 (NULL)
 /// - other NaN → Arrow validity = 1, value = NaN (preserved)
 pub fn column_view_to_arrow(view: &splayed_core::ColumnView) -> ArrayRef {
-    match view.data_type {
+    let dt = view.data_type;
+    let sz = dt.size_of();
+    let null_pat = dt.null_bytes();
+    let n = view.row_count;
+    let bytes = view.bytes;
+
+    match dt {
         DataType::Bool => {
-            let mut b = BooleanBuilder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_bool().unwrap_or(false)),
-                    _ => b.append_null(),
+            let mut b = BooleanBuilder::with_capacity(n);
+            for i in 0..n {
+                let off = i * sz;
+                if &bytes[off..off + sz] == null_pat {
+                    b.append_null();
+                } else {
+                    b.append_value(bytes[off] != 0);
                 }
             }
             Arc::new(b.finish())
         }
         DataType::Int32 => {
-            let mut b = Int32Builder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_i32().unwrap_or(0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<i32>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i32::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Int32Array::from(vals))
         }
         DataType::Int64 => {
-            let mut b = Int64Builder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_i64().unwrap_or(0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<i64>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i64::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Int64Array::from(vals))
         }
         DataType::Float32 => {
-            let mut b = Float32Builder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_f32().unwrap_or(0.0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<f32>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(f32::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Float32Array::from(vals))
         }
         DataType::Float64 => {
-            let mut b = Float64Builder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_f64().unwrap_or(0.0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<f64>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(f64::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Float64Array::from(vals))
         }
         DataType::Date32 => {
-            let mut b = Date32Builder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_i32().unwrap_or(0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<i32>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i32::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Date32Array::from(vals))
         }
         DataType::TimestampUs => {
-            let mut b = TimestampMicrosecondBuilder::with_capacity(view.row_count);
-            for i in 0..view.row_count {
-                match view.get(i) {
-                    Some(v) if !v.is_null() => b.append_value(v.as_i64().unwrap_or(0)),
-                    _ => b.append_null(),
-                }
-            }
-            Arc::new(b.finish())
+            let vals: Vec<Option<i64>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i64::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(TimestampMicrosecondArray::from(vals))
         }
     }
 }

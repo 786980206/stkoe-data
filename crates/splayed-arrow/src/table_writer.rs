@@ -178,7 +178,26 @@ pub fn update_table(
         let splayed_ty = arrow_to_splayed_type(field.data_type())
             .ok_or_else(|| TableError::UnsupportedType(field.data_type().clone()))?;
 
+        // Verify the incoming type matches the existing FIELD's type (C3 fix).
         let field_path = folder.join(&name);
+        {
+            let reader = splayed_core::FieldReader::open(&field_path)
+                .map_err(|e| TableError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("open field '{name}' for type check: {e}"),
+                )))?;
+            let field_dt = reader.data_type();
+            if field_dt != splayed_ty {
+                return Err(TableError::TypeMismatch {
+                    field: name,
+                    expected: field_dt,
+                    got: splayed_ty,
+                });
+            }
+            // Drop reader before writing (Windows mmap safety).
+            drop(reader);
+        }
+
         let elem_sz = splayed_ty.size_of();
         let arr = data.column(col_idx);
 
@@ -271,6 +290,12 @@ pub enum TableError {
     NullTime { row: usize },
     SymTimeNotFound { row: usize },
     FieldNotFound(String),
+    /// The incoming Arrow type does not match the FIELD's stored DataType.
+    TypeMismatch {
+        field: String,
+        expected: splayed_format::DataType,
+        got: splayed_format::DataType,
+    },
     UnsupportedType(arrow_schema::DataType),
     Io(std::io::Error),
     CreateMeta(crate::CreateMetaError),
@@ -291,6 +316,9 @@ impl std::fmt::Display for TableError {
                 write!(f, "(SYM, TIME) at row {row} not found in META")
             }
             Self::FieldNotFound(name) => write!(f, "field '{name}' not found on disk"),
+            Self::TypeMismatch { field, expected, got } => {
+                write!(f, "type mismatch for field '{field}': expected {expected:?}, got {got:?}")
+            }
             Self::UnsupportedType(ty) => write!(f, "unsupported Arrow type: {ty}"),
             Self::Io(e) => write!(f, "table io error: {e}"),
             Self::CreateMeta(e) => write!(f, "create_meta failed: {e}"),

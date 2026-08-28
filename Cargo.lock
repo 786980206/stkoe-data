@@ -2629,7 +2629,6 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
- "half",
  "splayed-codec",
  "splayed-core",
  "splayed-format",
@@ -2639,14 +2638,12 @@ dependencies = [
 name = "splayed-cli"
 version = "0.1.0"
 dependencies = [
- "arrow",
  "arrow-array",
  "arrow-csv",
  "arrow-schema",
  "clap",
  "datafusion",
  "splayed-arrow",
- "splayed-codec",
  "splayed-core",
  "splayed-datafusion",
  "splayed-duckdb",

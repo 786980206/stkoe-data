@@ -14,8 +14,6 @@
 //! generate SIMD instructions (SSE2/AVX2 on x86, NEON on ARM) without
 //! explicit intrinsics.
 
-use splayed_format::DataType;
-
 /// A bitmask where bit `i` is 1 if row `i` passes the filter.
 ///
 /// For `row_count > 64`, only the first 64 rows are evaluated (caller
@@ -100,17 +98,14 @@ fn filter_mask_f64<F: Fn(f64, f64) -> bool>(
     cmp: F,
 ) -> u64 {
     let values = unsafe { cast_bytes::<f64>(data, row_count) };
-    let null_bits = DataType::Float64.null_bytes();
-    let null_u64 = u64::from_le_bytes(null_bits.try_into().unwrap());
     let mut mask: u64 = 0;
 
     for (i, &v) in values.iter().enumerate() {
         if i >= 64 {
             break;
         }
-        // Check for canonical NaN (NULL sentinel) via bit pattern.
-        let bits = v.to_bits();
-        if bits == null_u64 {
+        // Skip NULL (canonical NaN) and all NaN to match scalar path.
+        if v.is_nan() {
             continue;
         }
         if cmp(v, threshold) {
@@ -174,13 +169,12 @@ pub fn batch_filter_f64<F: Fn(f64, f64) -> bool>(
     cmp: F,
 ) -> Vec<usize> {
     let values = unsafe { cast_bytes::<f64>(data, row_count) };
-    let null_bits = DataType::Float64.null_bytes();
-    let null_u64 = u64::from_le_bytes(null_bits.try_into().unwrap());
     let mut indices = Vec::with_capacity(row_count / 2);
 
     for (i, &v) in values.iter().enumerate() {
-        let bits = v.to_bits();
-        if bits == null_u64 {
+        // Skip NULL (canonical NaN) and all other NaN values to match
+        // the scalar compare() path which returns 0 for NaN (no match).
+        if v.is_nan() {
             continue;
         }
         if cmp(v, threshold) {
@@ -253,9 +247,8 @@ mod tests {
     #[test]
     fn f64_filter_with_null() {
         let mut values: Vec<f64> = vec![1.0, 5.0, 10.0, 15.0];
-        // Insert a NULL (canonical NaN) at index 1
-        let null_bits = DataType::Float64.null_bytes();
-        values[1] = f64::from_bits(u64::from_le_bytes(null_bits.try_into().unwrap()));
+        // Insert a NULL (canonical NaN = 0x7FF8000000000000) at index 1.
+        values[1] = f64::from_bits(0x7FF8_0000_0000_0000);
         let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         // filter > 0: indices 0, 2, 3 pass (index 1 is NULL → fails)

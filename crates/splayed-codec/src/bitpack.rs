@@ -61,11 +61,21 @@ pub fn encode(data: &[u8], data_type: DataType, count: usize) -> Result<Vec<u8>,
     // Find min and max to determine bit width.
     let min_val = *values.iter().min().unwrap();
     let max_val = *values.iter().max().unwrap();
-    let range = (max_val - min_val) as u64;
+    // Use wrapping subtraction to avoid overflow on wide-range i64.
+    // Then validate the range fits within 32 bits (BITPACK is not worthwhile beyond that).
+    let range = max_val.wrapping_sub(min_val) as u64;
+    if range > (1u64 << 32) {
+        // Range too wide — BITPACK would use >32 bits, negating any savings.
+        return Err(CodecError::InvalidInput);
+    }
 
     // Determine bit width: number of bits to represent `range`.
-    let bit_width = if range == 0 { 1 } else { 64 - range.leading_zeros() as u8 };
-    let bit_width = bit_width.max(1).min(64);
+    let bit_width = if range == 0 {
+        1
+    } else {
+        64 - range.leading_zeros() as u8
+    };
+    let bit_width = bit_width.max(1).min(32);
 
     // Pack values: subtract min, pack into bit_width bits.
     let total_bits = count as u64 * bit_width as u64;

@@ -249,6 +249,9 @@ impl MetaFile {
             let end = u64::from_le_bytes(buf[dict_off + (i + 1) * 8..dict_off + (i + 1) * 8 + 8].try_into().unwrap()) as usize;
             let str_start = dict_index_end + start;
             let str_end = dict_index_end + end;
+            if str_start > str_end {
+                return Err(MetaError::Truncated);
+            }
             if str_end > buf.len() {
                 return Err(MetaError::Truncated);
             }
@@ -356,18 +359,23 @@ impl MetaBuilder {
         // Group pairs by symbol (data is already sorted by sym).
         let mut pair_idx = 0usize;
         for sym in &symbols {
-            // Find the time indices for this symbol.
-            let mut times_for_sym: Vec<usize> = Vec::new();
+            // Find the first and last time indices for this symbol.
+            // Since pairs are sorted by (sym, time), the first element is the min
+            // and the last is the max — no need for a Vec allocation or min/max scan.
+            let mut first_ti: Option<usize> = None;
+            let mut last_ti: usize = 0;
             while pair_idx < self.pairs.len() && self.pairs[pair_idx].0 == *sym {
                 let t = self.pairs[pair_idx].1;
-                times_for_sym.push(time_index(t));
+                let ti = time_index(t);
+                if first_ti.is_none() {
+                    first_ti = Some(ti);
+                }
+                last_ti = ti;
                 pair_idx += 1;
             }
-            // time_start = min index, time_count = max - min + 1 (continuous interval).
-            let &min_ti = times_for_sym.iter().min().unwrap();
-            let &max_ti = times_for_sym.iter().max().unwrap();
+            let min_ti = first_ti.unwrap();
             let time_start = min_ti as u32;
-            let time_count = (max_ti - min_ti + 1) as u32;
+            let time_count = (last_ti - min_ti + 1) as u32;
 
             sym_index.push(SymIndexRecord {
                 time_start,

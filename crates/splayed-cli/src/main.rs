@@ -135,24 +135,15 @@ fn make_sample_batch() -> RecordBatch {
     .unwrap()
 }
 
-/// Resolve the global row index for a given (sym, time) pair.
-fn resolve_row(dataset: &splayed_core::Dataset, sym: &str, time_val: i64) -> Option<usize> {
-    let meta = &dataset.meta;
-    let sym_idx = meta.symbols.iter().position(|s| s == sym)?;
-    let sym_rec = &meta.sym_index[sym_idx];
-    // Find the local time index within this symbol's time range.
-    let time_start = sym_rec.time_start as i64;
-    let time_count = sym_rec.time_count as i64;
-    let local_idx = time_val - time_start;
-    if local_idx < 0 || local_idx >= time_count {
-        return None;
-    }
-    Some(sym_rec.row_start as usize + local_idx as usize)
-}
-
 fn cmd_init(dir: &PathBuf) {
-    // Clean + create dataset
-    let _ = std::fs::remove_dir_all(dir);
+    // Only overwrite if it's an existing Splayed dataset (has .meta).
+    let meta_path = dir.join(".meta");
+    if meta_path.exists() {
+        std::fs::remove_dir_all(dir).expect("removing existing dataset");
+    } else if dir.exists() {
+        eprintln!("✗ Directory exists and is not a Splayed dataset: {}", dir.display());
+        std::process::exit(1);
+    }
     create_table(dir, &make_sample_batch(), true).unwrap();
     println!("✓ Created dataset: {}", dir.display());
     let ds = open_dataset(dir).unwrap();
@@ -163,21 +154,37 @@ fn cmd_init(dir: &PathBuf) {
 
 fn cmd_update(dir: &PathBuf, field: &str, sym: &str, time_val: i64, value: f64) {
     let ds = open_dataset(dir).unwrap();
-    let row = resolve_row(&ds, sym, time_val).unwrap_or_else(|| {
-        panic!("Symbol '{sym}' has no time point {time_val}");
+    let row = ds.meta.global_row(sym, time_val).unwrap_or_else(|| {
+        eprintln!("✗ Symbol '{sym}' has no time point {time_val}");
+        std::process::exit(1);
     });
     let field_path = ds.field_path(field);
-    let raw = RawValue::from_f64(value);
-    let mut value_bytes = vec![0u8; 8]; // 8 bytes for Float64
+    // Read the field's DataType to determine the correct value width.
+    let reader = FieldReader::open(&field_path).expect("open field for type check");
+    let field_dt = reader.data_type();
+    let sz = field_dt.size_of();
+    let mut value_bytes = vec![0u8; sz];
+    // Encode the value based on the field type.
+    let raw = match field_dt {
+        DataType::Float64 => RawValue::from_f64(value),
+        DataType::Float32 => RawValue::from_f32(value as f32),
+        DataType::Int64 => RawValue::from_i64(value as i64),
+        DataType::Int32 => RawValue::from_i32(value as i32),
+        _ => {
+            eprintln!("✗ Cannot update field of type {field_dt:?} with f64 value");
+            std::process::exit(1);
+        }
+    };
     raw.write_le(&mut value_bytes, 0);
-    update_field(&field_path, &[UpdateItem::new(row as u32, value_bytes)]).unwrap();
+    // Drop the reader before writing (Windows mmap safety).
+    drop(reader);
+    update_field(&field_path, &[UpdateItem::new(row, value_bytes)]).unwrap();
     println!("✓ Updated {field}[{sym}, time={time_val}] = {value}");
 }
 
 fn cmd_compact(dir: &PathBuf, field: &str, algo: &str) {
     let ds = open_dataset(dir).unwrap();
     let field_path = ds.field_path(field);
-    // Drop any reader before compacting (Windows mmap).
     let comp = match algo.to_lowercase().as_str() {
         "zstd" => Compression::Zstd,
         "lz4" => Compression::Lz4,
@@ -202,7 +209,14 @@ fn cmd_read(dir: &PathBuf, field: &str, sym_filter: Option<&str>) {
     };
 
     for sym_name in &symbols {
-        let sym_idx = ds.meta.symbols.iter().position(|s| s == sym_name).unwrap();
+        let sym_idx = match ds.meta.find_symbol(sym_name) {
+            Some(idx) => idx,
+            None => {
+                eprintln!("✗ Symbol '{sym_name}' not found in dataset");
+                eprintln!("  Available symbols: {:?}", ds.meta.symbols);
+                std::process::exit(1);
+            }
+        };
         let sym_rec = &ds.meta.sym_index[sym_idx];
         let row_start = sym_rec.row_start as usize;
         let row_count = sym_rec.time_count as usize;
@@ -210,6 +224,10 @@ fn cmd_read(dir: &PathBuf, field: &str, sym_filter: Option<&str>) {
         print!("  {sym_name:6}: ");
         for i in 0..row_count {
             let row = (row_start + i) as u32;
+            // `i` is the LOCAL row index within this symbol's range (0..row_count),
+            // and `time_start` is this symbol's start index into the global TIME
+            // AXIS. So `time_start + i` is the correct global time axis index for
+            // this row's time label.
             let t = ds.meta.time_axis[time_start + i];
             match dt {
                 DataType::Float64 => {

@@ -89,24 +89,12 @@ fn build_schema(dataset: &Dataset) -> DFResult<DFSchema> {
         let reader = splayed_core::FieldReader::open(&path).map_err(|e| {
             DataFusionError::Execution(format!("open field '{name}' failed: {e}"))
         })?;
-        let splayed_ty = reader.data_type();
-        let arrow_ty = splayed_to_arrow_type(splayed_ty);
+        // Use the shared type mapper from splayed-arrow (avoids D1 duplication).
+        let arrow_ty = splayed_arrow::splayed_to_arrow_type(reader.data_type());
         fields.push(DFField::new(&name, arrow_ty, true));
     }
 
     Ok(DFSchema::new(fields))
-}
-
-fn splayed_to_arrow_type(ty: SplayedDataType) -> DFDataType {
-    match ty {
-        SplayedDataType::Bool => DFDataType::Boolean,
-        SplayedDataType::Int32 => DFDataType::Int32,
-        SplayedDataType::Int64 => DFDataType::Int64,
-        SplayedDataType::Float32 => DFDataType::Float32,
-        SplayedDataType::Float64 => DFDataType::Float64,
-        SplayedDataType::Date32 => DFDataType::Date32,
-        SplayedDataType::TimestampUs => DFDataType::Timestamp(DFTimeUnit::Microsecond, None),
-    }
 }
 
 #[async_trait::async_trait]

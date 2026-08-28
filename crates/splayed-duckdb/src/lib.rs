@@ -33,7 +33,7 @@ use splayed_arrow::column_view_to_arrow;
 use splayed_core::{
     open_dataset, Dataset, ScanBatchOwned, ScanRequest, Scanner, SymbolSelection, TimeRange,
 };
-use splayed_format::{DataType as SplayedDataType, TimeType};
+use splayed_format::TimeType;
 
 /// Errors that can occur during Splayed → Arrow IPC export.
 #[derive(Debug)]
@@ -81,28 +81,14 @@ pub fn build_arrow_schema(dataset: &Dataset) -> SchemaRef {
         for name in field_names {
             let path = dataset.field_path(&name);
             if let Ok(reader) = splayed_core::FieldReader::open(&path) {
-                let arrow_ty = splayed_to_arrow_type(reader.data_type());
+                // Use the shared type mapper from splayed-arrow (avoids D1 duplication).
+                let arrow_ty = splayed_arrow::splayed_to_arrow_type(reader.data_type());
                 fields.push(Field::new(&name, arrow_ty, true));
             }
         }
     }
 
     Arc::new(Schema::new(fields))
-}
-
-/// Map a Splayed `DataType` to its Arrow equivalent.
-fn splayed_to_arrow_type(ty: SplayedDataType) -> ArrowDataType {
-    match ty {
-        SplayedDataType::Bool => ArrowDataType::Boolean,
-        SplayedDataType::Int32 => ArrowDataType::Int32,
-        SplayedDataType::Int64 => ArrowDataType::Int64,
-        SplayedDataType::Float32 => ArrowDataType::Float32,
-        SplayedDataType::Float64 => ArrowDataType::Float64,
-        SplayedDataType::Date32 => ArrowDataType::Date32,
-        SplayedDataType::TimestampUs => {
-            ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None)
-        }
-    }
 }
 
 /// Convert a `ScanBatchOwned` to an Arrow `RecordBatch`.

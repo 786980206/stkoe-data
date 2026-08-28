@@ -74,13 +74,20 @@ pub fn create_meta(
 
     let meta = builder.build().map_err(CreateMetaError::MetaBuild)?;
 
-    // Write .meta atomically: write to temp, fsync, rename.
+    // Write .meta atomically: write to temp, fsync, rename (plan §6).
     let meta_path = folder.join(META_FILE_NAME);
     let tmp_path = folder.join(format!("{META_FILE_NAME}.new"));
 
     fs::create_dir_all(folder).map_err(CreateMetaError::Io)?;
     let bytes = meta.serialize();
-    fs::write(&tmp_path, &bytes).map_err(CreateMetaError::Io)?;
+
+    // Open temp file, write, fsync, then drop before rename.
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp_path).map_err(CreateMetaError::Io)?;
+        file.write_all(&bytes).map_err(CreateMetaError::Io)?;
+        file.sync_all().map_err(CreateMetaError::Io)?;
+    }
     fs::rename(&tmp_path, &meta_path).map_err(CreateMetaError::Io)?;
 
     Ok(meta)

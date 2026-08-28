@@ -18,6 +18,8 @@
 
 use splayed_format::DataType;
 
+use std::sync::Arc;
+
 use crate::dataset::Dataset;
 use crate::reader::FieldReader;
 use crate::ColumnView;
@@ -346,8 +348,8 @@ impl<'ds> Scanner<'ds> {
 
         let filter = request.filter.clone();
         let batch_size = request.batch_size;
-        let time_axis = self.dataset.meta.time_axis.clone();
-        // symbols is not needed — sym_idx is already in RowRange.
+        // Wrap in Arc to avoid cloning the full time_axis per thread (P2).
+        let time_axis: Arc<[i64]> = Arc::from(self.dataset.meta.time_axis.as_slice());
 
         // Spawn threads.
         let handles: Vec<_> = range_chunks
@@ -355,7 +357,7 @@ impl<'ds> Scanner<'ds> {
             .map(|chunk| {
                 let col_paths = col_paths.clone();
                 let filter = filter.clone();
-                let time_axis = time_axis.clone();
+                let time_axis = Arc::clone(&time_axis); // cheap ref-count clone
 
                 std::thread::spawn(move || -> Result<Vec<ScanBatchOwned>, ScannerError> {
                     // Open readers in this thread.
@@ -405,41 +407,30 @@ impl<'ds> Scanner<'ds> {
 
                             let mut row_count = to_read;
 
-                            // Apply filter if present.
+                            // Apply filter if present (shared logic with next_batch).
                             if let Some(ref f) = filter {
                                 let filter_field = f.field_name();
-                                if let Some(idx) =
-                                    col_data.iter().position(|(n, _, _)| n == filter_field)
-                                {
-                                    let filter_dt = col_data[idx].2;
-                                    let filter_bytes = &col_data[idx].1;
-                                    let view = ColumnView::new(filter_dt, filter_bytes, row_count);
-                                    let mut passing = Vec::with_capacity(row_count);
-                                    for i in 0..row_count {
-                                        let val = view.get(i).unwrap();
-                                        if filter_passes(f, &val) {
-                                            passing.push(i);
-                                        }
-                                    }
-                                    let passing_count = passing.len();
-                                    let mut new_data = Vec::with_capacity(col_data.len());
-                                    for (name, bytes, dt) in col_data {
-                                        let sz = dt.size_of();
-                                        let mut compacted =
-                                            Vec::with_capacity(passing_count * sz);
-                                        for &i in &passing {
-                                            let off = i * sz;
-                                            compacted.extend_from_slice(&bytes[off..off + sz]);
-                                        }
-                                        new_data.push((name, compacted, dt));
-                                    }
-                                    col_data = new_data;
-                                    sym_indices =
-                                        passing.iter().map(|&i| sym_indices[i]).collect();
-                                    time_values =
-                                        passing.iter().map(|&i| time_values[i]).collect();
-                                    row_count = passing_count;
-                                }
+                                let idx = col_data
+                                    .iter()
+                                    .position(|(n, _, _)| n == filter_field)
+                                    .ok_or_else(|| {
+                                        ScannerError::FilterFieldNotProjected(
+                                            filter_field.to_string(),
+                                        )
+                                    })?;
+                                let filter_dt = col_data[idx].2;
+                                let filter_bytes = &col_data[idx].1;
+
+                                let passing =
+                                    passing_indices(f, filter_dt, filter_bytes, row_count);
+                                let (new_data, passing_count) = compact_passing(
+                                    col_data,
+                                    &mut sym_indices,
+                                    &mut time_values,
+                                    &passing,
+                                );
+                                col_data = new_data;
+                                row_count = passing_count;
                             }
 
                             if row_count > 0 {
@@ -557,7 +548,7 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
             .collect();
 
-        // Apply filter if present.
+        // Apply filter if present (shared with scan_all_parallel for identical behavior).
         if let Some(ref filter) = self.filter {
             let filter_field = filter.field_name();
             let idx = col_data
@@ -567,45 +558,9 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             let filter_dt = col_data[idx].2;
             let filter_bytes = &col_data[idx].1;
 
-            // Build a temp ColumnView for the filter column.
-            let view = ColumnView::new(filter_dt, filter_bytes, row_count);
-
-            // Compute which rows pass the filter.
-            // Use SIMD-accelerated batch filter for f64/i64 columns,
-            // fall back to scalar loop for other types.
-            let passing: Vec<usize> = match filter_dt {
-                DataType::Float64 => {
-                    if let Some(threshold) = extract_f64_threshold(filter) {
-                        simd_batch_filter_f64(filter_bytes, threshold, row_count, filter)
-                    } else {
-                        scalar_filter(&view, filter, row_count)
-                    }
-                }
-                DataType::Int64 => {
-                    if let Some(threshold) = extract_i64_threshold(filter) {
-                        simd_batch_filter_i64(filter_bytes, threshold, row_count, filter)
-                    } else {
-                        scalar_filter(&view, filter, row_count)
-                    }
-                }
-                _ => scalar_filter(&view, filter, row_count),
-            };
-
-            // Compact each column to only passing rows.
-            let passing_count = passing.len();
-            let mut new_col_data = Vec::with_capacity(col_data.len());
-            for (name, bytes, dt) in col_data {
-                let sz = dt.size_of();
-                let mut compacted = Vec::with_capacity(passing_count * sz);
-                for &i in &passing {
-                    let off = i * sz;
-                    compacted.extend_from_slice(&bytes[off..off + sz]);
-                }
-                new_col_data.push((name, compacted, dt));
-            }
-            // Also compact sym_indices and time_values.
-            sym_indices = passing.iter().map(|&i| sym_indices[i]).collect();
-            time_values = passing.iter().map(|&i| time_values[i]).collect();
+            let passing = passing_indices(filter, filter_dt, filter_bytes, row_count);
+            let (new_col_data, passing_count) =
+                compact_passing(col_data, &mut sym_indices, &mut time_values, &passing);
 
             self.exhausted = self.current_range_idx >= self.ranges.len();
             if passing_count == 0 && self.exhausted {
@@ -666,18 +621,55 @@ impl Filter {
             | Self::NotEqual { field, .. } => field,
         }
     }
+}
 
-    #[allow(dead_code)]
-    fn value(&self) -> &FilterValue {
-        match self {
-            Self::GreaterThan { value, .. }
-            | Self::GreaterOrEqual { value, .. }
-            | Self::LessThan { value, .. }
-            | Self::LessOrEqual { value, .. }
-            | Self::Equal { value, .. }
-            | Self::NotEqual { value, .. } => value,
-        }
+/// Compute the row indices that pass the filter on a given column.
+///
+/// Shared between `next_batch` (single-threaded) and `scan_all_parallel` (parallel)
+/// to ensure identical behavior including SIMD fast paths for f64/i64 columns.
+///
+/// Returns an error if the filter field is not in the projection.
+fn passing_indices(
+    filter: &Filter,
+    filter_dt: DataType,
+    filter_bytes: &[u8],
+    row_count: usize,
+) -> Vec<usize> {
+    let view = ColumnView::new(filter_dt, filter_bytes, row_count);
+    match filter_dt {
+        DataType::Float64 => extract_f64_threshold(filter)
+            .map(|t| simd_batch_filter_f64(filter_bytes, t, row_count, filter))
+            .unwrap_or_else(|| scalar_filter(&view, filter, row_count)),
+        DataType::Int64 => extract_i64_threshold(filter)
+            .map(|t| simd_batch_filter_i64(filter_bytes, t, row_count, filter))
+            .unwrap_or_else(|| scalar_filter(&view, filter, row_count)),
+        _ => scalar_filter(&view, filter, row_count),
     }
+}
+
+/// Compact column data + sym/time vectors to only the passing rows.
+fn compact_passing(
+    col_data: Vec<(String, Vec<u8>, DataType)>,
+    sym_indices: &mut Vec<usize>,
+    time_values: &mut Vec<i64>,
+    passing: &[usize],
+) -> (Vec<(String, Vec<u8>, DataType)>, usize) {
+    let passing_count = passing.len();
+    let mut new_col_data = Vec::with_capacity(col_data.len());
+    for (name, bytes, dt) in col_data {
+        let sz = dt.size_of();
+        let mut compacted = Vec::with_capacity(passing_count * sz);
+        for &i in passing {
+            let off = i * sz;
+            compacted.extend_from_slice(&bytes[off..off + sz]);
+        }
+        new_col_data.push((name, compacted, dt));
+    }
+    let new_sym: Vec<usize> = passing.iter().map(|&i| sym_indices[i]).collect();
+    let new_time: Vec<i64> = passing.iter().map(|&i| time_values[i]).collect();
+    *sym_indices = new_sym;
+    *time_values = new_time;
+    (new_col_data, passing_count)
 }
 
 /// Scalar (non-SIMD) filter loop — used as fallback for non-numeric types.

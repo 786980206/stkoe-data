@@ -18,8 +18,15 @@
 //!
 //! Random single-row access is not supported on compressed fields; they are
 //! meant for large-range scans / cold data / archival (plan §5.6).
+//!
+//! ## Crash safety
+//!
+//! `compact_field` writes to a temporary file (`<field>.tmp`), fsyncs it,
+//! then atomically renames over the original — matching the META commit
+//! pattern (plan §6). A crash during compaction leaves the original FIELD
+//! intact.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -27,20 +34,22 @@ use splayed_format::{Compression, FieldHeader, HEADER_SIZE};
 
 use crate::CodecError;
 
-/// Compress a FIELD file in-place.
+/// Compress a FIELD file atomically.
 ///
 /// The field must currently be `compression = NONE`.  After compaction the
 /// file is read-only (`update_field` will refuse to write).
+///
+/// Writes to `<field_path>.tmp`, fsyncs, then atomically renames over the
+/// original — a crash leaves the original file intact.
 pub fn compact_field(
     field_path: impl AsRef<Path>,
     compression: Compression,
 ) -> Result<(), CompactError> {
     let field_path = field_path.as_ref();
 
-    // --- Read current header ---
+    // --- Read current header + data ---
     let mut file = OpenOptions::new()
         .read(true)
-        .write(true)
         .open(field_path)
         .map_err(CompactError::Io)?;
 
@@ -68,6 +77,9 @@ pub fn compact_field(
         .map_err(CompactError::Io)?;
     file.read_exact(&mut raw_data).map_err(CompactError::Io)?;
 
+    // Close the original file before rename (Windows mmap/lock safety).
+    drop(file);
+
     // --- Compress ---
     let compressed = compress(&raw_data, compression)?;
 
@@ -78,20 +90,21 @@ pub fn compact_field(
 
     let new_data_length = new_data.len() as u64;
 
-    // --- Rewrite file: truncate to header + new data ---
+    // --- Write to temp file, fsync, then atomic rename ---
     let mut new_header = header;
     new_header.compression = compression as u8;
     new_header.data_length = new_data_length;
 
-    file.seek(SeekFrom::Start(0)).map_err(CompactError::Io)?;
-    file.write_all(bytemuck::bytes_of(&new_header))
-        .map_err(CompactError::Io)?;
-    file.write_all(&new_data).map_err(CompactError::Io)?;
+    let tmp_path = field_path.with_extension("tmp");
+    {
+        let mut tmp = File::create(&tmp_path).map_err(CompactError::Io)?;
+        tmp.write_all(bytemuck::bytes_of(&new_header))
+            .map_err(CompactError::Io)?;
+        tmp.write_all(&new_data).map_err(CompactError::Io)?;
+        tmp.sync_all().map_err(CompactError::Io)?;
+    }
 
-    // Truncate any leftover bytes from the old (larger) data region.
-    let new_file_size = HEADER_SIZE as u64 + new_data_length;
-    file.set_len(new_file_size).map_err(CompactError::Io)?;
-    file.sync_all().map_err(CompactError::Io)?;
+    std::fs::rename(&tmp_path, field_path).map_err(CompactError::Io)?;
 
     Ok(())
 }
@@ -118,12 +131,28 @@ pub fn decompress_field_data(
     let comp = header.compression().map_err(DecompressError::Format)?;
     if comp == Compression::None {
         // Not compressed — return raw data.
-        let mut data = vec![0u8; header.data_length as usize];
+        // Validate data_length against file size to prevent huge allocations.
+        let file_size = file
+            .metadata()
+            .map_err(DecompressError::Io)?
+            .len();
+        let data_len = header.data_length as usize;
+        if HEADER_SIZE as u64 + data_len as u64 > file_size {
+            return Err(DecompressError::Format("data_length exceeds file size"));
+        }
+        let mut data = vec![0u8; data_len];
         file.read_exact(&mut data).map_err(DecompressError::Io)?;
         return Ok(data);
     }
 
     // Read [u64 uncompressed_len] + [compressed payload].
+    // Guard against malformed headers where data_length < 8.
+    if header.data_length < 8 {
+        return Err(DecompressError::Format(
+            "compressed field data_length < 8 (missing uncompressed_len prefix)",
+        ));
+    }
+
     let mut len_buf = [0u8; 8];
     file.read_exact(&mut len_buf).map_err(DecompressError::Io)?;
     let uncompressed_len = u64::from_le_bytes(len_buf) as usize;
