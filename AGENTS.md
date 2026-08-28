@@ -90,7 +90,8 @@ cargo test         # all tests must pass
 
 - Phase 1–3: **Complete** (Format, Reader, Writer function interfaces).
 - Phase 4: **Complete** (Scanner, ColumnView, batch API, filter pushdown).
-- Phase 6: Partial (ZSTD done, LZ4/DELTA/RLE planned).
+- Phase 5: In Progress (parallel scan done, SIMD/prefetch planned).
+- Phase 6: **Complete** (ZSTD, LZ4, DELTA, RLE, BITPACK; compressed FieldReader).
 - Phase 7: **Complete** (Arrow conversion, NULL/NaN semantics, type mapping).
 - Phase 8: **Complete** (DataFusion TableProvider, ExecutionPlan, pushdown).
 - Phase 9: Planned (DuckDB).
