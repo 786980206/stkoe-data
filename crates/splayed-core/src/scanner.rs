@@ -479,7 +479,7 @@ impl ScanBatchOwned {
 // ---------------------------------------------------------------------------
 
 impl Filter {
-    fn field_name(&self) -> &str {
+    pub fn field_name(&self) -> &str {
         match self {
             Self::GreaterThan { field, .. }
             | Self::GreaterOrEqual { field, .. }

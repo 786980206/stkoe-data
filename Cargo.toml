@@ -5,6 +5,7 @@ members = [
     "crates/splayed-codec",
     "crates/splayed-core",
     "crates/splayed-arrow",
+    "crates/splayed-datafusion",
 ]
 
 [workspace.package]
@@ -19,8 +20,11 @@ splayed-codec = { path = "crates/splayed-codec" }
 splayed-core = { path = "crates/splayed-core" }
 splayed-arrow = { path = "crates/splayed-arrow" }
 
-# Arrow stack (pinned for reproducibility)
-arrow = "53"
-arrow-array = "53"
-arrow-schema = "53"
+# Arrow stack (pinned to match DataFusion 55)
+arrow = "59"
+arrow-array = "59"
+arrow-schema = "59"
 half = "2"
+
+# DataFusion
+datafusion = "55"
