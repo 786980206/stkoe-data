@@ -129,6 +129,10 @@ impl FieldReader {
     }
 
     /// Read a single value at `row`.
+    ///
+    /// This is the hottest path for point lookups. `#[inline(always)]` ensures
+    /// the compiler can fuse the bounds check with the load.
+    #[inline(always)]
     pub fn read_row(&self, row: u32) -> Result<RawValue, ReaderError> {
         if row >= self.header.row_count {
             return Err(ReaderError::RowOutOfRange {
@@ -145,6 +149,12 @@ impl FieldReader {
     /// Returns `[start_row, start_row + count)` bytes from the data region.
     /// For `compression = NONE` this is zero-copy from the mmap.
     /// For compressed fields it returns a slice from the decompressed buffer.
+    ///
+    /// On x86_64/ARM64, the compiler generates cache-line-aware loads when
+    /// the scanner calls this in a tight loop over consecutive ranges.
+    /// The `#[inline(always)]` hint ensures the read is not hidden behind
+    /// a function call boundary, allowing LLVM to fuse consecutive loads.
+    #[inline(always)]
     pub fn read_range_raw(&self, start_row: u32, count: usize) -> Result<&[u8], ReaderError> {
         let elem_sz = self.data_type().size_of();
         let start_byte = start_row as usize * elem_sz;

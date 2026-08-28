@@ -16,6 +16,7 @@ splayed-core.workspace = true
 splayed-arrow.workspace = true
 splayed-codec.workspace = true
 splayed-datafusion.workspace = true
+splayed-duckdb.workspace = true
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

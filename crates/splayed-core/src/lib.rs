@@ -9,6 +9,7 @@ pub mod dataset;
 pub mod field_writer;
 pub mod reader;
 pub mod scanner;
+pub mod simd_filter;
 
 pub use column_view::{ColumnView, ColumnViewIter};
 pub use dataset::{open_dataset, Dataset, DatasetError};

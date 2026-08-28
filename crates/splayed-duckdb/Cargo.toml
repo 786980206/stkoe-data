@@ -1,0 +1,15 @@
+[package]
+name = "splayed-duckdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DuckDB integration for Splayed V1 — Arrow IPC bridge (plan §10.4 Phase 1)"
+
+[dependencies]
+splayed-core.workspace = true
+splayed-arrow.workspace = true
+splayed-format.workspace = true
+arrow = { workspace = true, features = ["ipc"] }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }

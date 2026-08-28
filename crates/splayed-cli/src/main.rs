@@ -86,6 +86,12 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Export the full dataset as Arrow IPC (for DuckDB read_arrow / Arrow ecosystem).
+    ExportArrow {
+        dataset_dir: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 fn make_sample_batch() -> RecordBatch {
@@ -336,5 +342,15 @@ async fn main() {
         } => cmd_read(&dataset_dir, &field, sym.as_deref()),
         Commands::Sql { dataset_dir, query } => cmd_sql(&dataset_dir, &query).await,
         Commands::Export { dataset_dir, output } => cmd_export(&dataset_dir, &output).await,
+        Commands::ExportArrow { dataset_dir, output } => cmd_export_arrow(&dataset_dir, &output),
     }
+}
+
+/// Export the dataset to Arrow IPC format (Phase 9: Splayed → Arrow → DuckDB).
+fn cmd_export_arrow(dir: &PathBuf, output: &PathBuf) {
+    let rows = splayed_duckdb::export_to_arrow_ipc(dir, output).unwrap_or_else(|e| {
+        eprintln!("✗ Export failed: {e}");
+        std::process::exit(1);
+    });
+    println!("✓ Exported {rows} rows to Arrow IPC: {}", output.display());
 }

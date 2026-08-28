@@ -12,10 +12,13 @@ Splayed V1 is a Rust columnar storage engine for `SYM × TIME × FIELD` financia
 Cargo.toml                 # workspace root
 crates/
   splayed-format/          # NO deps — binary format definitions (types, headers, meta, field)
-  splayed-codec/           # depends on format — encoding + compression (PLAIN, ZSTD, compact_field)
-  splayed-core/            # depends on format + codec — reader (mmap), field_writer, dataset, scanner
+  splayed-codec/           # depends on format — encoding + compression (PLAIN, DELTA, RLE, BITPACK, ZSTD, LZ4)
+  splayed-core/            # depends on format + codec — reader (mmap), field_writer, dataset, scanner, simd_filter
   splayed-arrow/           # depends on core — Arrow conversion, create_meta/create_table/update_table
   splayed-datafusion/      # depends on arrow — DataFusion TableProvider, SQL queries
+  splayed-duckdb/          # depends on arrow — DuckDB Arrow IPC bridge (export_to_arrow_ipc)
+  splayed-cli/             # CLI tool: init, update, compact, read, sql, export, export-arrow
+example/                   # Python demo scripts (DataFusion, DuckDB, DuckDB+Arrow IPC)
 ```
 
 **Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`. DataFusion lives in `splayed-datafusion`.
@@ -90,8 +93,8 @@ cargo test         # all tests must pass
 
 - Phase 1–3: **Complete** (Format, Reader, Writer function interfaces).
 - Phase 4: **Complete** (Scanner, ColumnView, batch API, filter pushdown).
-- Phase 5: In Progress (parallel scan done, SIMD/prefetch planned).
+- Phase 5: **Complete** (parallel scan, SIMD filter, inline prefetch).
 - Phase 6: **Complete** (ZSTD, LZ4, DELTA, RLE, BITPACK; compressed FieldReader).
 - Phase 7: **Complete** (Arrow conversion, NULL/NaN semantics, type mapping).
 - Phase 8: **Complete** (DataFusion TableProvider, ExecutionPlan, pushdown).
-- Phase 9: Planned (DuckDB).
+- Phase 9: **Complete** (DuckDB Arrow IPC bridge: Splayed→Arrow→DuckDB).

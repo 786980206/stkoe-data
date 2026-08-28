@@ -201,11 +201,11 @@ dataset/
 | 2 | ✅ Done | Reader: mmap, SYM/TIME lookup, row range, column read |
 | 3 | ✅ Done | Writer: all 7 function interfaces, generation, crash recovery |
 | 4 | ✅ Done | Scanner: projection/predicate/filter pushdown, batch API, ColumnView |
-| 5 | 🚧 In Progress | Performance: parallel scan (done), SIMD/prefetch (planned) |
+| 5 | ✅ Done | Performance: parallel scan, SIMD filter, inline prefetch |
 | 6 | ✅ Done | Compression: ZSTD, LZ4, DELTA, RLE, BITPACK |
 | 7 | ✅ Done | Arrow: ColumnView→Arrow, NULL/NaN semantics, type mapping |
 | 8 | ✅ Done | DataFusion: TableProvider, ExecutionPlan, pushdown |
-| 9 | ⬜ Planned | DuckDB: Arrow bridge, then Native ColumnView |
+| 9 | ✅ Done | DuckDB: Arrow IPC bridge (Splayed→Arrow→DuckDB) |
 
 ---
 

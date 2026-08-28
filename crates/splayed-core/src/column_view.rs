@@ -57,7 +57,10 @@ impl<'a> ColumnView<'a> {
     }
 
     /// Get the raw byte slice for a single row (zero-copy).
-    #[inline]
+    ///
+    /// Hot path for point lookups — `inline(always)` ensures the bounds
+    /// check and slice computation are fused into the caller.
+    #[inline(always)]
     pub fn row_bytes(&self, row: usize) -> Option<&'a [u8]> {
         if row >= self.row_count {
             return None;
@@ -68,7 +71,7 @@ impl<'a> ColumnView<'a> {
     }
 
     /// Read a single value as `RawValue` (zero-copy into a stack value).
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, row: usize) -> Option<RawValue> {
         self.row_bytes(row)
             .map(|b| RawValue::read_le(b, 0, self.data_type))

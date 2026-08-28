@@ -571,13 +571,25 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             let view = ColumnView::new(filter_dt, filter_bytes, row_count);
 
             // Compute which rows pass the filter.
-            let mut passing = Vec::with_capacity(row_count);
-            for i in 0..row_count {
-                let val = view.get(i).unwrap();
-                if filter_passes(filter, &val) {
-                    passing.push(i);
+            // Use SIMD-accelerated batch filter for f64/i64 columns,
+            // fall back to scalar loop for other types.
+            let passing: Vec<usize> = match filter_dt {
+                DataType::Float64 => {
+                    if let Some(threshold) = extract_f64_threshold(filter) {
+                        simd_batch_filter_f64(filter_bytes, threshold, row_count, filter)
+                    } else {
+                        scalar_filter(&view, filter, row_count)
+                    }
                 }
-            }
+                DataType::Int64 => {
+                    if let Some(threshold) = extract_i64_threshold(filter) {
+                        simd_batch_filter_i64(filter_bytes, threshold, row_count, filter)
+                    } else {
+                        scalar_filter(&view, filter, row_count)
+                    }
+                }
+                _ => scalar_filter(&view, filter, row_count),
+            };
 
             // Compact each column to only passing rows.
             let passing_count = passing.len();
@@ -665,6 +677,69 @@ impl Filter {
             | Self::Equal { value, .. }
             | Self::NotEqual { value, .. } => value,
         }
+    }
+}
+
+/// Scalar (non-SIMD) filter loop — used as fallback for non-numeric types.
+#[inline]
+fn scalar_filter(view: &ColumnView, filter: &Filter, row_count: usize) -> Vec<usize> {
+    let mut passing = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let val = view.get(i).unwrap();
+        if filter_passes(filter, &val) {
+            passing.push(i);
+        }
+    }
+    passing
+}
+
+/// Extract the f64 threshold from a Filter if the filter value is Float64.
+fn extract_f64_threshold(filter: &Filter) -> Option<f64> {
+    match filter {
+        Filter::GreaterThan { value: FilterValue::Float64(f), .. }
+        | Filter::GreaterOrEqual { value: FilterValue::Float64(f), .. }
+        | Filter::LessThan { value: FilterValue::Float64(f), .. }
+        | Filter::LessOrEqual { value: FilterValue::Float64(f), .. }
+        | Filter::Equal { value: FilterValue::Float64(f), .. }
+        | Filter::NotEqual { value: FilterValue::Float64(f), .. } => Some(*f),
+        _ => None,
+    }
+}
+
+/// Extract the i64 threshold from a Filter if the filter value is Int64.
+fn extract_i64_threshold(filter: &Filter) -> Option<i64> {
+    match filter {
+        Filter::GreaterThan { value: FilterValue::Int64(i), .. }
+        | Filter::GreaterOrEqual { value: FilterValue::Int64(i), .. }
+        | Filter::LessThan { value: FilterValue::Int64(i), .. }
+        | Filter::LessOrEqual { value: FilterValue::Int64(i), .. }
+        | Filter::Equal { value: FilterValue::Int64(i), .. }
+        | Filter::NotEqual { value: FilterValue::Int64(i), .. } => Some(*i),
+        _ => None,
+    }
+}
+
+/// SIMD-accelerated batch filter for f64 columns.
+fn simd_batch_filter_f64(data: &[u8], threshold: f64, row_count: usize, filter: &Filter) -> Vec<usize> {
+    match filter {
+        Filter::GreaterThan { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v > t),
+        Filter::GreaterOrEqual { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v >= t),
+        Filter::LessThan { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v < t),
+        Filter::LessOrEqual { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v <= t),
+        Filter::Equal { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v == t),
+        Filter::NotEqual { .. } => crate::simd_filter::batch_filter_f64(data, threshold, row_count, |v, t| v != t),
+    }
+}
+
+/// SIMD-accelerated batch filter for i64 columns.
+fn simd_batch_filter_i64(data: &[u8], threshold: i64, row_count: usize, filter: &Filter) -> Vec<usize> {
+    match filter {
+        Filter::GreaterThan { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v > t),
+        Filter::GreaterOrEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v >= t),
+        Filter::LessThan { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v < t),
+        Filter::LessOrEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v <= t),
+        Filter::Equal { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v == t),
+        Filter::NotEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v != t),
     }
 }
 

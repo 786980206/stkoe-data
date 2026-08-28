@@ -996,7 +996,7 @@ splayed/
 
 实现 Projection、SYM filter、TIME filter、FIELD filter、batch、parallelism。
 
-## Phase 5：性能优化 🚧 In Progress (parallel scan done)
+## Phase 5：性能优化 ✅ Done (SIMD filter + prefetch + parallel scan)
 
 加入 SIMD、parallel scan、parallel field read、page-cache friendly access、prefetch。
 
@@ -1012,7 +1012,7 @@ splayed/
 
 实现 TableProvider、ExecutionPlan、Projection Pushdown、Predicate Pushdown。
 
-## Phase 9：DuckDB
+## Phase 9：DuckDB ✅ Done (Arrow IPC bridge)
 
 先 DuckDB → Arrow → Splayed 与 Splayed → Arrow → DuckDB，再优化为 Native ColumnView。
 

@@ -2649,6 +2649,7 @@ dependencies = [
  "splayed-codec",
  "splayed-core",
  "splayed-datafusion",
+ "splayed-duckdb",
  "splayed-format",
  "tokio",
 ]
@@ -2689,6 +2690,18 @@ dependencies = [
  "splayed-core",
  "splayed-format",
  "tokio",
+]
+
+[[package]]
+name = "splayed-duckdb"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "splayed-arrow",
+ "splayed-core",
+ "splayed-format",
 ]
 
 [[package]]

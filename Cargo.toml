@@ -6,6 +6,7 @@ members = [
     "crates/splayed-core",
     "crates/splayed-arrow",
     "crates/splayed-datafusion",
+    "crates/splayed-duckdb",
     "crates/splayed-cli",
 ]
 
@@ -21,6 +22,7 @@ splayed-codec = { path = "crates/splayed-codec" }
 splayed-core = { path = "crates/splayed-core" }
 splayed-arrow = { path = "crates/splayed-arrow" }
 splayed-datafusion = { path = "crates/splayed-datafusion" }
+splayed-duckdb = { path = "crates/splayed-duckdb" }
 
 # Arrow stack (pinned to match DataFusion 55)
 arrow = "59"
