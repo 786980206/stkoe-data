@@ -204,7 +204,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "flatbuffers",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "zstd",
 ]
 
@@ -1941,6 +1941,15 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
+name = "lz4_flex"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
@@ -2116,7 +2125,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.17.1",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
@@ -2517,6 +2526,7 @@ name = "splayed-codec"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "lz4_flex 0.11.6",
  "splayed-format",
  "zstd",
 ]

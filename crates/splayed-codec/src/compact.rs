@@ -146,21 +146,29 @@ fn compress(data: &[u8], compression: Compression) -> Result<Vec<u8>, CodecError
         Compression::Zstd => {
             zstd::encode_all(data, 3).map_err(|_| CodecError::InvalidInput)
         }
-        Compression::Lz4 => Err(CodecError::UnsupportedCompression),
+        Compression::Lz4 => {
+            // Use compress without size prefix — our own [u64 uncompressed_len]
+            // header stores the original length.
+            Ok(lz4_flex::compress(data))
+        }
     }
 }
 
 fn decompress(
     data: &[u8],
     compression: Compression,
-    _expected_len: usize,
+    expected_len: usize,
 ) -> Result<Vec<u8>, CodecError> {
     match compression {
         Compression::None => Ok(data.to_vec()),
         Compression::Zstd => {
             zstd::decode_all(data).map_err(|_| CodecError::InvalidInput)
         }
-        Compression::Lz4 => Err(CodecError::UnsupportedCompression),
+        Compression::Lz4 => {
+            // Decompress using the known size from our [u64] header.
+            lz4_flex::decompress(data, expected_len)
+                .map_err(|_| CodecError::InvalidInput)
+        }
     }
 }
 

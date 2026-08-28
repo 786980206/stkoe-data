@@ -216,6 +216,36 @@ fn compact_field_then_decompress() {
     fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn compact_field_lz4_then_decompress() {
+    let dir = temp_dir("compact_lz4");
+    let _ = fs::remove_dir_all(&dir);
+
+    let batch = make_batch();
+    create_table(&dir, &batch, true).expect("create_table failed");
+
+    let close_path = dir.join("close");
+
+    // Drop any reader before compacting (Windows mmap).
+    {
+        let _reader = FieldReader::open(&close_path).unwrap();
+    }
+
+    // Compact with LZ4.
+    compact_field(&close_path, Compression::Lz4).expect("compact_field LZ4 failed");
+
+    // Decompress and verify values.
+    use splayed_core::decompress_field_data;
+    let decompressed = decompress_field_data(&close_path).expect("decompress LZ4 failed");
+
+    let v0 = RawValue::read_le(&decompressed, 0, DataType::Float64);
+    assert_eq!(v0.as_f64(), Some(100.0));
+    let v5 = RawValue::read_le(&decompressed, 5 * 8, DataType::Float64);
+    assert_eq!(v5.as_f64(), Some(202.0));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 const HEADER_SIZE_BYTES: u64 = 64;
 
 // ---------------------------------------------------------------------------
