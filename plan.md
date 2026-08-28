@@ -992,23 +992,23 @@ splayed/
 - `create_meta` / `create_table` / `update_table`（Arrow 输入，`splayed-arrow`）
 - generation、crash recovery
 
-## Phase 4：Scanner
+## Phase 4：Scanner ✅ Done
 
 实现 Projection、SYM filter、TIME filter、FIELD filter、batch、parallelism。
 
-## Phase 5：性能优化
+## Phase 5：性能优化 ⬜ Planned
 
 加入 SIMD、parallel scan、parallel field read、page-cache friendly access、prefetch。
 
-## Phase 6：Compression
+## Phase 6：Compression 🚧 In Progress (ZSTD + LZ4 done)
 
 加入 ZSTD、LZ4、DELTA、RLE，但不破坏 PLAIN + NONE 这条最快路径。
 
-## Phase 7：Arrow
+## Phase 7：Arrow ✅ Done
 
 实现 Splayed → Arrow 与 Arrow → Splayed，确保 NULL / NaN / DATE32 / TIMESTAMP_US 正确映射。
 
-## Phase 8：DataFusion
+## Phase 8：DataFusion ✅ Done
 
 实现 TableProvider、ExecutionPlan、Projection Pushdown、Predicate Pushdown。
 
