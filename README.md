@@ -66,7 +66,8 @@ splayed/
 ```text
 外部应用 → splayed-adbc（上层 ADBC 驱动，内部用 DataFusion 执行 SQL，返回 Arrow）
              ├→ splayed-datafusion（TableProvider + SQL 执行）
-             └→ splayed-duckdb（DuckDB 扩展 / IPC 桥）
+             ├→ splayed-duckdb（DuckDB 扩展 / IPC 桥）
+             └→ splayed-polars（Polars AnonymousScan 惰性扫描：谓词下推 + 列裁剪）
 splayed-core（引擎无关核心：扫描与写入）
 共享工具：splayed-arrow（CoreBatch → Arrow，被需要 Arrow 的适配层复用，可选用）
 ```
@@ -75,10 +76,19 @@ umbrella 用法（`arrow` 默认开、可关；`adbc` 隐式拉入 datafusion）
 
 ```toml
 [dependencies]
-splayed = { path = "crates/splayed", features = ["arrow", "adbc", "duckdb"] }
+splayed = { path = "crates/splayed", features = ["arrow", "adbc", "duckdb", "polars"] }
 ```
 
-Dependency direction: `format ← codec ← core → arrow → {datafusion, duckdb} → adbc`
+Polars 惰性查询：
+
+```text
+let lf = splayed_polars::splayed_lazyframe("data/2024")?;   // scan_* 风格
+let out = lf.filter(col("close").gt(lit(150.0)))
+             .select([col("sym"), col("close")])
+             .collect()?;   // 谓词下推进核心层 + 只读涉及列
+```
+
+Dependency direction: `format ← codec ← core → arrow → {datafusion, duckdb, polars} → adbc`
 
 ---
 
@@ -188,6 +198,16 @@ Writer functions (see `plan.md` §8.4 for the full specification):
 | `delete_field(field_path)` | splayed-core | Delete a FIELD file (idempotent) |
 | `compact_field(field_path, compression)` | splayed-codec | Compress FIELD (NONE → ZSTD), mark read-only |
 
+Read-side adapter entries:
+
+| Function | Crate | Description |
+|---|---|---|
+| `scan_owned_parallel(dataset, plan, req, n)` | splayed-core | 有序并行流式扫描（`split_ranges` 行均衡切片） |
+| `corebatch_into_record_batch(batch, proj, fields, dict)` | splayed-arrow | CoreBatch → Arrow **零拷贝**（数据缓冲移交、无 NULL 列不产 bitmap） |
+| `splayed_lazyframe(dir)` | splayed-polars | Polars 惰性扫描（AnonymousScan：谓词下推 + 列裁剪，scan_* 风格） |
+| `scan_to_chunks(dataset, req, n, sink)` | splayed-duckdb | 原生 DataChunk 路由（零 Arrow；扩展层逐批消费 CoreBatch） |
+| `ffi::splayed_*` | splayed-duckdb | DuckDB 扩展 C ABI（句柄 + 列视图 + 错误消息；cdylib/staticlib 按需生成） |
+
 The `splayed-core` native writers take `TableColumn { name, data_type, values }`
 (raw little-endian bytes in input-row order), so a future native DuckDB
 DataChunk adapter can write tables without going through Arrow.
@@ -250,6 +270,11 @@ dataset/
 | 4 | `FLOAT64` | 8 B | `0x7FF8000000000000` (canonical NaN) |
 | 5 | `DATE32` | 4 B | `0x80000000` |
 | 6 | `TIMESTAMP_US` | 8 B | `0x8000000000000000` |
+| 7 | `INT8` / 8 `INT16` | 1 / 2 B | `0x80` / `0x8000` |
+| 9–12 | `UINT8/16/32/64` | 1/2/4/8 B | 全 1（MAX 位型） |
+| 13 | `DATE64` | 8 B | `0x8000000000000000` |
+
+> ID 0–6 为原始类型；7–13 为增量扩展（旧文件零迁移）。
 
 ---
 
@@ -259,13 +284,18 @@ dataset/
 |---:|---|---|
 | 1 | ✅ Done | Format: META + FIELD binary read/write, types, NULL encoding |
 | 2 | ✅ Done | Reader: mmap, SYM/TIME lookup, row range, column read |
-| 3 | ✅ Done | Writer: all 7 function interfaces, generation, crash recovery |
+| 3 | ✅ Done | Writer: all function interfaces, generation, crash recovery |
 | 4 | ✅ Done | Scanner: projection/predicate/filter pushdown, batch API, ColumnView |
 | 5 | ✅ Done | Performance: parallel scan, SIMD filter, inline prefetch |
 | 6 | ✅ Done | Compression: ZSTD, LZ4, DELTA, RLE, BITPACK |
 | 7 | ✅ Done | Arrow: ColumnView→Arrow, NULL/NaN semantics, type mapping |
-| 8 | ✅ Done | DataFusion: TableProvider, ExecutionPlan, pushdown |
-| 9 | ✅ Done | DuckDB: Arrow IPC bridge (Splayed→Arrow→DuckDB) |
+| 8 | ✅ Done | DataFusion: TableProvider 三层对接, pushdown, UDF/排序声明 |
+| 9 | ✅ Done | DuckDB: Arrow IPC bridge + 原生 DataChunk 路由 + C ABI 集成层 |
+| 10 | ✅ Done | CoreBatch 内存模型：引擎无关列式（Buffer/Validity/字典列），扫描/适配零拷贝 |
+| 11 | ✅ Done | 磁盘定长类型扩展（INT8/16、UINT*、DATE64）+ 新类型过滤下推 |
+| 12 | ✅ Done | 并行能力：`scan_owned_parallel` 有序流式 + DataFusion 单数据集多分区 |
+| 13 | ✅ Done | 适配层组件化（umbrella features）：adbc（上层 ADBC，内部 DataFusion）、duckdb C ABI、polars 惰性扫描 |
+| 14 | ✅ Done | Polars AnonymousScan：谓词下推 + 列裁剪 + C data interface 转换 |
 
 ---
 

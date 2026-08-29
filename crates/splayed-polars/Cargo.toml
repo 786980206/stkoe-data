@@ -1,0 +1,25 @@
+[package]
+name = "splayed-polars"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Polars 深度集成：AnonymousScan 惰性扫描（谓词下推 + 列裁剪），C data interface 转换"
+
+[dependencies]
+splayed-format.workspace = true
+splayed-core.workspace = true
+splayed-arrow.workspace = true
+arrow = { workspace = true, features = ["ffi"] }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+polars = { version = "=0.45.1", default-features = false, features = [
+    "lazy",
+    "fmt",
+    "dtype-i8", "dtype-i16", "dtype-u8", "dtype-u16",
+    "dtype-date", "dtype-datetime",
+] }
+polars-arrow = "=0.45.1"
+
+[dev-dependencies]
+splayed-arrow.workspace = true

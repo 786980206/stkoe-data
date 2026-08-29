@@ -14,16 +14,22 @@ crates/
   splayed-format/          # NO deps — binary format definitions (types, headers, meta, field)
   splayed-codec/           # depends on format — encoding + compression (PLAIN, DELTA, RLE, BITPACK, ZSTD, LZ4)
   splayed-core/            # depends on format + codec — reader (mmap), field_writer, dataset, scanner, simd_filter
-  splayed-arrow/           # depends on core — Arrow conversion, create_meta/create_table/update_table
-  splayed-datafusion/      # depends on arrow — DataFusion TableProvider, SQL queries
-  splayed-duckdb/          # depends on arrow — DuckDB Arrow IPC bridge (export_to_arrow_ipc)
+  splayed-arrow/           # depends on core — Arrow conversion create_meta/create_table/update_table,
+                           #   CoreBatch→Arrow 零拷贝（corebatch_into_record_batch）
+  splayed-adbc/            # depends on datafusion — 上层 ADBC 驱动（内部用 DataFusion 执行 SQL → Arrow）
+  splayed-datafusion/      # depends on arrow + datafusion — TableProvider 三层对接 + SQL
+  splayed-duckdb/          # depends on core — Arrow IPC 桥（feature "arrow"，可选）+ 原生 DataChunk
+                           #   路由（native）+ DuckDB 扩展 C ABI（ffi；cdylib/staticlib 按需生成）
+  splayed-polars/          # depends on core + arrow + polars 0.45 — AnonymousScan 惰性扫描（谓词下推/列裁剪）
+  splayed/                 # umbrella — 核心恒有；adbc/datafusion/duckdb/polars 用 features 开关
   splayed-cli/             # CLI tool: init, update, compact, read, sql, export, export-arrow
+splayed-duckdb-extension/  # C++ DuckDB 扩展壳（非 cargo 成员；加载 splayed-duckdb 的 C ABI）
 example/                   # Python demo scripts (DataFusion, DuckDB, DuckDB+Arrow IPC)
 ```
 
-**Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`. DataFusion lives in `splayed-datafusion`.
+**Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`; engine bindings live in their own adapters (`splayed-datafusion` / `splayed-duckdb` / `splayed-polars` / 上层 `splayed-adbc`).
 
-**Arrow version:** The workspace pins Arrow 59 to match DataFusion 55. DataFusion re-exports Arrow as `datafusion::arrow::*` — use those re-exports in `splayed-datafusion` to avoid version mismatches.
+**Arrow version:** The workspace pins Arrow 59 to match DataFusion 55. DataFusion re-exports Arrow as `datafusion::arrow::*` — use those re-exports in `splayed-datafusion` to avoid version mismatches. Polars（适配层）固定其自研 `polars-arrow`（与 arrow-rs 不冲突）。
 
 ## Build & Test
 
@@ -33,8 +39,10 @@ cargo test         # all tests must pass
 ```
 
 - **Zero warnings policy.** If a build produces warnings, fix them before moving on.
-- **Tests are integration tests** in `crates/splayed-arrow/tests/integration.rs`. They create temp dirs, write datasets, and read them back.
+- **Tests are integration tests** in `crates/*/tests/*.rs`. They create temp dirs, write datasets, and read them back.
 - On Windows, mmap'd files cannot be written to. If you open a `FieldReader` and then try `compact_field` or `update_field` on the same path, close the reader first (drop it) — otherwise you'll get OS error 1224.
+- **MSVC PDB 抖动（LNK1318）**：`cargo test --workspace` 偶发链接失败（并发 link.exe 写 PDB 争用）。规避：`cargo test --workspace --config "profile.test.debug=false"`（测试无 debuginfo、不产生 PDB；`CARGO_BUILD_JOBS=1` 串行更稳）。
+- **DuckDB 扩展链接库**：cdylib/staticlib 不固化在 Cargo.toml（避免 MSVC link 输出被当 warning），按需生成：`cargo build -p splayed-duckdb --release --config "lib.crate-type=['cdylib','staticlib']"`（PowerShell 用单引号字符串）。
 
 ## Format Constants (do not change without updating plan.md)
 
@@ -51,7 +59,7 @@ cargo test         # all tests must pass
 ## Key Design Decisions
 
 1. **Full pre-declaration:** `time_count` = row capacity. SYM INDEX has no separate `row_capacity` field. `row_start = sum(prior time_counts)`.
-2. **NULL via sentinel bit pattern:** No validity bitmap. Canonical NaN = NULL for floats. `INT32_MIN`/`INT64_MIN` = NULL for ints. Compare **bit patterns**, not values.
+2. **NULL via sentinel bit pattern:** No validity bitmap. Canonical NaN = NULL for floats. `INT32_MIN`/`INT64_MIN` = NULL for signed ints; **全 1（MAX 位型）= NULL for 无符号**（UInt8/16/32/64）。比较按 **bit pattern**。
 3. **In-place update:** `create_field` pre-allocates all-NULL data. `update_field` overwrites in place. No file extension. `compact_field` is the only operation that rewrites the file body.
 4. **Compressed = read-only:** After `compact_field`, `update_field` is rejected. `compression != NONE` means read-only.
 5. **Generation:** u64, strictly monotonic. Updated on `update_field` success. Reader rejects FIELDs with mismatched generation.

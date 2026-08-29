@@ -39,5 +39,7 @@ pub use splayed_arrow as arrow;
 pub use splayed_datafusion as datafusion;
 #[cfg(feature = "duckdb")]
 pub use splayed_duckdb as duckdb;
+#[cfg(feature = "polars")]
+pub use splayed_polars as polars;
 #[cfg(feature = "adbc")]
 pub use splayed_adbc as adbc;

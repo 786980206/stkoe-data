@@ -13,6 +13,7 @@ splayed-core.workspace = true
 splayed-arrow = { workspace = true, optional = true }
 splayed-datafusion = { workspace = true, optional = true }
 splayed-duckdb = { workspace = true, optional = true }
+splayed-polars = { workspace = true, optional = true }
 splayed-adbc = { workspace = true, optional = true }
 
 [features]
@@ -25,3 +26,5 @@ adbc = ["dep:splayed-adbc"]
 datafusion = ["dep:splayed-datafusion"]
 # DuckDB 扩展 / 桥。
 duckdb = ["dep:splayed-duckdb"]
+# Polars 惰性扫描（AnonymousScan：谓词下推 + 列裁剪）。
+polars = ["dep:splayed-polars"]

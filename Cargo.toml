@@ -8,6 +8,7 @@ members = [
     "crates/splayed-adbc",
     "crates/splayed-datafusion",
     "crates/splayed-duckdb",
+    "crates/splayed-polars",
     "crates/splayed",
     "crates/splayed-cli",
 ]
@@ -26,6 +27,7 @@ splayed-arrow = { path = "crates/splayed-arrow" }
 splayed-adbc = { path = "crates/splayed-adbc" }
 splayed-datafusion = { path = "crates/splayed-datafusion" }
 splayed-duckdb = { path = "crates/splayed-duckdb" }
+splayed-polars = { path = "crates/splayed-polars" }
 
 # Arrow stack (pinned to match DataFusion 55)
 arrow = "59"

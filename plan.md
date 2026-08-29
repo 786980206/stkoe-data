@@ -1104,6 +1104,28 @@ splayed-duckdb-extension（C++ 工程，非 cargo 成员）
 构建产物（`--config "lib.crate-type=['cdylib','staticlib']"`）：
 `target/release/{splayed_duckdb.dll, splayed_duckdb.lib, splayed_duckdb.dll.lib}`。
 
+## 10.5 Polars 集成（splayed-polars）
+
+通过 Polars 官方 **`AnonymousScan`**（`LazyFrame::anonymous_scan`）实现惰性
+扫描源 `splayed_lazyframe(dir)`，深度优化：
+
+- **谓词下推**：`allows_predicate_pushdown` 开启——pushdown 的过滤条件经
+  `predicate` 模块翻译到核心层（`sym` 等值 → `SymbolSelection`、`time` →
+  `TimeRange`、FIELD 值比较 → `Filter`，AND 链合并），减少读取与转换；
+  未翻译部分（复杂/表达式比较）在扫描结果上交给 polars 物理评估兜底
+  （`df.lazy().filter(pred).collect()`），结果恒正确。
+- **列裁剪**：`allows_projection_pushdown` 开启——只扫描 `with_columns`
+  涉及的列（投影下推）。
+- **转换**：arrow-rs → polars 走 **Arrow C data interface**（`FFI_ArrowArray`
+  与 polars `ArrowArray` 布局逐字段一致，所有权移交）；时间列按物理类型
+  （Date=Int32、Datetime=Int64）导入，字符串列按值构造（polars 0.45 的
+  newest-compat 将 String 映射为 Utf8View，标准 C data 无法直接灌入）。
+- 已知约束（polars 0.45）：无显式 `select` 的完整收集会触发其 anonymous-scan
+  投影优化中的 `reader_schema=None` unwrap bug——pe 链上建议显式
+  `select([...])`（等价语义）。
+
+依赖：`polars = "=0.45.1"`（features: lazy/fmt/dtype-*），`polars-arrow = "=0.45.1"`。
+
 ---
 
 # 11. Rust Crate 结构
@@ -1112,42 +1134,54 @@ splayed-duckdb-extension（C++ 工程，非 cargo 成员）
 splayed/
 |
 +-- splayed-format/          # 无依赖：格式定义
-|   +-- meta.rs
-|   +-- field.rs
-|   +-- header.rs
-|   +-- types.rs
+|   +-- meta.rs, field.rs, header.rs, types.rs   # DataType 0–13（定长 + 哨兵 NULL）
 |
 +-- splayed-codec/           # format ← codec：编码/压缩
-|   +-- plain.rs
-|   +-- delta.rs
-|   +-- rle.rs
-|   +-- compression.rs
+|   +-- plain.rs, delta.rs, rle.rs, compression.rs
 |
 +-- splayed-core/            # format + codec ← core：不含 Arrow
-|   +-- dataset.rs
-|   +-- reader.rs
-|   +-- field_writer.rs      # create_field / update_field / delete_field
-|   +-- compact.rs           # compact_field
-|   +-- scanner.rs
-|   +-- mmap.rs
-|   +-- parallel.rs
+|   +-- dataset.rs, reader.rs, field_writer.rs, scanner.rs, simd_filter.rs
+|   +-- batch.rs             # CoreBatch：引擎无关内存列式（Buffer/Validity/字典列/CoreType）
+|   +-- table_writer.rs      # 原生 create_meta/create_table/update_table（TableColumn）
+|   +-- 并行流式：split_ranges / scan_owned_parallel（有序多线程）
 |
-+-- splayed-arrow/           # core + arrow ← arrow：Arrow 交换层
-|   +-- to_arrow.rs
-|   +-- from_arrow.rs
-|   +-- meta_writer.rs       # create_meta / create_table
-|   +-- table_writer.rs      # update_table
++-- splayed-arrow/           # core + arrow ← arrow：共享转换工具（可选用）
+|   +-- arrow_conv.rs        # 类型映射 / ColumnView→Arrow（遗留）
+|   +-- corebatch_to_arrow.rs# CoreBatch→Arrow 零拷贝（corebatch_into_record_batch）
+|   +-- meta_writer.rs / table_writer.rs   # create_meta / create_table / update_table
 |
-+-- splayed-datafusion/      # arrow → datafusion
-|   +-- provider.rs
++-- splayed-datafusion/      # core + arrow + datafusion：TableProvider 三层对接 + SQL
+|   +-- dataset.rs           # Layer1：一个 .meta 目录 = 一个分区
+|   +-- table.rs             # Layer2：分区表（自动探测 / 分区裁剪 / with_scan_parallelism）
+|   +-- register.rs          # Layer3：register_splayed_table / STORED AS SPLAYED / read_splayed
+|   +-- filter.rs / convert.rs / exec.rs   # 谓词下推 / CoreBatch→RecordBatch / 执行计划
 |
-+-- splayed-duckdb/
-    +-- extension/
++-- splayed-duckdb/          # core（+ 可选 arrow）：DuckDB 集成层
+|   +-- native.rs            # scan_to_chunks（原生 DataChunk 路由，零 Arrow）
+|   +-- ffi.rs               # C ABI（cdylib/staticlib 按需生成）：句柄/schema/扫描/列视图/错误
+|   +-- arrow_bridge.rs      # feature "arrow"：Splayed→Arrow IPC 导出
+|
++-- splayed-polars/          # core + arrow + polars 0.45：惰性扫描
+|   +-- anonymous.rs         # AnonymousScan（谓词下推 + 列裁剪 + 兜底过滤）
+|   +-- predicate.rs         # polars Expr → 核心层剪裁翻译（尽力）
+|   +-- arrowconv.rs         # arrow-rs → polars（C data interface，时间列物理化）
+|
++-- splayed-adbc/            # datafusion + arrow：上层 ADBC 驱动（内部 DataFusion 执行 SQL）
+|
++-- splayed/                 # umbrella：核心恒有；arrow/adbc/datafusion/duckdb/polars features
+|
++-- splayed-cli/             # CLI：init, update, compact, read, sql, export, export-arrow
+splayed-duckdb-extension/    # C++ DuckDB 扩展壳（非 cargo 成员，加载 splayed-duckdb C ABI）
+example/                     # Python demo scripts
 ```
 
-依赖方向：`format`（无依赖）← `codec` ← `core` → `arrow` → `datafusion` / `duckdb`。
+依赖方向：`format`（无依赖）← `codec` ← `core` → `arrow`（共享转换工具，
+被 need Arrow 的适配层复用）→ `{datafusion, duckdb, polars}` →（上层）
+`adbc`。
 
-> **分层原则**：`splayed-core` 不依赖 Arrow。`create_meta` / `create_table` / `update_table` 因需 Arrow BATCHRECORD 输入，位于 `splayed-arrow`；`create_field` / `update_field` / `delete_field` / `compact_field` 为纯核心操作，位于 `splayed-core`。`compact_field` 的压缩实现位于 `splayed-codec`，由 `splayed-core` 调用。
+> **分层原则**：`splayed-core` 不依赖 Arrow，提供引擎无关的扫描/写入与
+> `CoreBatch`；`splayed-arrow` 是**可选共享转换工具**；各引擎绑定（DataFusion
+> / DuckDB / Polars）与上层 ADBC 驱动各自成 crate（umbrella features 开关）。
 
 ---
 
