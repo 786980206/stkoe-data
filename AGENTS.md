@@ -111,3 +111,5 @@ cargo test         # all tests must pass
 - FIELD 统计 footer（min/max，§5.2.2）+ 扫描期剪裁 + ScanRequest.limit：**Complete**。
 - core `update_meta`（布局重排 + 并发字段重散布 + generation 原子提交）+ DataFusion reload / ADBC refresh 联动：**Complete**。
 - 分区管理下沉 core（`splayed-core::partition`：发现/schema 合并/三层剪裁/流式合并），DataFusion 与 DuckDB 共用：**Complete**。
+- 分区列（key=value 虚拟列）+ 分区级符号剪裁透传 + polars 分区表 + 编码器接线 + 聚合下推 rule：**Complete**。
+  （workspace rust-version 升到 1.86：stats-agg rule 需要 `dyn TableSource as &dyn Any` 上转型。）

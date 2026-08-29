@@ -30,10 +30,12 @@ pub mod dataset;
 pub mod exec;
 mod filter;
 pub mod register;
+pub mod stats_agg_rule;
 pub mod table;
 
 pub use dataset::SplayedDatasetProvider;
 pub use register::{
     auto_provider, register_splayed_table, SplayedTableFactory, SplayedTableFunction,
 };
+pub use stats_agg_rule::{SplayedStatsAggRule, with_splayed_optimizer_rules};
 pub use table::SplayedTableProvider;

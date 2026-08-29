@@ -16,7 +16,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.86：为 stats-agg 规则做 `dyn TableSource as &dyn Any` 上转型（trait upcasting）。
+rust-version = "1.86"
 license = "MIT"
 
 [workspace.dependencies]

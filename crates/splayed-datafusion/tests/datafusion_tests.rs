@@ -703,3 +703,70 @@ async fn partition_symbol_prune_passes_override() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// 聚合下推：无过滤的 MIN/MAX/COUNT 命中 footer 统计 → 常量单行计划（扫描跳过）。
+async fn ctx_with_rule() -> datafusion::prelude::SessionContext {
+    let builder = datafusion::execution::SessionStateBuilder::new()
+        .with_default_features()
+        .with_optimizer_rule(std::sync::Arc::new(
+            splayed_datafusion::SplayedStatsAggRule,
+        ));
+    let state = builder.build();
+    let ctx = datafusion::prelude::SessionContext::new_with_state(state);
+    let dir = temp_dir("agg_rule");
+    create_table(&dir, &make_null_close_batch(), true).unwrap(); // close [100, None, 102]
+    let provider = splayed_datafusion::SplayedDatasetProvider::new(&dir).unwrap();
+    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+    ctx
+}
+
+#[tokio::test]
+async fn stats_agg_rule_answers_without_filter() {
+    let ctx = ctx_with_rule().await;
+
+    // MIN/MAX/COUNT(*)/COUNT(col) → 常量答案。
+    let batches = ctx
+        .sql("SELECT MIN(close), MAX(close), COUNT(*), COUNT(close) FROM splayed")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let b = &batches[0];
+    assert_eq!(b.num_rows(), 1);
+    assert_eq!(
+        b.column(0).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap().value(0),
+        100.0
+    );
+    assert_eq!(
+        b.column(1).as_any().downcast_ref::<arrow_array::Float64Array>().unwrap().value(0),
+        102.0
+    );
+    assert_eq!(
+        b.column(2).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0),
+        3
+    );
+    assert_eq!(
+        b.column(3).as_any().downcast_ref::<arrow_array::Int64Array>().unwrap().value(0),
+        2 // close 有一个 NULL
+    );
+
+    // 带过滤 → 不改写，走正常扫描但仍正确。
+    let batches2 = ctx
+        .sql("SELECT COUNT(*) FROM splayed WHERE close IS NOT NULL")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let c = batches2[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(c, 2);
+
+    let dir = temp_dir("agg_rule_cleanup");
+    let _ = std::fs::remove_dir_all(&dir);
+}

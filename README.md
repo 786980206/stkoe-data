@@ -170,6 +170,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 |---|---|
 | `SplayedDatasetProvider::new(dir)` | **Layer 1**：单 dataset provider；`with_scan_parallelism(n)`（单数据集多输出分区）、**`reload()`**（`update_meta` 后刷新）、`statistics()`（num_rows/byte_size/null_count/min/max 上报） |
 | `SplayedTableProvider::new(dir)` | **Layer 2**：分区表（基于 `core::partition` 发现/剪裁；每个子目录一个分区，时间/符号/统计剪裁，schema 合并校验） |
+| `SplayedStatsAggRule` / `with_splayed_optimizer_rules(builder)` | **聚合下推**：无过滤的 MIN/MAX/COUNT 命中列统计（footer min/max + null_count）→ 单行常量计划，整扫描跳过（`SessionStateBuilder` 挂规则） |
 | `register_splayed_table(ctx, name, dir)` / `auto_provider(dir)` | **Layer 3**：自动探测 dataset/分区表并注册 |
 | `SplayedTableFunction` | `read_splayed('dir')` 表函数（`register_udtf`） |
 | `SplayedTableFactory` | `CREATE EXTERNAL TABLE ... STORED AS SPLAYED LOCATION 'dir'` |
