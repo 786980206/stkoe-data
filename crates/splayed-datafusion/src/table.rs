@@ -338,7 +338,7 @@ impl TableProvider for SplayedTableProvider {
             .collect();
         let preq = PartitionScanRequest {
             columns: Vec::new(),
-            symbols: SymbolSelection::All, // 符号级剪裁由 dataset 扫描处理
+            symbols: pd.symbols.clone().unwrap_or(SymbolSelection::All),
             time_range: pd.time_range.unwrap_or_else(TimeRange::all),
             filters: dataset_filters.clone(),
             partition_filters,
@@ -358,8 +358,16 @@ impl TableProvider for SplayedTableProvider {
 
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(pplan.tasks.len());
         for task in &pplan.tasks {
+            // 分区级符号剪裁：core plan 已把 task.symbols 剪成该分区存在的子集，
+            // 直接透传（避免分区缺符号报错）。
             let child = self.partitions[task.partition]
-                .scan(state, Some(&dataset_projection), &dataset_exprs, limit)
+                .scan_with_symbols(
+                    state,
+                    Some(&dataset_projection),
+                    &dataset_exprs,
+                    limit,
+                    &task.symbols,
+                )
                 .await?;
 
             if !has_part_cols {

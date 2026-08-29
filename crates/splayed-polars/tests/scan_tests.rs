@@ -163,3 +163,62 @@ fn group_by_aggregation_over_lazy_scan() {
     assert_eq!(sums, vec![303.0, 603.0]); // SYM01=303, SYM02=603（升序排列后）
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// 分区表惰性扫描：key=value 分区列进 schema、分区列过滤下推、常量列补回。
+#[test]
+fn lazy_table_scan_partition_columns() {
+    use splayed_polars::splayed_lazyframe_table;
+
+    let root = std::env::temp_dir().join(format!("splayed_pl_tbl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    create_table(&root.join("year=2024"), &make_batch(), true).unwrap(); // 6 行
+    create_table(&root.join("year=2025"), &make_batch(), true).unwrap();
+
+    let lf = splayed_lazyframe_table(&root).unwrap();
+
+    // 分区列过滤 → 只扫 2024；year 投影为常量列。
+    let df = lf
+        .clone()
+        .filter(col("year").eq(lit(2024)))
+        .select([col("close"), col("year")])
+        .collect()
+        .unwrap();
+    assert_eq!(df.shape(), (6, 2));
+    let years: Vec<i64> = df.column("year").unwrap().i64().unwrap().iter().map(|v| v.unwrap()).collect();
+    assert!(years.iter().all(|&y| y == 2024));
+
+    // 字符串字面量同样剪裁（year = '2025'）由 core 层完成；此处用 String 分区列验证。
+    let root2 = std::env::temp_dir().join(format!("splayed_pl_tbl2_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root2);
+    create_table(&root2.join("env=prod"), &make_batch(), true).unwrap();
+    create_table(&root2.join("env=test"), &make_batch(), true).unwrap();
+    let lf2 = splayed_lazyframe_table(&root2).unwrap();
+    let df2 = lf2
+        .filter(col("env").eq(lit("prod")))
+        .select([col("close"), col("env")])
+        .collect()
+        .unwrap();
+    assert_eq!(df2.shape(), (6, 2));
+    let envs: Vec<&str> = df2
+        .column("env")
+        .unwrap()
+        .str()
+        .unwrap()
+        .iter()
+        .map(|v| v.unwrap())
+        .collect();
+    assert!(envs.iter().all(|&e| e == "prod"));
+    std::fs::remove_dir_all(&root2).ok();
+
+    // count over 全表（两分区）。
+    let df3 = lf
+        .filter(col("close").gt(lit(150.0)))
+        .group_by([col("year")])
+        .agg([col("close").count()])
+        .sort(["year"], Default::default())
+        .collect()
+        .unwrap();
+    assert_eq!(df3.shape(), (2, 2));
+
+    std::fs::remove_dir_all(&root).ok();
+}

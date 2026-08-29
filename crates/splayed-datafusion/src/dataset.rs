@@ -342,10 +342,37 @@ impl TableProvider for SplayedDatasetProvider {
 
     async fn scan(
         &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.scan_impl(state, projection, filters, limit, None).await
+    }
+}
+
+/// 分区表层扩展：带符号覆盖的扫描（core 分区计划已把每个分区的符号剪成
+/// 有效子集，透传避免分区内缺符号报错）。
+impl SplayedDatasetProvider {
+    pub(crate) async fn scan_with_symbols(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        symbols: &SymbolSelection,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.scan_impl(state, projection, filters, limit, Some(symbols))
+            .await
+    }
+
+    async fn scan_impl(
+        &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
+        symbol_override: Option<&SymbolSelection>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let projected_indices: Vec<usize> = match projection {
             Some(indices) => indices.clone(),
@@ -376,9 +403,14 @@ impl TableProvider for SplayedDatasetProvider {
         let default_batch = 65536usize;
         let batch_size = limit.map(|l| l.min(default_batch)).unwrap_or(default_batch);
 
+        // 符号选择：分区层的有效子集优先（分区表）；否则按解析结果。
+        let symbols = symbol_override
+            .cloned()
+            .unwrap_or(pd.symbols.unwrap_or(SymbolSelection::All));
+
         let req = ScanRequest {
             columns: scan_columns,
-            symbols: pd.symbols.unwrap_or(SymbolSelection::All),
+            symbols,
             time_range: pd.time_range.unwrap_or(TimeRange::all()),
             filters: pd.value_filters,
             batch_size,

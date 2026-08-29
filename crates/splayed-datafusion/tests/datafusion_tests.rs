@@ -662,3 +662,44 @@ async fn partition_column_sql() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// 分区级符号剪裁透传：符号只存在于部分分区时，core 分区计划剔除缺失分区的
+/// 符号并剪掉该分区，dataset 扫描用有效子集（不再因缺符号报错）。
+#[tokio::test]
+async fn partition_symbol_prune_passes_override() {
+    fn one_sym_batch(sym: &str, base: f64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("time", ArrowDT::Date32, false),
+                Field::new("sym", ArrowDT::Utf8, false),
+                Field::new("close", ArrowDT::Float64, true),
+            ])),
+            vec![
+                Arc::new(Date32Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec![Some(sym); 3])),
+                Arc::new(Float64Array::from(vec![base, base + 1.0, base + 2.0])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let root = temp_dir("sym_prune");
+    create_table(&root.join("2024"), &one_sym_batch("SYM01", 100.0), true).unwrap();
+    create_table(&root.join("2025"), &one_sym_batch("SYM02", 200.0), true).unwrap();
+
+    // SYM02 只在 2025：2024 被剪掉，返回值 = 2025 的 3 行。
+    let batches = run_query(&root, "SELECT close FROM splayed WHERE sym = 'SYM02'").await;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let close = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..close.len()).map(|i| close.value(i)).collect::<Vec<_>>(),
+        vec![200.0, 201.0, 202.0]
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

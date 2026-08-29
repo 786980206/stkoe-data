@@ -180,6 +180,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | 接口 | 说明 |
 |---|---|
 | `splayed_lazyframe(dir) -> LazyFrame` | 注册 `AnonymousScan` 惰性数据源（`LazyFrame::anonymous_scan`） |
+| `splayed_lazyframe_table(dir) -> LazyFrame` | **分区表**惰性数据源：复用 `core::partition` 剪裁/合并；key=value 分区列进 schema + 常量列 |
 | `SplayedScan` | `AnonymousScan` 实现：`allows_predicate/projection_pushdown=true` |
 | `predicate::translate(expr, dtype_of)` | polars `Expr`（`列 op 字面量` AND 链）→ core `SymbolSelection/TimeRange/Filter` |
 | `arrowconv::{to_polars_dtype, to_polars_arrow_dtype, record_batch_to_dataframe}` | arrow-rs → polars：C data interface（时间列物理化），字符串按值构造 |
