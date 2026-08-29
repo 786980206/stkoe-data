@@ -34,8 +34,8 @@ pub use scanner::{
     scan_owned_parallel, split_ranges,
 };
 pub use partition::{
-    Partition, PartitionError, PartitionPlan, PartitionScanBatches, PartitionScanRequest,
-    PartitionSchema, PartitionTask, PartitionedTable,
+    Partition, PartitionColumn, PartitionColumnKind, PartitionError, PartitionPlan,
+    PartitionScanBatches, PartitionScanRequest, PartitionSchema, PartitionTask, PartitionedTable,
 };
 pub use table_writer::{
     TableColumn, TableError, create_meta, create_table, update_meta, update_table,

@@ -117,6 +117,8 @@ pub enum FilterValue {
     Date32(i32),
     Date64(i64),
     TimestampUs(i64),
+    /// 字符串字面量（声明式分区列 / 未来字符串字段；数值列对比返回不匹配）。
+    String(String),
 }
 
 /// A scan request.

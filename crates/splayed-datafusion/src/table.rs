@@ -8,16 +8,24 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
+use datafusion::arrow::datatypes::{
+    DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
+    SchemaRef as ArrowSchemaRef,
+};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue, Statistics};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
+use datafusion::physical_expr::expressions::{Literal, col};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::ExecutionPlan;
 
 use splayed_core::{
-    PartitionScanRequest, PartitionedTable, SymbolSelection, TimeRange,
+    Filter, PartitionColumnKind, PartitionScanRequest, PartitionedTable, SymbolSelection,
+    TimeRange,
 };
 
 use crate::dataset::SplayedDatasetProvider;
@@ -76,6 +84,9 @@ impl SplayedTableProvider {
             .collect();
         let stats = aggregate_statistics(&partitions);
 
+        // 表 schema = 数据集 schema + 声明式分区列（追加在末尾）。
+        let schema = Arc::new(with_partition_columns(schema.as_ref(), &table));
+
         Ok(Self {
             dir,
             table,
@@ -116,6 +127,73 @@ fn same_schema(a: &ArrowSchema, b: &ArrowSchema) -> bool {
         && a.fields().iter().zip(b.fields().iter()).all(|(x, y)| {
             x.name() == y.name() && x.data_type() == y.data_type()
         })
+}
+
+/// dataset schema + 声明式分区列（追加在末尾）。
+fn with_partition_columns(schema: &ArrowSchema, table: &PartitionedTable) -> ArrowSchema {
+    let mut fields: Vec<ArrowField> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    for pc in table.partition_columns() {
+        let ty = match pc.kind {
+            PartitionColumnKind::Int64 => ArrowDataType::Int64,
+            PartitionColumnKind::String => ArrowDataType::Utf8,
+        };
+        fields.push(ArrowField::new(pc.name.clone(), ty, false));
+    }
+    ArrowSchema::new(fields)
+}
+
+/// 单表达式（引用分区列）→ core `Filter`（列 op 字面量；剥恒等 cast）。
+fn partition_filter_from_expr(expr: &Expr, part_cols: &HashSet<String>) -> Option<Filter> {
+    use datafusion::logical_expr::{BinaryExpr, Operator};
+    use splayed_core::FilterValue;
+
+    // 剥除 cast 包裹（DF55：Cast(Box<Expr> + 目标类型) 的元组变体）。
+    let mut e = expr;
+    while let Expr::Cast(cast) = e {
+        e = cast.expr.as_ref();
+    }
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = e else {
+        return None;
+    };
+    let (field, lit) = match (left.as_ref(), right.as_ref()) {
+        (Expr::Column(c), Expr::Literal(v, _)) => (c.name.to_string(), v),
+        (Expr::Literal(v, _), Expr::Column(c)) => (c.name.to_string(), v),
+        _ => return None,
+    };
+    if !part_cols.contains(field.as_str()) {
+        return None;
+    }
+    let fv = match lit {
+        ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) => {
+            FilterValue::String(s.clone().unwrap_or_default())
+        }
+        ScalarValue::Int8(v) => FilterValue::Int64(v.unwrap_or_default() as i64),
+        ScalarValue::Int16(v) => FilterValue::Int64(v.unwrap_or_default() as i64),
+        ScalarValue::Int32(v) => FilterValue::Int64(v.unwrap_or_default() as i64),
+        ScalarValue::Int64(v) => FilterValue::Int64(v.unwrap_or_default()),
+        ScalarValue::UInt32(v) => FilterValue::Int64(v.unwrap_or_default() as i64),
+        ScalarValue::UInt64(v) => FilterValue::Int64(v.unwrap_or_default() as i64),
+        _ => return None,
+    };
+    Some(match op {
+        Operator::Eq => Filter::Equal { field, value: fv },
+        Operator::NotEq => Filter::NotEqual { field, value: fv },
+        Operator::Gt => Filter::GreaterThan { field, value: fv },
+        Operator::GtEq => Filter::GreaterOrEqual { field, value: fv },
+        Operator::Lt => Filter::LessThan { field, value: fv },
+        Operator::LtEq => Filter::LessOrEqual { field, value: fv },
+        _ => return None,
+    })
+}
+
+/// 某分区某分区列的值 → ScalarValue（表投影的常量列）。
+fn partition_scalar(kind: PartitionColumnKind, value: &str) -> ScalarValue {
+    match kind {
+        PartitionColumnKind::Int64 => {
+            ScalarValue::Int64(value.parse::<i64>().ok())
+        }
+        PartitionColumnKind::String => ScalarValue::Utf8(Some(value.to_string())),
+    }
 }
 
 /// Aggregate per-partition statistics into table-level statistics.
@@ -217,13 +295,53 @@ impl TableProvider for SplayedTableProvider {
             .collect();
         let output_schema = Arc::new(ArrowSchema::new(fields));
 
-        // 分区剪裁（core 层：TIME → 符号 → 分区统计）→ 只执行命中的分区。
+        let dataset_cols = self.table.fields().len() + 2; // time + sym + fields
+        let has_part_cols = !self.table.partition_columns().is_empty();
+
+        // 分流：引用分区列的表达式 → 分区列剪裁（core plan）；其余 → dataset。
+        let part_cols: HashSet<String> = self
+            .table
+            .partition_columns()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        let mut dataset_exprs: Vec<Expr> = Vec::new();
+        let mut partition_filters = Vec::new();
+        for expr in filters {
+            let mut hits = HashSet::new();
+            let _ = expr.apply(|e| {
+                if let Expr::Column(c) = e {
+                    if part_cols.contains(c.name.as_str()) {
+                        hits.insert(c.name.to_string());
+                    }
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            });
+            if !hits.is_empty() {
+                if let Some(f) = partition_filter_from_expr(expr, &part_cols) {
+                    partition_filters.push(f);
+                }
+                continue; // 分区列表达式不传给 dataset
+            }
+            dataset_exprs.push(expr.clone());
+        }
+
+        // 分区剪裁（core 层：TIME → 符号 → 分区统计 → 分区列）。
         let pd = parse_filters(filters, &self.schema, &self.known_symbols);
+        // 值过滤只取「非分区列」部分（分区列已进 partition_filters，且其
+        // 字段在 dataset 中不存在，不能进 partition_may_match 的 footer 检查）。
+        let dataset_filters: Vec<_> = pd
+            .value_filters
+            .iter()
+            .filter(|f| !part_cols.contains(f.field_name()))
+            .cloned()
+            .collect();
         let preq = PartitionScanRequest {
             columns: Vec::new(),
-            symbols: SymbolSelection::All, // 符号级剪裁仍由 dataset 扫描处理
+            symbols: SymbolSelection::All, // 符号级剪裁由 dataset 扫描处理
             time_range: pd.time_range.unwrap_or_else(TimeRange::all),
-            filters: pd.value_filters.clone(),
+            filters: dataset_filters.clone(),
+            partition_filters,
             batch_size: 65536,
             parallelism: 1,
         };
@@ -231,13 +349,48 @@ impl TableProvider for SplayedTableProvider {
             DataFusionError::Execution(format!("SplayedTable plan failed: {e}"))
         })?;
 
+        // dataset 投影 = 去掉分区列下标（分区列由常量投影补回）。
+        let dataset_projection: Vec<usize> = projected_indices
+            .iter()
+            .copied()
+            .filter(|&i| i < dataset_cols)
+            .collect();
+
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(pplan.tasks.len());
         for task in &pplan.tasks {
-            plans.push(
-                self.partitions[task.partition]
-                    .scan(state, projection, filters, limit)
-                    .await?,
-            );
+            let child = self.partitions[task.partition]
+                .scan(state, Some(&dataset_projection), &dataset_exprs, limit)
+                .await?;
+
+            if !has_part_cols {
+                plans.push(child);
+                continue;
+            }
+
+            // ProjectionExec：数据集列按名取 + 分区列按分区 declared 值做常量列。
+            let mut exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
+            for &idx in &projected_indices {
+                if idx >= dataset_cols {
+                    let pos = idx - dataset_cols;
+                    let pc = &self.table.partition_columns()[pos];
+                    let value = self
+                        .table
+                        .partitions()[task.partition]
+                        .declared
+                        .iter()
+                        .find(|(k, _)| k == &pc.name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    exprs.push((
+                        Arc::new(Literal::new(partition_scalar(pc.kind, &value))),
+                        pc.name.clone(),
+                    ));
+                } else {
+                    let name = self.schema.field(idx).name().clone();
+                    exprs.push((col(&name, &child.schema())?, name));
+                }
+            }
+            plans.push(Arc::new(ProjectionExec::try_new(exprs, child)?));
         }
 
         if plans.is_empty() {

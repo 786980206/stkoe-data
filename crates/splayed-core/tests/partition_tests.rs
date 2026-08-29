@@ -236,3 +236,111 @@ fn symbol_and_stats_pruning() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn partition_columns_key_value() {
+    use splayed_core::{FilterValue, PartitionColumnKind};
+
+    let root = temp_dir("kv");
+    make_partition(&root.join("year=2024"), &["SYM01"], 100.0);
+    make_partition(&root.join("year=2025"), &["SYM01"], 500.0);
+
+    let table = PartitionedTable::open(&root).unwrap();
+    // 分区列：year（Int64）+ declared 值 + 分区名（仍为目录名）。
+    assert_eq!(table.partition_columns().len(), 1);
+    let pc = &table.partition_columns()[0];
+    assert_eq!(pc.name, "year");
+    assert_eq!(pc.kind, PartitionColumnKind::Int64);
+    assert_eq!(table.partitions()[0].declared, vec![("year".to_string(), "2024".to_string())]);
+    assert_eq!(table.partitions()[1].declared, vec![("year".to_string(), "2025".to_string())]);
+
+    // 分区列过滤：year = 2024 → 只扫 2024 分区。
+    let req = PartitionScanRequest {
+        columns: vec!["close".into()],
+        partition_filters: vec![Filter::Equal {
+            field: "year".into(),
+            value: FilterValue::Int64(2024),
+        }],
+        ..Default::default()
+    };
+    let plan = table.plan(&req).unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].partition, 0);
+    assert_eq!(read_close(&plan, &req, &table), vec![100.0, 110.0, 120.0]);
+
+    // year > 2024 → 只扫 2025。
+    let req2 = PartitionScanRequest {
+        columns: vec!["close".into()],
+        partition_filters: vec![Filter::GreaterThan {
+            field: "year".into(),
+            value: FilterValue::Int64(2024),
+        }],
+        ..Default::default()
+    };
+    let plan2 = table.plan(&req2).unwrap();
+    assert_eq!(plan2.tasks.len(), 1);
+    assert_eq!(plan2.tasks[0].partition, 1);
+
+    // 字符串字面量：year = '2024' 也命中 2024。
+    let req3 = PartitionScanRequest {
+        columns: vec!["close".into()],
+        partition_filters: vec![Filter::Equal {
+            field: "year".into(),
+            value: FilterValue::String("2024".to_string()),
+        }],
+        ..Default::default()
+    };
+    let plan3 = table.plan(&req3).unwrap();
+    assert_eq!(plan3.tasks.len(), 1);
+    assert_eq!(plan3.tasks[0].partition, 0);
+
+    // year = 9999 → 空计划。
+    let req4 = PartitionScanRequest {
+        partition_filters: vec![Filter::Equal {
+            field: "year".into(),
+            value: FilterValue::Int64(9999),
+        }],
+        ..Default::default()
+    };
+    assert!(table.plan(&req4).unwrap().tasks.is_empty());
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn partition_column_string_kind_and_mixed_naming() {
+    use splayed_core::{FilterValue, PartitionColumnKind};
+
+    // 非数字值 → String 分区列。
+    let root = temp_dir("kvstr");
+    make_partition(&root.join("env=prod"), &["SYM01"], 100.0);
+    make_partition(&root.join("env=test"), &["SYM01"], 500.0);
+    let table = PartitionedTable::open(&root).unwrap();
+    assert_eq!(table.partition_columns()[0].name, "env");
+    assert_eq!(table.partition_columns()[0].kind, PartitionColumnKind::String);
+
+    let req = PartitionScanRequest {
+        columns: vec!["close".into()],
+        partition_filters: vec![Filter::Equal {
+            field: "env".into(),
+            value: FilterValue::String("prod".to_string()),
+        }],
+        ..Default::default()
+    };
+    let plan = table.plan(&req).unwrap();
+    assert_eq!(plan.tasks.len(), 1);
+    assert_eq!(plan.tasks[0].partition, 0);
+    assert_eq!(read_close(&plan, &req, &table), vec![100.0, 110.0, 120.0]);
+
+    // 普通目录名与 key=value 混用 → 报错。
+    let root2 = temp_dir("kv_mix");
+    make_partition(&root2.join("year=2024"), &["SYM01"], 100.0);
+    make_partition(&root2.join("misc"), &["SYM01"], 500.0);
+    assert!(matches!(
+        PartitionedTable::open(&root2),
+        Err(splayed_core::PartitionError::MixedPartitionNaming { .. })
+    ));
+
+    fs::remove_dir_all(&root).ok();
+    fs::remove_dir_all(&root2).ok();
+}

@@ -39,6 +39,10 @@ pub enum PartitionError {
         expected: TimeType,
         found: TimeType,
     },
+    /// key=value 目录名与普通目录名混用。
+    MixedPartitionNaming { partition: String },
+    /// 分区列声明不一致（不同 key）。
+    PartitionColumnMismatch { partition: String, expected: String, found: String },
     Scan(String),
 }
 
@@ -59,11 +63,39 @@ impl std::fmt::Display for PartitionError {
                 f,
                 "partition {partition} time_type mismatch — expected {expected:?}, found {found:?}"
             ),
+            Self::MixedPartitionNaming { partition } => write!(
+                f,
+                "partition {partition}: key=value dir names and plain dir names must not mix"
+            ),
+            Self::PartitionColumnMismatch { partition, expected, found } => write!(
+                f,
+                "partition {partition}: partition column mismatch — expected {expected}, found {found}"
+            ),
             Self::Scan(s) => write!(f, "partition scan error: {s}"),
         }
     }
 }
 impl std::error::Error for PartitionError {}
+
+/// 分区列的值类型（全表统一：全部可解析为 i64 → Int64，否则 String）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionColumnKind {
+    Int64,
+    String,
+}
+
+impl PartitionColumnKind {
+    pub fn is_int64(&self) -> bool {
+        matches!(self, Self::Int64)
+    }
+}
+
+/// 声明式分区列（由 `key=value` 目录名解析而来，如 `year=2024/` → `year`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionColumn {
+    pub name: String,
+    pub kind: PartitionColumnKind,
+}
 
 /// 一个分区（元数据层面的视图；数据扫描惰性打开）。
 #[derive(Debug, Clone)]
@@ -74,6 +106,8 @@ pub struct Partition {
     pub path: PathBuf,
     /// 分区 meta（TIME AXIS / SYM INDEX 等，供剪裁）。
     pub meta: MetaFile,
+    /// 声明式分区列的值（与 `schema().partition_columns` 对齐；普通目录名为空）。
+    pub declared: Vec<(String, String)>,
 }
 
 /// 合并后的全表 schema（全分区一致）。
@@ -82,6 +116,8 @@ pub struct PartitionSchema {
     pub time_type: TimeType,
     /// 有序字段（名, 类型）。
     pub fields: Vec<(String, DataType)>,
+    /// 声明式分区列（key=value 目录名解析；空 = 无分区列）。
+    pub partition_columns: Vec<PartitionColumn>,
 }
 
 /// 分区表（引擎无关）。
@@ -100,7 +136,10 @@ pub struct PartitionScanRequest {
     pub columns: Vec<String>,
     pub symbols: SymbolSelection,
     pub time_range: TimeRange,
+    /// 作用于数据字段的值过滤（分区内行级 + 分区统计剪裁）。
     pub filters: Vec<Filter>,
+    /// 作用于**声明式分区列**的过滤（分区级剪裁）。
+    pub partition_filters: Vec<Filter>,
     pub batch_size: usize,
     /// 每个分区的并行度。
     pub parallelism: usize,
@@ -113,6 +152,7 @@ impl Default for PartitionScanRequest {
             symbols: SymbolSelection::All,
             time_range: TimeRange::all(),
             filters: Vec::new(),
+            partition_filters: Vec::new(),
             batch_size: 65536,
             parallelism: 1,
         }
@@ -145,6 +185,8 @@ impl PartitionedTable {
         let mut partitions = Vec::with_capacity(partition_dirs.len());
         let mut schemas: Vec<PartitionSchema> = Vec::with_capacity(partition_dirs.len());
         let mut names = Vec::with_capacity(partition_dirs.len());
+        let mut declared_per_partition: Vec<Vec<(String, String)>> =
+            Vec::with_capacity(partition_dirs.len());
 
         for pd in &partition_dirs {
             let name = if pd == &dir {
@@ -154,6 +196,25 @@ impl PartitionedTable {
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             };
+            // key=value 目录名 → 声明式分区列（单层一个 key=value；普通名=无）。
+            let declared = name
+                .split_once('=')
+                .map(|(k, v)| vec![(k.to_string(), v.to_string())])
+                .unwrap_or_default();
+            if declared.is_empty() && name != "." {
+                // 普通目录名：要求全表统一风格（要么都是 key=value，要么都没有）
+                if partition_dirs.iter().any(|pd2| {
+                    pd2 != pd
+                        && pd2
+                            .file_name()
+                            .map(|s| s.to_string_lossy().contains('='))
+                            .unwrap_or(false)
+                }) {
+                    return Err(PartitionError::MixedPartitionNaming {
+                        partition: name,
+                    });
+                }
+            }
             let meta_bytes =
                 fs::read(pd.join(META_FILE_NAME)).map_err(PartitionError::Io)?;
             let meta = MetaFile::deserialize(&meta_bytes).map_err(PartitionError::Meta)?;
@@ -161,13 +222,48 @@ impl PartitionedTable {
             schemas.push(PartitionSchema {
                 time_type: meta.time_type(),
                 fields,
+                partition_columns: Vec::new(),
             });
             names.push(name.clone());
+            declared_per_partition.push(declared);
             partitions.push(Partition {
                 name,
                 path: pd.clone(),
                 meta,
+                declared: Vec::new(), // 下方统一填充
             });
+        }
+
+        // 分区列合并：所有 key=value 分区列名一致；kind = 全部值可解析 i64 → Int64，否则 String。
+        let mut partition_columns: Vec<PartitionColumn> = Vec::new();
+        for (i, declared) in declared_per_partition.iter().enumerate() {
+            for (key, value) in declared {
+                let col = match partition_columns.iter_mut().find(|c| c.name == *key) {
+                    Some(col) => col,
+                    None => {
+                        partition_columns.push(PartitionColumn {
+                            name: key.clone(),
+                            kind: PartitionColumnKind::Int64,
+                        });
+                        partition_columns.last_mut().unwrap()
+                    }
+                };
+                if col.kind.is_int64() && value.parse::<i64>().is_err() {
+                    col.kind = PartitionColumnKind::String;
+                }
+                let _ = i;
+            }
+        }
+        // 单层目录只能表达一个 key=value（多层如 year=2024/month=01 暂不支持）。
+        if partition_columns.len() > 1 {
+            return Err(PartitionError::PartitionColumnMismatch {
+                partition: names[0].clone(),
+                expected: "at most one partition column (one-level key=value dirs)".to_string(),
+                found: partition_columns[1].name.clone(),
+            });
+        }
+        for (i, declared) in declared_per_partition.iter().enumerate() {
+            partitions[i].declared = declared.clone();
         }
 
         // Schema 合并校验：字段名+类型一致；time_type 一致。
@@ -200,10 +296,14 @@ impl PartitionedTable {
         }
         sym_set.sort();
 
+        // 最终 schema：数据集字段 + 声明式分区列。
+        let mut schema = schemas.remove(0);
+        schema.partition_columns = partition_columns;
+
         Ok(Self {
             dir,
             partitions,
-            schema: schemas.remove(0),
+            schema,
             symbols: sym_set,
         })
     }
@@ -226,6 +326,11 @@ impl PartitionedTable {
 
     pub fn fields(&self) -> &[(String, DataType)] {
         &self.schema.fields
+    }
+
+    /// 声明式分区列（key=value 目录名解析；空 = 无分区列）。
+    pub fn partition_columns(&self) -> &[PartitionColumn] {
+        &self.schema.partition_columns
     }
 
     /// 全表符号并集（升序）。
@@ -280,6 +385,12 @@ impl PartitionedTable {
                 continue;
             }
 
+            // 4) 分区列剪裁：声明式分区列上的过滤条件与分区 declared 值
+            //    不相交 → 跳过（如 year = '2024'）。
+            if !self.partition_columns_may_match(part, &request.partition_filters) {
+                continue;
+            }
+
             tasks.push(PartitionTask { partition: i, symbols });
         }
 
@@ -308,6 +419,20 @@ impl PartitionedTable {
             let min_v = RawValue::read_le(&st.min, 0, dt);
             let max_v = RawValue::read_le(&st.max, 0, dt);
             if !crate::scanner::matches_range(f, &min_v, &max_v) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 分区列剪裁：声明式分区列上的过滤与分区 `declared` 值不相交 → 跳过。
+    fn partition_columns_may_match(&self, part: &Partition, filters: &[Filter]) -> bool {
+        for f in filters {
+            // 只认分区列；其它列名交给 dataset 层。
+            let Some((_, value)) = part.declared.iter().find(|(k, _)| k == f.field_name()) else {
+                continue;
+            };
+            if !partition_filter_passes(f, value) {
                 return false;
             }
         }
@@ -377,6 +502,39 @@ impl PartitionScanBatches {
 // ---------------------------------------------------------------------------
 // 内部工具
 // ---------------------------------------------------------------------------
+
+/// 判定一个值过滤是否被分区列 `declared` 值满足。
+///
+/// 值语义：Int64 字面量与数字值按 i64 比较；String 字面量按字符串相等。
+/// 无法精确判定（未知字面量类型 / 非比较）一律返回 `true`（不漏剪裁）。
+fn partition_filter_passes(f: &Filter, value: &str) -> bool {
+    use crate::FilterValue as Fv;
+    match f {
+        Filter::Equal { value: Fv::Int64(v), .. } => value.parse::<i64>().map(|x| x == *v).unwrap_or(false),
+        Filter::NotEqual { value: Fv::Int64(v), .. } => value
+            .parse::<i64>()
+            .map(|x| x != *v)
+            .unwrap_or(true),
+        Filter::GreaterThan { value: Fv::Int64(v), .. } => {
+            value.parse::<i64>().map(|x| x > *v).unwrap_or(false)
+        }
+        Filter::GreaterOrEqual { value: Fv::Int64(v), .. } => {
+            value.parse::<i64>().map(|x| x >= *v).unwrap_or(false)
+        }
+        Filter::LessThan { value: Fv::Int64(v), .. } => {
+            value.parse::<i64>().map(|x| x < *v).unwrap_or(false)
+        }
+        Filter::LessOrEqual { value: Fv::Int64(v), .. } => {
+            value.parse::<i64>().map(|x| x <= *v).unwrap_or(false)
+        }
+        Filter::Equal { value: Fv::String(s), .. } => value == s.as_str(),
+        Filter::NotEqual { value: Fv::String(s), .. } => value != s.as_str(),
+        Filter::IsNull { .. } => false,    // declared 值恒非空
+        Filter::IsNotNull { .. } => true,
+        // 其它字面量类型（Float/Date…）：保守不剪裁。
+        _ => true,
+    }
+}
 
 /// 发现分区目录：`dir/.meta` 存在 → 单分区（`[dir]`）；否则子目录中含 `.meta`
 /// 者（按名升序）。

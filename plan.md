@@ -1042,9 +1042,15 @@ plan(&PartitionScanRequest)              // 三层剪裁：
   //  TIME：分区 meta time_axis 与半开区间 [start,end) 相交性
   //  符号：Symbols 选择剔除分区不存在的符号；一个都不存在→跳过分区
   //  统计：值 filter 与分区字段 footer [min,max] 不相交 → 跳过分区（整分区文件级跳过）
+  //  分区列：key=value 目录名解析的声明式列（PartitionColumn，Int64/String）
+  //          → 列上过滤条件与分区 declared 值不相交 → 跳过分区
 scan(&plan, &req) -> PartitionScanBatches// 按分区名升序流式合并 CoreBatch
 ```
 
+- 分区列：单层 `key=value/` 目录（如 `year=2024/.meta`）解析为**声明式
+  虚拟列**（全值可解析 i64 → Int64，否则 String）；DataFusion 表 schema
+  追加该列（`ProjectionExec` 常量列补回值），DuckDB 原生经
+  `PartitionScanRequest.partition_filters` 剪裁；
 - DataFusion：`SplayedTableProvider::scan` 用 core 分区计划的 tasks 选分区执行；
 - DuckDB：`splayed_duckdb::native::scan_table_to_chunks` 走同一实现；
 - Polars/其它引擎可直接调用 `PartitionedTable`（core 依赖即可）。

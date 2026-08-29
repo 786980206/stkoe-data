@@ -613,3 +613,52 @@ async fn update_meta_reload_reflects() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// 声明式分区列（key=value 目录）：schema 追加虚拟列、谓词下推到分区剪裁、
+/// 扫描结果带常量分区列。
+#[tokio::test]
+async fn partition_column_sql() {
+    let root = temp_dir("kv_df");
+    create_table(&root.join("year=2024"), &make_batch(), true).unwrap(); // 10 行
+    create_table(&root.join("year=2025"), &make_batch(), true).unwrap();
+
+    // 等值 → 只扫 2024 分区；year 投影为常量列。
+    let batches = run_query(&root, "SELECT close, year FROM splayed WHERE year = 2024").await;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 10);
+    let year = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap();
+    for i in 0..year.len() {
+        assert_eq!(year.value(i), 2024);
+    }
+
+    // 数值范围 → 只扫 2025 分区。
+    let b2 = run_query(&root, "SELECT close FROM splayed WHERE year > 2024").await;
+    let total2: usize = b2.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total2, 10);
+
+    // 字符串字面量等值同样剪裁（year = '2024'）。
+    let b3 = run_query(&root, "SELECT COUNT(*) AS c FROM splayed WHERE year = '2024'").await;
+    let c = b3[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(c, 10);
+
+    // DISTINCT 分区列值 = 2。
+    let b4 = run_query(&root, "SELECT COUNT(DISTINCT year) AS n FROM splayed").await;
+    let n = b4[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(n, 2);
+
+    fs::remove_dir_all(&root).ok();
+}

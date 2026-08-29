@@ -85,8 +85,8 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | | `scan_owned(...) / scan_owned_parallel(..., n)` | 自有 / 有序并行流 |
 | | `scan_all_parallel(...)` | 全收集（并行，支持 limit） |
 | | `split_ranges(plan, n)` | 行均衡切片（并行分组） |
-| 分区表 | `PartitionedTable::open(dir)` | 发现（单 dataset 兼容）+ schema 合并校验 + 符号并集 |
-| | `plan(&PartitionScanRequest)` | 三层剪裁：TIME（分区时间轴）/ 符号（分区缺失剔除）/ 统计（footer min-max 不相交→跳过分区） |
+| 分区表 | `PartitionedTable::open(dir)` | 发现（单 dataset 兼容）+ schema 合并校验 + 符号并集 + **key=value 目录名解析为声明式分区列**（`PartitionColumn`，Int64/String） |
+| | `plan(&PartitionScanRequest)` | 四层剪裁：TIME（分区时间轴）/ 符号（分区缺失剔除）/ 统计（footer min-max 不相交→跳过分区）/ **分区列**（`partition_filters` 与 declared 值不相交→跳过） |
 | | `scan(&plan, &req) -> PartitionScanBatches` | 按分区名升序流式合并 CoreBatch（DataFusion / DuckDB 共用此实现） |
 | 请求类型 | `ScanRequest{columns, symbols, time_range, filters, batch_size, parallelism, limit}` | 一次扫描的全部下推条件 |
 | | `SymbolSelection::All \| Symbols` / `TimeRange::new`, `Filter`(8 种) / `FilterValue`(全定长类型) | 下推值类型 |
