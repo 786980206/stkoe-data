@@ -1067,19 +1067,22 @@ Splayed Extension
 Splayed Scanner
 ```
 
-初期可以：
+两条路径（`splayed-duckdb`）：
 
 ```text
-Splayed -> Arrow -> DuckDB
+Phase 1（feature "arrow"，默认开）：
+  Splayed -> CoreBatch -> Arrow(零拷贝) -> IPC 文件 -> DuckDB read_arrow
+  （外部文件交换；代价 = IPC 序列化 + DuckDB 重解析一段拷贝）
+
+Phase 2（原生 DataChunk，no arrow）：
+  Splayed -> CoreBatch -> scan_to_chunks() -> DuckDB Extension 逐批消费
+  （扩展内 Vector(LogicalType, data_ptr) 零拷贝借用：定长列数据原样、
+    validity → NullMask 小拷贝、字典列展开；CoreBatch 与 chunk 同保活）
 ```
 
-性能成熟后：
-
-```text
-Splayed -> Native ColumnView -> DuckDB DataChunk
-```
-
-减少 Arrow 转换。
+`native::scan_to_chunks` 已提供原生出口（零 Arrow 依赖——`--no-default-features`
+时 lib 依赖树中无任何 arrow 包）；DuckDB 扩展骨架（C ABI / C++ Vector 构造）
+为后续工程项。
 
 ---
 

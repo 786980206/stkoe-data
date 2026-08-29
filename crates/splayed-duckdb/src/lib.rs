@@ -1,173 +1,24 @@
-//! Splayed V1 DuckDB integration — Arrow IPC bridge (plan §10.4, Phase 1).
+//! DuckDB 集成（`splayed-duckdb`）。
 //!
-//! Phase 1: `Splayed → Arrow → DuckDB`
+//! 两条路径，按需开启：
 //!
-//! This crate exports a Splayed dataset to Arrow IPC format, which DuckDB can
-//! read natively via:
-//! ```sql
-//! SELECT * FROM read_arrow('dataset.arrow');
-//! ```
+//! 1. **Arrow IPC 桥**（`feature = "arrow"`，默认开）：Splayed → CoreBatch →
+//!    Arrow（零拷贝）→ IPC 文件，DuckDB 用 `read_arrow('file.arrow')` 读取。
+//!    适合“外部文件交换”场景，代价是 IPC 序列化 + DuckDB 重新解析一段拷贝。
+//! 2. **原生 DataChunk 路由**（无 arrow，`mod native`）：直接以 `CoreBatch`
+//!    流喂给 DuckDB 扩展层（未来的 TableFunction / Copy 函数）。CoreBatch 的
+//!    定长小端缓冲 + validity 位图与 DuckDB `Vector` 的 `data_ptr + NullMask`
+//!    布局同构，扩展内可用 `Vector(LogicalType, data_ptr)` 零拷贝借用：
+//!    - 数值/日期/时间戳列：数据缓冲原样（无拷贝）；
+//!    - NULL：CoreBatch validity 位图 → DuckDB `NullMask`（n/8 字节小拷贝）；
+//!    - SYM（字典列）：扩展侧展开为 DuckDB 字典/字符串向量（或复用元数据）。
 //!
-//! The conversion chain is:
-//! ```text
-//! Splayed Dataset
-//!   → Scanner (META pruning + ColumnView)
-//!   → Arrow RecordBatch (via column_view_to_arrow)
-//!   → Arrow IPC file (streaming writer)
-//! ```
-//!
-//! Phase 2 (future): `Splayed → Native ColumnView → DuckDB DataChunk`
-//! would bypass the Arrow conversion by using DuckDB's C API directly,
-//! but Phase 1 via Arrow IPC is simpler and already very efficient.
+//! 详见 [`native`] 模块与 `plan.md` §10.4。
 
-use std::path::Path;
-use std::sync::Arc;
+#[cfg(feature = "arrow")]
+mod arrow_bridge;
 
-use arrow::ipc::writer::StreamWriter;
-use arrow_array::RecordBatch;
-use arrow_schema::{
-    DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit as ArrowTimeUnit,
-};
+pub mod native;
 
-use splayed_core::{open_dataset, Dataset, ScanRequest, Scanner, SymbolSelection, TimeRange};
-use splayed_format::TimeType;
-
-/// Errors that can occur during Splayed → Arrow IPC export.
-#[derive(Debug)]
-pub enum ExportError {
-    /// Failed to open the Splayed dataset.
-    OpenDataset(String),
-    /// Failed to scan the dataset.
-    Scan(String),
-    /// Failed to write Arrow IPC.
-    Ipc(String),
-    /// I/O error writing the file.
-    Io(std::io::Error),
-}
-
-impl std::fmt::Display for ExportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OpenDataset(s) => write!(f, "failed to open dataset: {s}"),
-            Self::Scan(s) => write!(f, "scan error: {s}"),
-            Self::Ipc(s) => write!(f, "arrow IPC error: {s}"),
-            Self::Io(e) => write!(f, "io error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ExportError {}
-
-/// Build the Arrow schema for a Splayed dataset.
-///
-/// The schema is: `time, sym, <field1>, <field2>, ...`
-/// matching the DataFusion provider's schema.
-pub fn build_arrow_schema(dataset: &Dataset) -> SchemaRef {
-    let time_type = dataset.meta.time_type();
-    let time_arrow = match time_type {
-        TimeType::Date32 => ArrowDataType::Date32,
-        TimeType::TimestampUs => ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None),
-    };
-
-    let mut fields = vec![
-        Field::new("time", time_arrow, true),
-        Field::new("sym", ArrowDataType::Utf8, true),
-    ];
-
-    if let Ok(field_names) = dataset.list_fields() {
-        for name in field_names {
-            let path = dataset.field_path(&name);
-            if let Ok(reader) = splayed_core::FieldReader::open(&path) {
-                // Use the shared type mapper from splayed-arrow (avoids D1 duplication).
-                let arrow_ty = splayed_arrow::splayed_to_arrow_type(reader.data_type());
-                fields.push(Field::new(&name, arrow_ty, true));
-            }
-        }
-    }
-
-    Arc::new(Schema::new(fields))
-}
-
-/// Convert a `CoreBatch` to an Arrow `RecordBatch` via the zero-copy adapter.
-///
-/// The batch layout `[time, sym, fields...]` matches `build_arrow_schema`, so
-/// the projection is the identity and the schema fields carry the types.
-fn scan_batch_to_record_batch(
-    batch: splayed_core::CoreBatch,
-    schema: &SchemaRef,
-) -> Result<RecordBatch, ExportError> {
-    let indices: Vec<usize> = (0..schema.fields().len()).collect();
-    let fields: Vec<arrow_schema::Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
-    splayed_arrow::corebatch_into_record_batch(batch, &indices, &fields, None)
-        .map_err(|e| ExportError::Ipc(e.to_string()))
-}
-
-/// Export a Splayed dataset to Arrow IPC format, writing to a file.
-///
-/// This is the Phase 1 bridge: `Splayed → Arrow → IPC file → DuckDB`.
-///
-/// DuckDB can then read this file via:
-/// ```sql
-/// SELECT * FROM read_arrow('output.arrow');
-/// ```
-///
-/// Returns the total number of rows exported.
-pub fn export_to_arrow_ipc(dataset_dir: &Path, output_path: &Path) -> Result<usize, ExportError> {
-    let dataset = open_dataset(dataset_dir)
-        .map_err(|e| ExportError::OpenDataset(e.to_string()))?;
-    let schema = build_arrow_schema(&dataset);
-
-    let field_names = dataset
-        .list_fields()
-        .map_err(|e| ExportError::OpenDataset(e.to_string()))?;
-
-    let req = ScanRequest {
-        columns: field_names.clone(),
-        symbols: SymbolSelection::All,
-        time_range: TimeRange::all(),
-        filters: vec![],
-        batch_size: 65536,
-        parallelism: 1,
-    };
-
-    let scanner = Scanner::new(&dataset);
-    let plan = scanner
-        .plan(&req)
-        .map_err(|e| ExportError::Scan(e.to_string()))?;
-    let mut batches = scanner
-        .scan(&plan, &req)
-        .map_err(|e| ExportError::Scan(e.to_string()))?;
-
-    let file = std::fs::File::create(output_path).map_err(ExportError::Io)?;
-    let mut writer =
-        StreamWriter::try_new(file, &schema).map_err(|e| ExportError::Ipc(e.to_string()))?;
-
-    let mut total_rows = 0;
-    while let Some(batch) = batches
-        .next_batch()
-        .map_err(|e| ExportError::Scan(e.to_string()))?
-    {
-        let record_batch = scan_batch_to_record_batch(batch, &schema)?;
-        writer
-            .write(&record_batch)
-            .map_err(|e| ExportError::Ipc(e.to_string()))?;
-        total_rows += record_batch.num_rows();
-    }
-
-    writer
-        .finish()
-        .map_err(|e| ExportError::Ipc(e.to_string()))?;
-
-    Ok(total_rows)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn export_error_display() {
-        let e = ExportError::OpenDataset("not found".into());
-        assert!(e.to_string().contains("not found"));
-    }
-}
+#[cfg(feature = "arrow")]
+pub use crate::arrow_bridge::{ExportError, build_arrow_schema, export_to_arrow_ipc};

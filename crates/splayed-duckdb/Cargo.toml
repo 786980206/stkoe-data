@@ -4,12 +4,22 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "DuckDB integration for Splayed V1 — Arrow IPC bridge (plan §10.4 Phase 1)"
+description = "DuckDB integration for Splayed V1 — Phase 1: Arrow IPC bridge (optional); native DataChunk route (no Arrow)"
 
 [dependencies]
 splayed-core.workspace = true
-splayed-arrow.workspace = true
 splayed-format.workspace = true
-arrow = { workspace = true, features = ["ipc"] }
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
+# Arrow 是可选依赖：仅 Arrow IPC 导出桥需要；原生 DataChunk 路径不触碰 Arrow。
+splayed-arrow = { workspace = true, optional = true }
+arrow = { workspace = true, optional = true, features = ["ipc"] }
+arrow-array = { workspace = true, optional = true }
+arrow-schema = { workspace = true, optional = true }
+
+[dev-dependencies]
+splayed-arrow.workspace = true
+
+[features]
+default = ["arrow"]
+# Arrow IPC 桥（Splayed → CoreBatch → Arrow → IPC 文件，DuckDB read_arrow 读）。
+# 关掉本 feature 后 crate 零 Arrow 依赖，只暴露原生 DataChunk 路由。
+arrow = ["dep:splayed-arrow", "dep:arrow", "dep:arrow-array", "dep:arrow-schema"]
