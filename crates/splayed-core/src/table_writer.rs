@@ -109,18 +109,7 @@ pub fn create_table(
 
     // 2) each FIELD written once in global-row order.
     for col in columns {
-        let elem_sz = col.data_type.size_of();
-        // Buffer spans the FULL global row space — input rows may be sparse
-        // (missing time points keep their pre-declared NULL sentinel).
-        let mut global = vec![0u8; meta.total_rows() as usize * elem_sz];
-        splayed_format::fill_null(&mut global, col.data_type);
-        for i in 0..n {
-            let gr = meta
-                .global_row(&sym[i], time[i])
-                .ok_or_else(|| TableError::SymTimeNotFound { row: i })? as usize;
-            let src = &col.values[i * elem_sz..(i + 1) * elem_sz];
-            global[gr * elem_sz..(gr + 1) * elem_sz].copy_from_slice(src);
-        }
+        let global = scatter_to_global(&meta, sym, time, col)?;
         create_field_with_data(dir.join(&col.name), col.data_type, &global)
             .map_err(TableError::CreateField)?;
     }
@@ -128,16 +117,42 @@ pub fn create_table(
     Ok(meta)
 }
 
+/// Scatter an input-row-order column into global-row order.
+///
+/// The buffer spans the FULL global row space — input rows may be sparse
+/// (missing time points keep their pre-declared NULL sentinel).
+fn scatter_to_global(
+    meta: &MetaFile,
+    sym: &[String],
+    time: &[i64],
+    col: &TableColumn,
+) -> Result<Vec<u8>, TableError> {
+    let elem_sz = col.data_type.size_of();
+    let mut global = vec![0u8; meta.total_rows() as usize * elem_sz];
+    splayed_format::fill_null(&mut global, col.data_type);
+    for i in 0..sym.len() {
+        let gr = meta
+            .global_row(&sym[i], time[i])
+            .ok_or_else(|| TableError::SymTimeNotFound { row: i })? as usize;
+        let src = &col.values[i * elem_sz..(i + 1) * elem_sz];
+        global[gr * elem_sz..(gr + 1) * elem_sz].copy_from_slice(src);
+    }
+    Ok(global)
+}
+
 /// In-place update of existing (SYM, TIME) cells (plan §8.4 update_table).
 ///
 /// - Only positions present in META are updated; unknown (SYM, TIME) errors.
-/// - A FIELD not present on disk errors (`FieldNotFound`); a type mismatch
-///   errors (`TypeMismatch`).
+/// - A FIELD not present on disk: errors with `FieldNotFound` unless
+///   `create_missing_fields` is set, in which case the field is **auto-created**
+///   as a new column (all pre-existing rows NULL, input rows filled once).
+/// - An existing FIELD with a different type errors (`TypeMismatch`).
 pub fn update_table(
     dir: impl AsRef<Path>,
     sym: &[String],
     time: &[i64],
     columns: &[TableColumn],
+    create_missing_fields: bool,
 ) -> Result<(), TableError> {
     let dir = dir.as_ref();
     let dataset = open_dataset(dir).map_err(TableError::Dataset)?;
@@ -152,7 +167,14 @@ pub fn update_table(
     let n = sym.len();
     for col in columns {
         if !existing.contains(&col.name) {
-            return Err(TableError::FieldNotFound(col.name.clone()));
+            if !create_missing_fields {
+                return Err(TableError::FieldNotFound(col.name.clone()));
+            }
+            // New column: NULL history + this input's values (one-pass write).
+            let global = scatter_to_global(meta, sym, time, col)?;
+            create_field_with_data(dir.join(&col.name), col.data_type, &global)
+                .map_err(TableError::CreateField)?;
+            continue;
         }
         let expected = n * col.data_type.size_of();
         if col.values.len() != expected {

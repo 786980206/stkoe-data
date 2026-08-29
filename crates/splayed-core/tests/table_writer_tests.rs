@@ -199,7 +199,7 @@ fn update_table_modifies_existing_cells() {
 
     // Update SYM01@0 close → 999.
     let upd = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(999.0)])]);
-    update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd).expect("update_table failed");
+    update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd, false).expect("update_table failed");
     assert_eq!(read_row(&dir, "close", 0).as_f64(), Some(999.0));
 
     fs::remove_dir_all(&dir).ok();
@@ -213,21 +213,55 @@ fn update_table_unknown_sym_time_errors() {
 
     // SYM01@99 doesn't exist in META → error (no silent expansion).
     let upd = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(1.0)])]);
-    let err = update_table(&dir, &syms_of(&["SYM01"]), &[99], &upd);
+    let err = update_table(&dir, &syms_of(&["SYM01"]), &[99], &upd, false);
     assert!(matches!(err, Err(TableError::SymTimeNotFound { row: 0 })));
 
     fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn update_table_missing_field_errors() {
+fn update_table_missing_field_errors_by_default() {
     let dir = temp_dir("upd_field");
     let columns = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(100.0)])]);
     create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns).unwrap();
 
+    // Default: field missing → error (protects against typos).
     let upd = native_column(&[("volume", DataType::Int64, vec![RawValue::from_i64(7)])]);
-    let err = update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd);
+    let err = update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd, false);
     assert!(matches!(err, Err(TableError::FieldNotFound(name)) if name == "volume"));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn update_table_auto_creates_missing_field() {
+    let dir = temp_dir("upd_auto");
+    let columns = native_column(&[("close", DataType::Float64, vec![
+        RawValue::from_f64(100.0),
+        RawValue::from_f64(101.0),
+    ])]);
+    // SYM01 with times 0,1 (2 global rows).
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01", "SYM01"]), &[0, 1], &columns)
+        .unwrap();
+
+    // New field "volume": only the row for SYM01@0 is filled; SYM01@1 stays NULL.
+    let upd = native_column(&[("volume", DataType::Int64, vec![RawValue::from_i64(999)])]);
+    update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd, true).expect("auto-create failed");
+
+    let reader = FieldReader::open(dir.join("volume")).unwrap();
+    assert_eq!(reader.read_row(0).unwrap().as_i64(), Some(999));
+    assert!(reader.read_row(1).unwrap().is_null());
+
+    // Existing field still updated fine alongside the new one.
+    let upd2 = native_column(&[
+        ("volume", DataType::Int64, vec![RawValue::from_i64(1000)]),
+        ("close", DataType::Float64, vec![RawValue::from_f64(50.0)]),
+    ]);
+    update_table(&dir, &syms_of(&["SYM01"]), &[1], &upd2, true).expect("update failed");
+    let reader = FieldReader::open(dir.join("volume")).unwrap();
+    assert_eq!(reader.read_row(0).unwrap().as_i64(), Some(999));
+    assert_eq!(reader.read_row(1).unwrap().as_i64(), Some(1000));
+    assert_eq!(read_row(&dir, "close", 1).as_f64(), Some(50.0));
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -240,7 +274,7 @@ fn update_table_type_mismatch_errors() {
 
     // Same field name but Int64 → rejected.
     let upd = native_column(&[("close", DataType::Int64, vec![RawValue::from_i64(7)])]);
-    let err = update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd);
+    let err = update_table(&dir, &syms_of(&["SYM01"]), &[0], &upd, false);
     assert!(matches!(err, Err(TableError::TypeMismatch { field, .. }) if field == "close"));
 
     fs::remove_dir_all(&dir).ok();

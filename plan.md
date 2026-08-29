@@ -592,7 +592,7 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 ```text
 create_meta(dir, time_type, sym: Vec<String>, time: Vec<i64>) -> MetaFile
 create_table(dir, time_type, sym, time, columns: Vec<TableColumn>) -> MetaFile
-update_table(dir, sym, time, columns: Vec<TableColumn>) -> ()
+update_table(dir, sym, time, columns: Vec<TableColumn>, create_missing_fields: bool) -> ()
 TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端字节
 ```
 
@@ -672,7 +672,9 @@ TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端�
 
 - 仅更新已存在的 `(SYM, TIME)` 位置。
 - `data` 中 `(SYM, TIME)` 不在 META 中则报错（不扩展）。
-- `data` 中包含 META 中不存在的 FIELD 列则报错或跳过。
+- `data` 中包含 META 中不存在的 FIELD 列：默认报错；`create_missing_fields=true`
+  时自动创建该列（新列历史槽位全 NULL，本次输入值按 `(SYM, TIME) → global_row`
+  一次写入），用于 schema 演进（晚到列）。
 
 ### 失败模式
 
@@ -680,8 +682,8 @@ TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端�
 | --- | --- |
 | `update_field` 写入已压缩 FIELD | 拒绝，报错（只读） |
 | `update_field` row 超出 `[0, total_rows)` | 拒绝，报错 |
-| `update_table` 传入 META 中不存在的 `(SYM, TIME)` | 报错，不静默扩展 |
-| `update_table` 传入 .meta 不存在的 FIELD 列 | 报错或跳过（实现选择） |
+| `update_table` 传入 `(SYM, TIME)` 不在 META 中 | 报错，不静默扩展 |
+| `update_table` 传入 .meta 不存在的 FIELD 列 | 默认报错；`create_missing_fields=true` 时自动创建 |
 | `create_field` 时 `.meta` 不存在 | 报错 |
 | `compact_field` 时 `compression != NONE` | 拒绝（不允许二次压缩） |
 | crash 后 FIELD generation 与 META 不匹配 | Reader 拒绝使用该 FIELD |

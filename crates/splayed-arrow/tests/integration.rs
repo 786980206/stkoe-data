@@ -136,7 +136,7 @@ fn update_table_modifies_values() {
     )
     .unwrap();
 
-    update_table(&dir, &update_batch, true).expect("update_table failed");
+    update_table(&dir, &update_batch, true, false).expect("update_table failed");
 
     let reader = FieldReader::open(dir.join("close")).expect("open reader failed");
     assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(500.0));

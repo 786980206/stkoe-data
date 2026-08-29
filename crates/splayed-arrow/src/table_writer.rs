@@ -33,17 +33,21 @@ pub fn create_table(
 
 /// Update existing FIELD files from an Arrow RecordBatch (in-place).
 ///
+/// `create_missing_fields`: when a FIELD column in `data` doesn't exist on disk,
+/// auto-create it as a new column (existing rows NULL) instead of erroring.
+///
 /// See `plan.md` §8.4 `update_table`.
 pub fn update_table(
     folder: impl AsRef<Path>,
     data: &RecordBatch,
-    sorted: bool,
+    _sorted: bool,
+    create_missing_fields: bool,
 ) -> Result<(), TableError> {
     let folder = folder.as_ref();
     let (_time_type, syms, times, columns) = convert_batch(data)?;
-    let _ = sorted;
 
-    splayed_core::update_table(folder, &syms, &times, &columns).map_err(TableError::Core)?;
+    splayed_core::update_table(folder, &syms, &times, &columns, create_missing_fields)
+        .map_err(TableError::Core)?;
     Ok(())
 }
 
