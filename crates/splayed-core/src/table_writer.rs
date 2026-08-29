@@ -72,12 +72,18 @@ pub fn create_meta(
 /// Values are given in input-row order and scattered to their global rows via
 /// the (SYM, TIME) → global_row mapping; each FIELD file is written in a single
 /// pass (`create_field_with_data`) instead of pre-allocate + update.
+///
+/// `sorted`: a **performance hint** — when the input rows are already ordered by
+/// (SYM, TIME) ascending, the scatter skips the per-row `global_row` binary
+/// searches (O(n) window-cursor walk). The input is verified regardless: if it
+/// turns out unsorted the general path is used, so results are always correct.
 pub fn create_table(
     dir: impl AsRef<Path>,
     time_type: TimeType,
     sym: &[String],
     time: &[i64],
     columns: &[TableColumn],
+    sorted: bool,
 ) -> Result<MetaFile, TableError> {
     let dir = dir.as_ref();
 
@@ -104,17 +110,32 @@ pub fn create_table(
         }
     }
 
-    // 1) .meta
+    // 1) .meta (MetaBuilder skips its internal sort when already ordered).
     let meta = create_meta(dir, time_type, sym, time)?;
 
     // 2) each FIELD written once in global-row order.
+    let fast = sorted && is_sorted_by_sym_time(sym, time);
     for col in columns {
-        let global = scatter_to_global(&meta, sym, time, col)?;
+        let global = if fast {
+            scatter_to_global_sorted(&meta, sym, time, col)?
+        } else {
+            scatter_to_global(&meta, sym, time, col)?
+        };
         create_field_with_data(dir.join(&col.name), col.data_type, &global)
             .map_err(TableError::CreateField)?;
     }
 
     Ok(meta)
+}
+
+/// Is the input ordered by `(SYM asc, TIME asc)` lexicographically?
+fn is_sorted_by_sym_time(sym: &[String], time: &[i64]) -> bool {
+    for i in 0..sym.len().saturating_sub(1) {
+        if sym[i] > sym[i + 1] || (sym[i] == sym[i + 1] && time[i] > time[i + 1]) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Scatter an input-row-order column into global-row order.
@@ -134,6 +155,58 @@ fn scatter_to_global(
         let gr = meta
             .global_row(&sym[i], time[i])
             .ok_or_else(|| TableError::SymTimeNotFound { row: i })? as usize;
+        let src = &col.values[i * elem_sz..(i + 1) * elem_sz];
+        global[gr * elem_sz..(gr + 1) * elem_sz].copy_from_slice(src);
+    }
+    Ok(global)
+}
+
+/// Fast-path scatter for input already ordered by `(SYM asc, TIME asc)`.
+///
+/// Global rows are then monotonically non-decreasing, so each row's global row
+/// is found with a per-symbol binary search + an advancing TIME AXIS window
+/// cursor — O(1) amortized per row instead of two binary searches each.
+///
+/// Semantics identical to [`scatter_to_global`] (NULL-filled gaps, input values
+/// placed at their global rows). Callers must have verified sortedness.
+fn scatter_to_global_sorted(
+    meta: &MetaFile,
+    sym: &[String],
+    time: &[i64],
+    col: &TableColumn,
+) -> Result<Vec<u8>, TableError> {
+    let elem_sz = col.data_type.size_of();
+    let mut global = vec![0u8; meta.total_rows() as usize * elem_sz];
+    splayed_format::fill_null(&mut global, col.data_type);
+
+    let axis = &meta.time_axis;
+    let mut sym_idx: Option<usize> = None;
+    let mut window_cursor = 0usize; // advancing index into TIME AXIS
+
+    for i in 0..sym.len() {
+        let s = &sym[i];
+        let t = time[i];
+
+        // Advance to a new symbol once per group.
+        if sym_idx.map_or(true, |si| meta.symbols[si] != *s) {
+            let si = meta
+                .symbols
+                .binary_search_by(|x| x.as_str().cmp(s.as_str()))
+                .map_err(|_| TableError::SymTimeNotFound { row: i })?;
+            sym_idx = Some(si);
+            window_cursor = meta.sym_index[si].time_start as usize;
+        }
+
+        let rec = &meta.sym_index[sym_idx.expect("set above")];
+        let window_end = rec.time_start as usize + rec.time_count as usize;
+        while window_cursor < window_end && axis[window_cursor] < t {
+            window_cursor += 1;
+        }
+        if window_cursor >= window_end || axis[window_cursor] != t {
+            return Err(TableError::SymTimeNotFound { row: i });
+        }
+
+        let gr = rec.row_start as usize + (window_cursor - rec.time_start as usize);
         let src = &col.values[i * elem_sz..(i + 1) * elem_sz];
         global[gr * elem_sz..(gr + 1) * elem_sz].copy_from_slice(src);
     }

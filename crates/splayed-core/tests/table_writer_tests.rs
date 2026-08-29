@@ -122,6 +122,7 @@ fn create_table_writes_fields_in_one_pass() {
         &syms_of(&["SYM01", "SYM02", "SYM01", "SYM02", "SYM01"]),
         &[0, 0, 1, 1, 2],
         &columns,
+        false,
     )
     .expect("create_table failed");
     assert_eq!(meta.total_rows(), 5);
@@ -152,6 +153,76 @@ fn create_table_writes_fields_in_one_pass() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// `sorted=true` on genuinely sorted input takes the fast path (window-cursor
+/// scatter) and must produce the same layout as the general path.
+#[test]
+fn create_table_sorted_fast_path() {
+    let dir = temp_dir("sorted_fast");
+    let columns = native_column(&[
+        ("close", DataType::Float64, vec![
+            RawValue::from_f64(100.0),
+            RawValue::from_f64(101.0),
+            RawValue::from_f64(200.0),
+            RawValue::from_f64(201.0),
+        ]),
+        ("volume", DataType::Int64, vec![
+            RawValue::from_i64(1000),
+            RawValue::from_i64(1001),
+            RawValue::from_i64(2000),
+            RawValue::from_i64(2001),
+        ]),
+    ]);
+    // Already (SYM, TIME) ascending: SYM01 t0,t1 then SYM02 t0,t1.
+    let meta = create_table(
+        &dir,
+        TimeType::Date32,
+        &syms_of(&["SYM01", "SYM01", "SYM02", "SYM02"]),
+        &[0, 1, 0, 1],
+        &columns,
+        true,
+    )
+    .expect("sorted create_table failed");
+    assert_eq!(meta.total_rows(), 4);
+
+    // Global rows are identity here (sorted input): g0..g3 map 1:1.
+    assert_eq!(read_row(&dir, "close", 0).as_f64(), Some(100.0));
+    assert_eq!(read_row(&dir, "close", 1).as_f64(), Some(101.0));
+    assert_eq!(read_row(&dir, "close", 2).as_f64(), Some(200.0));
+    assert_eq!(read_row(&dir, "close", 3).as_f64(), Some(201.0));
+    assert_eq!(read_row(&dir, "volume", 3).as_i64(), Some(2001));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// `sorted=true` with a lie (actually unsorted input) must fall back to the
+/// general scatter — results stay correct, never corrupted.
+#[test]
+fn create_table_sorted_hint_unsorted_input_falls_back() {
+    let dir = temp_dir("sorted_lie");
+    let columns = native_column(&[("close", DataType::Float64, vec![
+        RawValue::from_f64(100.0),
+        RawValue::from_f64(101.0),
+        RawValue::from_f64(200.0),
+    ])]);
+    // Claim sorted=true but row 2 is (SYM02, t0) after (SYM01, t1): not sorted.
+    let meta = create_table(
+        &dir,
+        TimeType::Date32,
+        &syms_of(&["SYM01", "SYM01", "SYM02"]),
+        &[0, 1, 0],
+        &columns,
+        true,
+    )
+    .expect("lied sorted input still works");
+    assert_eq!(meta.total_rows(), 3);
+    // Correct global layout regardless of the false hint.
+    assert_eq!(read_row(&dir, "close", 0).as_f64(), Some(100.0)); // SYM01 t0
+    assert_eq!(read_row(&dir, "close", 1).as_f64(), Some(101.0)); // SYM01 t1
+    assert_eq!(read_row(&dir, "close", 2).as_f64(), Some(200.0)); // SYM02 t0
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn create_table_nonempty_dir_errors() {
     let dir = temp_dir("nonempty");
@@ -165,6 +236,7 @@ fn create_table_nonempty_dir_errors() {
         &syms_of(&["SYM01"]),
         &[0],
         &columns,
+        false,
     );
     assert!(matches!(err, Err(TableError::DirNotEmpty)));
 
@@ -179,7 +251,7 @@ fn create_table_length_mismatch_errors() {
         DataType::Float64,
         vec![RawValue::from_f64(1.0), RawValue::from_f64(2.0)], // 2 vals vs 1 row
     )]);
-    let err = create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns);
+    let err = create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns, false);
     assert!(matches!(
         err,
         Err(TableError::LengthMismatch { field, .. }) if field == "close"
@@ -195,7 +267,7 @@ fn create_table_length_mismatch_errors() {
 fn update_table_modifies_existing_cells() {
     let dir = temp_dir("upd");
     let columns = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(100.0)])]);
-    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns).unwrap();
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns, false).unwrap();
 
     // Update SYM01@0 close → 999.
     let upd = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(999.0)])]);
@@ -209,7 +281,7 @@ fn update_table_modifies_existing_cells() {
 fn update_table_unknown_sym_time_errors() {
     let dir = temp_dir("upd_unknown");
     let columns = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(100.0)])]);
-    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns).unwrap();
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns, false).unwrap();
 
     // SYM01@99 doesn't exist in META → error (no silent expansion).
     let upd = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(1.0)])]);
@@ -223,7 +295,7 @@ fn update_table_unknown_sym_time_errors() {
 fn update_table_missing_field_errors_by_default() {
     let dir = temp_dir("upd_field");
     let columns = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(100.0)])]);
-    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns).unwrap();
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns, false).unwrap();
 
     // Default: field missing → error (protects against typos).
     let upd = native_column(&[("volume", DataType::Int64, vec![RawValue::from_i64(7)])]);
@@ -241,7 +313,7 @@ fn update_table_auto_creates_missing_field() {
         RawValue::from_f64(101.0),
     ])]);
     // SYM01 with times 0,1 (2 global rows).
-    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01", "SYM01"]), &[0, 1], &columns)
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01", "SYM01"]), &[0, 1], &columns, true)
         .unwrap();
 
     // New field "volume": only the row for SYM01@0 is filled; SYM01@1 stays NULL.
@@ -270,7 +342,7 @@ fn update_table_auto_creates_missing_field() {
 fn update_table_type_mismatch_errors() {
     let dir = temp_dir("upd_type");
     let columns = native_column(&[("close", DataType::Float64, vec![RawValue::from_f64(100.0)])]);
-    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns).unwrap();
+    create_table(&dir, TimeType::Date32, &syms_of(&["SYM01"]), &[0], &columns, false).unwrap();
 
     // Same field name but Int64 → rejected.
     let upd = native_column(&[("close", DataType::Int64, vec![RawValue::from_i64(7)])]);

@@ -147,7 +147,7 @@ Writer functions (see `plan.md` §8.4 for the full specification):
 | `create_table(folder, data, sorted)` | splayed-arrow | One-shot table creation from a RecordBatch — thin Arrow adapter |
 | `update_table(folder, data, sorted, create_missing_fields)` | splayed-arrow | In-place update of existing (SYM, TIME) cells — thin Arrow adapter |
 | `create_meta(dir, time_type, sym, time)` | splayed-core | **Native** `.meta` write (no Arrow) for exchange layers |
-| `create_table(dir, time_type, sym, time, columns)` | splayed-core | **Native** one-shot table write; each FIELD written once with data |
+| `create_table(dir, time_type, sym, time, columns, sorted)` | splayed-core | **Native** one-shot table write; `sorted=true` takes an O(n) fast path when input is already (SYM, TIME)-ordered |
 | `update_table(dir, sym, time, columns, create_missing_fields)` | splayed-core | **Native** in-place cell update; `true` auto-creates missing FIELD columns |
 | `create_field(field_path, data_type)` | splayed-core | Pre-allocate FIELD file (all NULL) |
 | `create_field_with_data(field_path, data_type, values)` | splayed-core | Create FIELD **and** fill it in one write pass |

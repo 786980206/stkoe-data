@@ -591,13 +591,17 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 
 ```text
 create_meta(dir, time_type, sym: Vec<String>, time: Vec<i64>) -> MetaFile
-create_table(dir, time_type, sym, time, columns: Vec<TableColumn>) -> MetaFile
+create_table(dir, time_type, sym, time, columns: Vec<TableColumn>, sorted: bool) -> MetaFile
 update_table(dir, sym, time, columns: Vec<TableColumn>, create_missing_fields: bool) -> ()
 TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端字节
 ```
 
 - `create_table`：建 `.meta` 后，每个 FIELD 先在**全局行序**缓冲（缺失时间点保留 NULL 哨兵），再 `create_field_with_data` 一次写入；
-- `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；
+- `sorted`（**性能提示**）：输入已按 (SYM, TIME) 升序时走快速路径——`MetaBuilder`
+  跳过重复排序，FIELD 散列改为按符号分组 + TIME AXIS 窗口游标（每行均摊
+  O(1)，免去每行的两次二分查找）。传入前会做 O(n) 顺序校验：若实际乱序
+  自动回退普通路径，结果始终正确；
+- `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；`create_missing_fields=true` 时自动创建缺失 FIELD（新列历史全 NULL）；
 - 目录须为空或不存在。
 
 ### delete_field(field_path)

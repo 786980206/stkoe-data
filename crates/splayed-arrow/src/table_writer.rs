@@ -17,16 +17,19 @@ use crate::arrow_conv::{arrow_time_type, arrow_to_splayed_type, arrow_value_to_r
 
 /// One-shot: create `.meta` + all FIELD files, each FIELD written once with data.
 ///
+/// `sorted`: performance hint — input already ordered by (SYM, TIME) ascending
+/// lets the core engine skip per-row global_row lookups (verified internally).
+///
 /// See `plan.md` §8.4 `create_table`.
 pub fn create_table(
     folder: impl AsRef<Path>,
     data: &RecordBatch,
-    _sorted: bool,
+    sorted: bool,
 ) -> Result<(), TableError> {
     let folder = folder.as_ref();
     let (time_type, syms, times, columns) = convert_batch(data)?;
 
-    splayed_core::create_table(folder, time_type, &syms, &times, &columns)
+    splayed_core::create_table(folder, time_type, &syms, &times, &columns, sorted)
         .map_err(TableError::Core)?;
     Ok(())
 }
