@@ -1,8 +1,11 @@
-//! Splayed V1 core engine: reader, field writer, dataset management.
+//! Splayed V1 core engine: reader, field writer, table writer, dataset management.
 //!
 //! This crate depends on `splayed-format` and `splayed-codec` but **not** Arrow.
-//! It provides the pure-core operations: `create_field`, `update_field`,
-//! `delete_field`, `compact_field`, and the mmap-based reader.
+//! It provides the pure-core operations: `create_field` (+
+//! `create_field_with_data`), `update_field`, `delete_field`, `compact_field`,
+//! the mmap-based reader, and the native table writers `create_meta` /
+//! `create_table` / `update_table` (exchange layers convert their data to
+//! [`TableColumn`] raw bytes — no Arrow needed).
 
 pub mod column_view;
 pub mod dataset;
@@ -10,17 +13,21 @@ pub mod field_writer;
 pub mod reader;
 pub mod scanner;
 pub mod simd_filter;
+pub mod table_writer;
 
 pub use column_view::{ColumnView, ColumnViewIter};
 pub use dataset::{open_dataset, Dataset, DatasetError};
 pub use field_writer::{
-    create_field, delete_field, update_field, CreateFieldError, DeleteFieldError, UpdateError,
-    UpdateItem,
+    create_field, create_field_with_data, delete_field, update_field, CreateFieldError,
+    DeleteFieldError, UpdateError, UpdateItem,
 };
 pub use reader::{FieldReader, ReaderError};
 pub use scanner::{
     Filter, FilterValue, OwnedScanBatches, ScanBatchOwned, ScanBatches, ScanPlan, ScanRequest,
     Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
+};
+pub use table_writer::{
+    TableColumn, TableError, create_meta, create_table, update_table,
 };
 
 // Re-export compact_field from splayed-codec (plan §8.4 places it in splayed-codec).

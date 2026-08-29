@@ -479,7 +479,7 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 
 ## 8.4 函数接口规范
 
-以下七个函数是 Writer 层的权威 API 定义。Arrow 相关函数（`create_meta` / `create_table` / `update_table`）位于 `splayed-arrow` crate，纯核心函数位于 `splayed-core` crate。
+以下七个函数是 Writer 层的权威 API 定义。Arrow 相关函数（`create_meta` / `create_table` / `update_table`）位于 `splayed-arrow` crate（仅做 Arrow→原生转换），同名的原生版本位于 `splayed-core` crate（见后文「原生表写接口」），供 DuckDB 原生 DataChunk 等交换层直写；`create_field` / `create_field_with_data` / `update_field` / `delete_field` / `compact_field` 位于 `splayed-core` / `splayed-codec`。
 
 ### create_meta(folder, data, sorted)
 
@@ -563,6 +563,42 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 4. 预分配 FIELD 文件：`header(64B) + total_rows × sizeof(type)`
 5. DATA 区全部填入该类型的 NULL 特殊值
 6. 写入 FIELD header
+
+### create_field_with_data(field_path, data_type, values)
+
+**所在 crate：** `splayed-core`
+
+**输入：**
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `field_path` | path | 字段文件路径（与 `.meta` 同目录） |
+| `data_type` | uint8 | 数据类型 ID（见 §5.3） |
+| `values` | bytes | 原始小端字节，长度必须 = `total_rows × sizeof(type)` |
+
+**处理：**
+
+1. 读取同级目录 `.meta`（权威 `total_rows` / `generation`）
+2. 校验 `values.len() == total_rows × sizeof(type)`，否则 `LengthMismatch` 报错
+3. **一次写入**：`header(64B) + data`（单一写通，没有预分配全 NULL 再回填的两遍写）
+
+**约束：** 值必须覆盖全部 `total_rows`；稀疏/部分填充走 `create_field` + `update_field`。
+
+### 原生表写接口（`splayed-core`）——交换层直写，无 Arrow
+
+上述 Arrow 函数（`create_meta` / `create_table` / `update_table`）只是转换器：
+真正的引擎实现在 core 的原生接口（未来 DuckDB 原生 DataChunk 等交换层可直接调用，无需经 Arrow）：
+
+```text
+create_meta(dir, time_type, sym: Vec<String>, time: Vec<i64>) -> MetaFile
+create_table(dir, time_type, sym, time, columns: Vec<TableColumn>) -> MetaFile
+update_table(dir, sym, time, columns: Vec<TableColumn>) -> ()
+TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端字节
+```
+
+- `create_table`：建 `.meta` 后，每个 FIELD 先在**全局行序**缓冲（缺失时间点保留 NULL 哨兵），再 `create_field_with_data` 一次写入；
+- `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；
+- 目录须为空或不存在。
 
 ### delete_field(field_path)
 

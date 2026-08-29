@@ -1,11 +1,10 @@
-//! `create_meta`: build a `.meta` file from an Arrow RecordBatch (TIME + SYM).
+//! `create_meta`: Arrow RecordBatch (TIME + SYM) → native pairs → core writer.
 //! See `plan.md` §8.4.
 
-use std::fs;
 use std::path::Path;
 
 use arrow_array::{Array, RecordBatch, StringArray};
-use splayed_format::{MetaBuilder, MetaFile, TimeType, META_FILE_NAME};
+use splayed_format::{MetaFile, TimeType};
 
 use crate::arrow_conv::arrow_time_type;
 
@@ -17,11 +16,15 @@ use crate::arrow_conv::arrow_time_type;
 ///
 /// The TIME column is identified by being a Date32 or Timestamp(µs) type.
 /// The SYM column is identified by being the (first) Utf8/String column.
+///
+/// This is a thin Arrow→native adapter: the actual engine is
+/// `splayed_core::create_meta(dir, time_type, sym, time)`.
 pub fn create_meta(
     folder: impl AsRef<Path>,
     data: &RecordBatch,
     sorted: bool,
 ) -> Result<MetaFile, CreateMetaError> {
+    let _ = sorted; // MetaBuilder always validates/sorts (plan §8.4).
     let folder = folder.as_ref();
 
     // Find TIME and SYM columns.
@@ -46,51 +49,35 @@ pub fn create_meta(
 
     let time_array = data.column(time_idx);
     let sym_array = data.column(sym_idx);
-
-    let n = data.num_rows();
     let sym_str = sym_array
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or(CreateMetaError::SymNotUtf8)?;
 
-    // Build pairs (sym, time_i64).
-    let mut builder = MetaBuilder::new(time_type, 1);
-
+    let n = data.num_rows();
+    let mut syms: Vec<String> = Vec::with_capacity(n);
+    let mut times: Vec<i64> = Vec::with_capacity(n);
     for i in 0..n {
-        let sym = if sym_array.is_null(i) {
+        if sym_array.is_null(i) {
             return Err(CreateMetaError::NullSym { row: i });
-        } else {
-            sym_str.value(i)
-        };
-        let time = extract_time_i64(time_array.as_ref(), i, time_type)?;
-        builder.add(sym, time);
+        }
+        syms.push(sym_str.value(i).to_string());
+        times.push(extract_time_i64(time_array.as_ref(), i, time_type)?);
     }
 
-    // If caller says it's sorted, trust but verify during build.
-    if sorted {
-        // MetaBuilder will detect unsorted and re-sort if needed.
-        // We set the sorted flag but build() still validates.
+    splayed_core::create_meta(folder, time_type, &syms, &times).map_err(map_core_error)
+}
+
+/// Map a `splayed_core::TableError` (create_meta subset) into `CreateMetaError`.
+fn map_core_error(e: splayed_core::TableError) -> CreateMetaError {
+    match e {
+        splayed_core::TableError::Io(e) => CreateMetaError::Io(e),
+        splayed_core::TableError::Meta(e) => CreateMetaError::MetaBuild(e),
+        other => CreateMetaError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("create_meta failed: {other}"),
+        )),
     }
-
-    let meta = builder.build().map_err(CreateMetaError::MetaBuild)?;
-
-    // Write .meta atomically: write to temp, fsync, rename (plan §6).
-    let meta_path = folder.join(META_FILE_NAME);
-    let tmp_path = folder.join(format!("{META_FILE_NAME}.new"));
-
-    fs::create_dir_all(folder).map_err(CreateMetaError::Io)?;
-    let bytes = meta.serialize();
-
-    // Open temp file, write, fsync, then drop before rename.
-    {
-        use std::io::Write;
-        let mut file = fs::File::create(&tmp_path).map_err(CreateMetaError::Io)?;
-        file.write_all(&bytes).map_err(CreateMetaError::Io)?;
-        file.sync_all().map_err(CreateMetaError::Io)?;
-    }
-    fs::rename(&tmp_path, &meta_path).map_err(CreateMetaError::Io)?;
-
-    Ok(meta)
 }
 
 /// Extract a time value as i64 from an Arrow array at the given index.
@@ -135,7 +122,7 @@ impl std::fmt::Display for CreateMetaError {
             Self::NullSym { row } => write!(f, "null SYM at row {row}"),
             Self::NullTime { row } => write!(f, "null TIME at row {row}"),
             Self::Io(e) => write!(f, "create_meta io error: {e}"),
-            Self::MetaBuild(e) => write!(f, "create_meta build error: {e}"),
+            Self::MetaBuild(e) => write!(f, "create_meta meta error: {e}"),
         }
     }
 }

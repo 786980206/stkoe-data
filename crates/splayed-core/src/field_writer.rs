@@ -67,6 +67,52 @@ pub fn create_field(field_path: impl AsRef<Path>, data_type: DataType) -> Result
     Ok(())
 }
 
+/// Create a FIELD file **and fill it with data in a single write pass**.
+///
+/// Reads `.meta` from the same directory for `total_rows` / `generation`,
+/// validates that `values` covers exactly `total_rows` elements, then writes
+/// the header + data region once — no separate NULL pre-allocation pass.
+///
+/// Use this when the full column is available up-front (e.g. `create_table`);
+/// keep `create_field` + `update_field` for the pre-allocate-then-fill-in-place
+/// workflow.
+pub fn create_field_with_data(
+    field_path: impl AsRef<Path>,
+    data_type: DataType,
+    values: &[u8],
+) -> Result<(), CreateFieldError> {
+    let field_path = field_path.as_ref();
+    let dir = field_path.parent().ok_or(CreateFieldError::NoParentDir)?;
+
+    // Read .meta from same directory (authoritative row count + generation).
+    let meta_path = dir.join(META_FILE_NAME);
+    let meta_bytes = fs::read(&meta_path).map_err(CreateFieldError::Io)?;
+    let meta = splayed_format::MetaFile::deserialize(&meta_bytes)
+        .map_err(CreateFieldError::Meta)?;
+
+    let total_rows = meta.total_rows();
+    let elem_sz = data_type.size_of();
+    let data_length = (total_rows as usize) * elem_sz;
+    if values.len() != data_length {
+        return Err(CreateFieldError::LengthMismatch {
+            expected: data_length,
+            got: values.len(),
+        });
+    }
+
+    let header = splayed_format::new_plain_field_header(data_type, meta.header.generation, total_rows);
+
+    let mut file = File::create(field_path).map_err(CreateFieldError::Io)?;
+
+    // Write header (64 bytes) + data region in one pass.
+    file.write_all(bytemuck::bytes_of(&header))
+        .map_err(CreateFieldError::Io)?;
+    file.write_all(values).map_err(CreateFieldError::Io)?;
+
+    file.sync_all().map_err(CreateFieldError::Io)?;
+    Ok(())
+}
+
 /// Update a FIELD file in-place with one or more update items.
 ///
 /// Each item writes raw bytes starting at `start_row × sizeof(type)` offset.
@@ -162,6 +208,8 @@ pub enum CreateFieldError {
     NoParentDir,
     Io(std::io::Error),
     Meta(splayed_format::MetaError),
+    /// `create_field_with_data`: values length ≠ total_rows × element size.
+    LengthMismatch { expected: usize, got: usize },
 }
 
 impl std::fmt::Display for CreateFieldError {
@@ -170,6 +218,10 @@ impl std::fmt::Display for CreateFieldError {
             Self::NoParentDir => write!(f, "field path has no parent directory"),
             Self::Io(e) => write!(f, "create_field io error: {e}"),
             Self::Meta(e) => write!(f, "create_field meta error: {e}"),
+            Self::LengthMismatch { expected, got } => write!(
+                f,
+                "create_field_with_data: values length {got} != expected {expected} (total_rows × element size)"
+            ),
         }
     }
 }

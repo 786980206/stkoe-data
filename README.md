@@ -139,16 +139,25 @@ Also available: `read_splayed('/path/to/dir')` table function and
 
 ## Function API
 
-Seven writer functions (see `plan.md` §8.4 for full specification):
+Writer functions (see `plan.md` §8.4 for the full specification):
 
 | Function | Crate | Description |
 |---|---|---|
-| `create_meta(folder, data, sorted)` | splayed-arrow | Build `.meta` from Arrow RecordBatch (TIME + SYM) |
-| `create_table(folder, data, sorted)` | splayed-arrow | One-shot: create_meta + create_field + update_field |
+| `create_meta(folder, data, sorted)` | splayed-arrow | Build `.meta` from Arrow RecordBatch (TIME + SYM) — thin Arrow adapter |
+| `create_table(folder, data, sorted)` | splayed-arrow | One-shot table creation from a RecordBatch — thin Arrow adapter |
+| `update_table(folder, data, sorted)` | splayed-arrow | In-place update of existing (SYM, TIME) cells — thin Arrow adapter |
+| `create_meta(dir, time_type, sym, time)` | splayed-core | **Native** `.meta` write (no Arrow) for exchange layers |
+| `create_table(dir, time_type, sym, time, columns)` | splayed-core | **Native** one-shot table write; each FIELD written once with data |
+| `update_table(dir, sym, time, columns)` | splayed-core | **Native** in-place cell update |
 | `create_field(field_path, data_type)` | splayed-core | Pre-allocate FIELD file (all NULL) |
+| `create_field_with_data(field_path, data_type, values)` | splayed-core | Create FIELD **and** fill it in one write pass |
 | `update_field(field_path, update_info[])` | splayed-core | In-place update at absolute row offsets |
 | `delete_field(field_path)` | splayed-core | Delete a FIELD file (idempotent) |
 | `compact_field(field_path, compression)` | splayed-codec | Compress FIELD (NONE → ZSTD), mark read-only |
+
+The `splayed-core` native writers take `TableColumn { name, data_type, values }`
+(raw little-endian bytes in input-row order), so a future native DuckDB
+DataChunk adapter can write tables without going through Arrow.
 | `update_table(folder, data, sorted)` | splayed-arrow | Update existing fields from Arrow RecordBatch |
 
 ### On-disk Layout
