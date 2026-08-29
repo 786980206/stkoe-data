@@ -398,6 +398,14 @@ impl CoreColumn {
         }
     }
 
+    /// The shared dictionary of a dictionary column.
+    pub fn dictionary_dict(&self) -> Option<&CoreStringDict> {
+        match &self.kind {
+            CoreColumnKind::Dictionary { values, .. } => Some(values),
+            _ => None,
+        }
+    }
+
     pub fn validity(&self) -> Option<&Bitmap> {
         self.nulls.as_ref()
     }

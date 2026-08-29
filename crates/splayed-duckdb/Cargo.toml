@@ -4,7 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "DuckDB integration for Splayed V1 — Phase 1: Arrow IPC bridge (optional); native DataChunk route (no Arrow)"
+description = "DuckDB integration for Splayed V1 — Rust 完整集成层（CoreBatch→DataChunk、扫描；C ABI 供扩展壳链接）"
+
+# 默认为 rlib。生成 cdylib/staticlib（供 DuckDB 扩展壳链接）时不改此文件，
+# 显式用：cargo build -p splayed-duckdb --release \
+#   --config 'lib.crate-type=["cdylib","staticlib"]'
+# （避免 MSVC 在默认构建里把 link 输出当作 warning）
 
 [dependencies]
 splayed-core.workspace = true

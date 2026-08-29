@@ -18,6 +18,7 @@
 #[cfg(feature = "arrow")]
 mod arrow_bridge;
 
+pub mod ffi;
 pub mod native;
 
 #[cfg(feature = "arrow")]

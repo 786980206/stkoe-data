@@ -1075,14 +1075,34 @@ Phase 1（feature "arrow"，默认开）：
   （外部文件交换；代价 = IPC 序列化 + DuckDB 重解析一段拷贝）
 
 Phase 2（原生 DataChunk，no arrow）：
-  Splayed -> CoreBatch -> scan_to_chunks() -> DuckDB Extension 逐批消费
-  （扩展内 Vector(LogicalType, data_ptr) 零拷贝借用：定长列数据原样、
-    validity → NullMask 小拷贝、字典列展开；CoreBatch 与 chunk 同保活）
+  Splayed -> CoreBatch -> scan_to_chunks() / C ABI -> DuckDB Extension 逐批消费
 ```
 
-`native::scan_to_chunks` 已提供原生出口（零 Arrow 依赖——`--no-default-features`
-时 lib 依赖树中无任何 arrow 包）；DuckDB 扩展骨架（C ABI / C++ Vector 构造）
-为后续工程项。
+### Phase 2 工程结构（Rust 集成层 + C++ 壳）
+
+```text
+splayed-duckdb（Rust crate，rlib；可按需 cdylib/staticlib）
+  └─ src/ffi.rs   C ABI（零 Arrow）：
+       splayed_dataset_open/close · schema_count/schema_field
+       splayed_scan_open/next/dict_value/close · last_error
+       句柄=裸指针（谁创建谁释放）；列视图借用当前批（下次调用前有效）
+splayed-duckdb-extension（C++ 工程，非 cargo 成员）
+  └─ extension.cpp 扩展壳：Load/注册 read_splayed(dir) 表函数，
+     消费 C ABI 列视图填充 DataChunk（定长列 memcpy、validity→NullMask、
+     SYM 字典逐行取串）
+```
+
+- 内存管理：句柄即 `Box::into_raw` 指针，每对象有 `*_close`；错误=返回码 +
+  `splayed_last_error()`（线程本地，Rust 持有）。
+- 列布局：`[0]=time`（原生 DATE/TIMESTAMP 类型）、`[1]=sym`（字典列
+  type_id=200）、`[2..]=FIELD`（splayed `DataType` id 0..=13）。
+- 数据合同：定长列缓冲与 DuckDB `Vector` 布局同构——C API 路径 memcpy 进
+  向量缓冲；扩展工程若改用 C++ `Vector(LogicalType, data_ptr)` 构造可零拷贝。
+- 演进顺序（按实施建议）：先扫描（已做）→ 分区谓词转换 → 写入 →
+  ADBC/DuckDB 平替后端。
+
+构建产物（`--config "lib.crate-type=['cdylib','staticlib']"`）：
+`target/release/{splayed_duckdb.dll, splayed_duckdb.lib, splayed_duckdb.dll.lib}`。
 
 ---
 
