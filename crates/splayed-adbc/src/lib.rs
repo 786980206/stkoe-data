@@ -64,6 +64,7 @@ impl std::error::Error for AdbcError {}
 pub struct Connection {
     ctx: SessionContext,
     runtime: Arc<tokio::runtime::Runtime>,
+    dir: std::path::PathBuf,
 }
 
 impl Connection {
@@ -80,12 +81,26 @@ impl Connection {
                 .map_err(|e| AdbcError::OpenDatabase(e.to_string()))?;
             Ok::<_, AdbcError>(ctx)
         })?;
-        Ok(Self { ctx, runtime })
+        Ok(Self { ctx, runtime, dir })
     }
 
     /// 以单个 dataset 目录（`dir/.meta` 必须存在）打开。
     pub fn open_dataset(dir: impl AsRef<Path>) -> Result<Self, AdbcError> {
         Self::open(dir)
+    }
+
+    /// 重新加载磁盘状态（例如 `splayed_core::update_meta` 之后）：用新的
+    /// provider 重新注册 `splayed` 表（旧注册先注销再注册）。调用前请确保
+    /// 没有正在执行的语句/流。
+    pub fn refresh(&self) -> Result<(), AdbcError> {
+        let ctx = self.ctx.clone();
+        let dir = self.dir.clone();
+        self.runtime.block_on(async move {
+            let _ = ctx.deregister_table("splayed"); // 忽略「不存在」错误
+            register_splayed_table(&ctx, "splayed", dir)
+                .map_err(|e| AdbcError::OpenDatabase(e.to_string()))?;
+            Ok::<_, AdbcError>(())
+        })
     }
 
     /// 创建一个携带 SQL 的语句。

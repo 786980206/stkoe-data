@@ -109,3 +109,4 @@ cargo test         # all tests must pass
 - CoreBatch + 零拷贝 + 磁盘类型扩展 + 并行流式：**Complete**。
 - 适配层组件化（umbrella）/ DuckDB C ABI / Polars AnonymousScan：**Complete**。
 - FIELD 统计 footer（min/max，§5.2.2）+ 扫描期剪裁 + ScanRequest.limit：**Complete**。
+- core `update_meta`（布局重排 + 并发字段重散布 + generation 原子提交）+ DataFusion reload / ADBC refresh 联动：**Complete**。

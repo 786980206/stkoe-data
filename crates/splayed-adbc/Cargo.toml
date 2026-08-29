@@ -17,3 +17,6 @@ arrow-array.workspace = true
 arrow-schema.workspace = true
 futures = "0.3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+
+[dev-dependencies]
+splayed-core.workspace = true

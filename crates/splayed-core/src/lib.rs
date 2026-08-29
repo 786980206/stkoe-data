@@ -33,7 +33,7 @@ pub use scanner::{
     scan_owned_parallel, split_ranges,
 };
 pub use table_writer::{
-    TableColumn, TableError, create_meta, create_table, update_table,
+    TableColumn, TableError, create_meta, create_table, update_meta, update_table,
 };
 
 // Re-export compact_field from splayed-codec (plan §8.4 places it in splayed-codec).

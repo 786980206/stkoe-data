@@ -141,3 +141,49 @@ fn partitioned_table_open() {
 
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// `update_meta` 联动：core 重排后 `Connection::refresh()` 使后续 SQL 看到
+/// 新布局（旧注册被新 provider 替换）。
+#[test]
+fn refresh_sees_new_layout_after_update_meta() {
+    use splayed_core::update_meta;
+
+    let dir = temp_dir("refresh");
+    create_table(&dir, &make_batch(), true).unwrap(); // 2 sym × 5 time = 10 行
+
+    let conn = Connection::open(&dir).unwrap();
+    let before = conn.execute("SELECT COUNT(*) AS c FROM splayed").unwrap();
+    let c = before[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(c, 10);
+
+    // core 重排布局：只保留 SYM02 的 t0..2（3 行）。
+    let syms: Vec<String> = ["SYM02", "SYM02", "SYM02"].map(|s| s.to_string()).to_vec();
+    update_meta(&dir, splayed_format::TimeType::Date32, &syms, &[0, 1, 2]).unwrap();
+
+    // 未 refresh 时还是旧视图（缓存 provider）——刷新后为 3 行。
+    let stale = conn.execute("SELECT COUNT(*) AS c FROM splayed").unwrap();
+    let sc = stale[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(sc, 10); // 旧 provider 缓存
+
+    conn.refresh().unwrap();
+    let after = conn.execute("SELECT COUNT(*) AS c FROM splayed").unwrap();
+    let ac = after[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(ac, 3);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -564,3 +564,52 @@ async fn stats_pruned_filter_empty() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// `update_meta` 联动：core 重排布局后，`provider.reload()` 使 DataFusion
+/// 看到新数据（schema/统计 重建）。
+#[tokio::test]
+async fn update_meta_reload_reflects() {
+    use datafusion::catalog::TableProvider;
+    use splayed_core::update_meta;
+
+    let dir = temp_dir("um_reload");
+    create_table(&dir, &make_batch(), true).unwrap(); // 2 sym × 5 time = 10 行
+
+    let mut provider = splayed_datafusion::SplayedDatasetProvider::new(&dir).unwrap();
+    let before = provider.statistics().unwrap();
+    assert_eq!(before.num_rows, datafusion::common::stats::Precision::Exact(10));
+
+    // core 重排：只保留 SYM01 的 t0..2（3 行）。
+    let syms: Vec<String> = ["SYM01", "SYM01", "SYM01"]
+        .map(|s| s.to_string())
+        .to_vec();
+    update_meta(&dir, splayed_format::TimeType::Date32, &syms, &[0, 1, 2]).unwrap();
+
+    provider.reload().unwrap();
+    let after = provider.statistics().unwrap();
+    assert_eq!(after.num_rows, datafusion::common::stats::Precision::Exact(3));
+
+    // 注册后查询也看到新布局。
+    let ctx = datafusion::prelude::SessionContext::new();
+    ctx.register_table("splayed", Arc::new(provider)).unwrap();
+    let batches = ctx
+        .sql("SELECT close FROM splayed ORDER BY time")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 3);
+    let close = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..close.len()).map(|i| close.value(i)).collect::<Vec<_>>(),
+        vec![100.0, 101.0, 102.0]
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}

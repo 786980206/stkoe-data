@@ -644,6 +644,7 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 create_meta(dir, time_type, sym: Vec<String>, time: Vec<i64>) -> MetaFile
 create_table(dir, time_type, sym, time, columns: Vec<TableColumn>, sorted: bool) -> MetaFile
 update_table(dir, sym, time, columns: Vec<TableColumn>, create_missing_fields: bool) -> ()
+update_meta(dir, time_type, sym, time) -> MetaFile
 TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端字节
 ```
 
@@ -653,7 +654,22 @@ TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端�
   O(1)，免去每行的两次二分查找）。传入前会做 O(n) 顺序校验：若实际乱序
   自动回退普通路径，结果始终正确；
 - `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；`create_missing_fields=true` 时自动创建缺失 FIELD（新列历史全 NULL）；
-- 目录须为空或不存在。
+- `update_meta`：**以新 (SYM, TIME) 布局重建 `.meta` 并把全部现有 FIELD
+  并发重散布到新布局**（区别于 `update_table` 的「格子内更新」）：
+  - 参数与 `create_meta` 一致（`sym`/`time` 为逐行数组）；
+  - gather：新布局第 g 行 = (新 sym, 新 time)，旧数据中同 (SYM, TIME) 的值
+    被搬运（旧 meta 二分定位，连续段一次 memcpy），旧数据没有的格子填
+    NULL；FIELD 保持同名，重写为 PLAIN+NONE 并重算真实 `null_count` 与
+    统计 footer；
+  - 并发：`std::thread::scope` 每字段一线程（字段彼此独立）；
+  - 原子性：先写 `.meta.new`（fsync 暂不改名）→ 各字段 `name.tmp` 写入+
+    fsync+rename → 最后 rename `.meta.new`→`.meta`（提交点）。中间态由
+    **generation 屏障**挡住（§6 不变量：generation 不匹配的 FIELD 被
+    Reader 拒绝）；失败重跑本函数即完成提交（重散布确定性、幂等）；
+  - `time_type` 允许变化（TIME 不落 FIELD）；
+  - ⚠ Windows：被 mmap 的字段无法 rename——调用方须先 drop 所有打开的
+    FieldReader / provider / 连接再调用。
+- 目录须为空或不存在（仅 `create_table`）。
 
 ### delete_field(field_path)
 

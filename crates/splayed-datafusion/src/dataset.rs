@@ -47,7 +47,46 @@ impl SplayedDatasetProvider {
     /// Open a dataset directory containing `.meta` + FIELD files.
     pub fn new(dir: impl Into<PathBuf>) -> DFResult<Self> {
         let dir = dir.into();
-        let dataset = Arc::new(open_dataset(&dir).map_err(|e| {
+        let (dataset, schema, symbols, stats, definition) = Self::init(&dir)?;
+        Ok(Self {
+            dataset,
+            schema,
+            symbols,
+            stats,
+            definition,
+            scan_parallelism: 1,
+        })
+    }
+
+    /// 重新加载磁盘状态（例如 `splayed_core::update_meta` 之后）。调用方须先
+    /// 结束所有正在进行中的查询（本 provider 持有的旧 `Dataset` 会被替换）。
+    pub fn reload(&mut self) -> DFResult<()> {
+        let dir = self.dataset_dir().to_path_buf();
+        let (dataset, schema, symbols, stats, definition) = Self::init(&dir)?;
+        self.dataset = dataset;
+        self.schema = schema;
+        self.symbols = symbols;
+        self.stats = stats;
+        self.definition = definition;
+        Ok(())
+    }
+
+    /// 当前数据集目录（供 reload / 上层重建使用）。
+    pub fn dataset_dir(&self) -> &std::path::Path {
+        &self.dataset.dir
+    }
+
+    /// 打开目录并构建 provider 状态（new / reload 共用）。
+    fn init(
+        dir: &std::path::Path,
+    ) -> DFResult<(
+        Arc<Dataset>,
+        ArrowSchemaRef,
+        HashSet<String>,
+        Option<Statistics>,
+        String,
+    )> {
+        let dataset = Arc::new(open_dataset(dir).map_err(|e| {
             DataFusionError::Execution(format!("failed to open splayed dataset: {e}"))
         })?);
         let meta = &dataset.meta;
@@ -86,14 +125,7 @@ impl SplayedDatasetProvider {
             dir.display()
         );
 
-        Ok(Self {
-            dataset,
-            schema,
-            symbols,
-            stats: Some(stats),
-            definition,
-            scan_parallelism: 1,
-        })
+        Ok((dataset, schema, symbols, Some(stats), definition))
     }
 
     /// Builder: split this dataset's scan into `n` DataFusion output partitions

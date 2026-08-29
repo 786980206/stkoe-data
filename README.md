@@ -191,6 +191,7 @@ Writer functions (see `plan.md` §8.4 for the full specification):
 | `update_table(folder, data, sorted, create_missing_fields)` | splayed-arrow | In-place update of existing (SYM, TIME) cells — thin Arrow adapter |
 | `create_meta(dir, time_type, sym, time)` | splayed-core | **Native** `.meta` write (no Arrow) for exchange layers |
 | `create_table(dir, time_type, sym, time, columns, sorted)` | splayed-core | **Native** one-shot table write; `sorted=true` takes an O(n) fast path when input is already (SYM, TIME)-ordered |
+| `update_meta(dir, time_type, sym, time)` | splayed-core | **Native** 以新 (SYM, TIME) 布局重建 `.meta` + **并发**重散布全部现有 FIELD（gather/NULL 补齐/generation 屏障/失败重跑幂等） |
 | `update_table(dir, sym, time, columns, create_missing_fields)` | splayed-core | **Native** in-place cell update; `true` auto-creates missing FIELD columns |
 | `create_field(field_path, data_type)` | splayed-core | Pre-allocate FIELD file (all NULL) |
 | `create_field_with_data(field_path, data_type, values)` | splayed-core | Create FIELD **and** fill it in one write pass |
@@ -304,6 +305,7 @@ min/max **跳过 NULL 哨兵**；`create_field_with_data`/`compact_field` 写入
 | 13 | ✅ Done | 适配层组件化（umbrella features）：adbc（上层 ADBC，内部 DataFusion）、duckdb C ABI、polars 惰性扫描 |
 | 14 | ✅ Done | Polars AnonymousScan：谓词下推 + 列裁剪 + C data interface 转换 |
 | 15 | ✅ Done | FIELD 统计 footer（min/max）→ 扫描期整数据集剪裁 + DataFusion 统计上报；ScanRequest.limit 读取期截断 |
+| 16 | ✅ Done | core `update_meta`：布局重排 + 并发字段重散布 + 原子提交；DataFusion `reload` / ADBC `refresh` 联动 |
 
 ---
 
