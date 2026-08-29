@@ -23,8 +23,9 @@ pub use field_writer::{
 };
 pub use reader::{FieldReader, ReaderError};
 pub use scanner::{
-    Filter, FilterValue, OwnedScanBatches, ScanBatchOwned, ScanBatches, ScanPlan, ScanRequest,
-    Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
+    Filter, FilterValue, OwnedScanBatches, ParallelScanBatches, ScanBatchOwned, ScanBatches,
+    ScanPlan, ScanRequest, Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
+    scan_owned_parallel, split_ranges,
 };
 pub use table_writer::{
     TableColumn, TableError, create_meta, create_table, update_table,

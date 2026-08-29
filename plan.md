@@ -946,6 +946,22 @@ Layer 1   SplayedDatasetProvider 单个 dataset 目录（对标一个 parquet �
 （`UnknownPartitioning(plans.len())`，每个物理分区 = 一个输出分区）。
 没有命中分区时返回 `EmptyExec`（如 `COUNT(*)` → 0）。
 
+并行能力：
+
+- **core**：`scan_all_parallel`（按 `ScanRequest.parallelism` 分块 + 线程）与
+  **`scan_owned_parallel`**（有序**流式**并行：`split_ranges` 把 row ranges 按
+  行数拆分/连续打包成 ≤n 组保序切片，每组一个 `std::thread` 生产者 + 有界
+  通道，消费按组序取回 → 与串行扫描逐行等价）。`split_ranges` 对超大单
+  SYM 区间先按目标行数切分，天然抗偏斜。
+- **DataFusion**：`SplayedDatasetProvider::with_scan_parallelism(n)` /
+  `SplayedTableProvider::with_scan_parallelism(n)`（默认 1）把单个 dataset 的
+  扫描切成 n 个**行均衡、保序**的 output partition，由 DataFusion 多线程
+  runtime 并行执行；`SplayedTableScanExec` 展平各子计划的输出分区数。
+  LIMIT 安全性：DF 对多分区扫描保留 `GlobalLimitExec`（`partition_count()!=1`
+  时 `limit_satisfied_by_input` 恒 false），每分区提前截断只是优化。
+- **DuckDB 接入点**：`ScanRequest.parallelism` 直接对表 DuckDB 线程数；
+  native 直写无需改 core（见 §8.4 原生表写接口）。
+
 有序性：单个 dataset 的 Scanner 按 `(SYM, TIME)` 升序产出（META 的 symbols 与
 time_axis 均升序，range 依 SYM INDEX 顺序生成）。因此 Layer 1 在
 `SymbolSelection::All`（无 SYM 过滤，避免过滤字面量顺序打乱）且投影保留

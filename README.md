@@ -135,6 +135,11 @@ Also available: `read_splayed('/path/to/dir')` table function and
 `CREATE EXTERNAL TABLE ... STORED AS SPLAYED LOCATION 'dir'`
 (via `SplayedTableFactory`).
 
+Parallelism: `splayed_core::scan_owned_parallel` streams a dataset in
+row-balanced, order-preserving slices across N threads; DataFusion
+`SplayedDatasetProvider`/`SplayedTableProvider::with_scan_parallelism(n)`
+splits one dataset into N output partitions for parallel execution.
+
 ---
 
 ## Function API

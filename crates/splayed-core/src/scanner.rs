@@ -728,6 +728,163 @@ impl OwnedScanBatches {
 }
 
 // ---------------------------------------------------------------------------
+// Range partitioning + parallel streaming scan
+// ---------------------------------------------------------------------------
+
+/// Split one range into pieces of at most `max_rows` rows.
+///
+/// A `RowRange` covers contiguous rows `[row_start, row_start+count)` and
+/// contiguous TIME AXIS indices `[time_start_idx, time_start_idx+count)`, so
+/// splitting is always sound — every piece is a valid, order-preserving range.
+fn split_range(r: RowRange, max_rows: u32) -> Vec<RowRange> {
+    if r.count <= max_rows {
+        return vec![r];
+    }
+    let mut out = Vec::new();
+    let mut done = 0u32;
+    while done < r.count {
+        let take = max_rows.min(r.count - done);
+        out.push(RowRange {
+            row_start: r.row_start + done,
+            count: take,
+            sym_idx: r.sym_idx,
+            time_start_idx: r.time_start_idx + done,
+        });
+        done += take;
+    }
+    out
+}
+
+/// Partition `plan.ranges` into at most `n` roughly **row-balanced** groups.
+///
+/// - Oversized single ranges are first split so a huge symbol doesn't starve
+///   the other partitions (skewed-symbol friendly).
+/// - Groups keep the global `(sym, time)` order internally (they are contiguous
+///   slices of the ordered range list).
+/// - `n <= 1` or an empty plan → a single group with all ranges (identity).
+pub fn split_ranges(plan: &ScanPlan, n: usize) -> Vec<Vec<RowRange>> {
+    if n <= 1 || plan.ranges.is_empty() {
+        return vec![plan.ranges.clone()];
+    }
+    let total: u64 = plan.ranges.iter().map(|r| r.count as u64).sum();
+    let target = ((total + n as u64 - 1) / n as u64).max(1) as u32;
+
+    // Split oversized ranges first so a huge symbol doesn't starve the other
+    // partitions (skewed-symbol friendly).
+    let mut pieces: Vec<RowRange> = Vec::new();
+    for r in &plan.ranges {
+        pieces.extend(split_range(*r, target));
+    }
+    if pieces.len() <= 1 {
+        return vec![pieces];
+    }
+
+    // Consecutive packing: walk the (globally ordered) piece list and close a
+    // group once it reaches ~`target` rows. Groups therefore stay contiguous
+    // slices of the ordered list — every group is internally `(sym, time)`
+    // ordered AND draining groups in order reproduces the global order.
+    let mut groups: Vec<Vec<RowRange>> = vec![Vec::new()];
+    let mut cur_rows = 0u64;
+    for piece in pieces {
+        let last = groups.last_mut().expect("always one group");
+        if !last.is_empty() && cur_rows >= target as u64 && groups.len() < n {
+            groups.push(Vec::new());
+            cur_rows = 0;
+        }
+        groups.last_mut().expect("always one group").push(piece);
+        cur_rows += piece.count as u64;
+    }
+    groups
+}
+
+/// An **ordered** parallel streaming scan over an `Arc<Dataset>`.
+///
+/// Built by [`scan_owned_parallel`]: `parallelism` producer threads each scan
+/// one row-balanced range group via the standard [`scan_owned`] batch machinery
+/// (readers, filters, sym/time, batch size — identical semantics), pushing
+/// batches through per-group bounded channels. The consumer drains the groups
+/// in order, so the stream is byte-for-byte equivalent to a serial scan.
+pub struct ParallelScanBatches {
+    receivers: Vec<std::sync::mpsc::Receiver<Result<ScanBatchOwned, ScannerError>>>,
+    current: usize,
+}
+
+/// Create an ordered parallel scan stream ([`ParallelScanBatches`]).
+///
+/// `parallelism <= 1` or an empty range list yields the serial/empty behavior.
+/// Threads are `std::thread::spawn` (not tied to any async runtime), which fits
+/// both native consumers (DuckDB-style chunk threading) and `spawn_blocking`
+/// adapters (DataFusion) alike.
+pub fn scan_owned_parallel(
+    dataset: Arc<Dataset>,
+    plan: &ScanPlan,
+    request: &ScanRequest,
+    parallelism: usize,
+) -> Result<ParallelScanBatches, ScannerError> {
+    if plan.ranges.is_empty() {
+        return Ok(ParallelScanBatches {
+            receivers: Vec::new(),
+            current: 0,
+        });
+    }
+
+    let groups = split_ranges(plan, parallelism);
+    let mut receivers = Vec::with_capacity(groups.len());
+
+    for group in groups {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ScanBatchOwned, ScannerError>>(2);
+        receivers.push(rx);
+
+        let dataset = Arc::clone(&dataset);
+        let request = request.clone();
+        let sub_plan = ScanPlan {
+            columns: plan.columns.clone(),
+            ranges: group,
+            total_rows: 0,
+        };
+        std::thread::spawn(move || -> Result<(), ScannerError> {
+            let mut it = scan_owned(dataset, &sub_plan, &request)?;
+            loop {
+                match it.next_batch() {
+                    Ok(Some(b)) => {
+                        if tx.send(Ok(b)).is_err() {
+                            break; // consumer dropped (cancellation)
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+
+    Ok(ParallelScanBatches {
+        receivers,
+        current: 0,
+    })
+}
+
+impl ParallelScanBatches {
+    /// Get the next batch in global (sym, time) order, or `None` when exhausted.
+    ///
+    /// Drains the per-group channels in order; a group whose producer has
+    /// finished (channel disconnected) advances to the next group.
+    pub fn next_batch(&mut self) -> Result<Option<ScanBatchOwned>, ScannerError> {
+        while self.current < self.receivers.len() {
+            match self.receivers[self.current].recv() {
+                Ok(item) => return item.map(Some),
+                Err(_) => self.current += 1, // this group's producer is done
+            }
+        }
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Filter evaluation
 // ---------------------------------------------------------------------------
 

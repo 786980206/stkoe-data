@@ -96,6 +96,20 @@ impl SplayedTableProvider {
     pub fn partitions(&self) -> &[Arc<SplayedDatasetProvider>] {
         &self.partitions
     }
+
+    /// Builder: how many output partitions each partition's dataset is split
+    /// into (see [`SplayedDatasetProvider::with_scan_parallelism`]). Default 1.
+    pub fn with_scan_parallelism(mut self, n: usize) -> Self {
+        self.set_scan_parallelism(n);
+        self
+    }
+
+    /// Runtime switch for the same setting, applied to every partition.
+    pub fn set_scan_parallelism(&mut self, n: usize) {
+        for p in &mut self.partitions {
+            Arc::make_mut(p).set_scan_parallelism(n);
+        }
+    }
 }
 
 /// Find the dataset directories that make up this table.

@@ -21,20 +21,23 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::catalog::TableProvider;
 
-use splayed_core::{open_dataset, Dataset, FieldReader, ScanRequest, SymbolSelection, TimeRange};
+use splayed_core::{open_dataset, Dataset, FieldReader, ScanRequest, Scanner, SymbolSelection, TimeRange};
 use splayed_format::{MetaFile, TimeType};
 
 use crate::exec::SplayedScanExec;
 use crate::filter::{classify, parse_filters};
 
 /// A single Splayed dataset folder ("one partition") as a `TableProvider`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SplayedDatasetProvider {
     dataset: Arc<Dataset>,
     schema: ArrowSchemaRef,
     symbols: HashSet<String>,
     stats: Option<Statistics>,
     definition: String,
+    /// How many DataFusion output partitions this single dataset is split into
+    /// for parallel scanning (default 1 = serial).
+    scan_parallelism: usize,
 }
 
 impl SplayedDatasetProvider {
@@ -81,7 +84,21 @@ impl SplayedDatasetProvider {
             symbols,
             stats: Some(stats),
             definition,
+            scan_parallelism: 1,
         })
+    }
+
+    /// Builder: split this dataset's scan into `n` DataFusion output partitions
+    /// (row-balanced, order-preserving) for parallel execution by DataFusion's
+    /// multi-threaded runtime. Default 1 (single partition, serial).
+    pub fn with_scan_parallelism(mut self, n: usize) -> Self {
+        self.scan_parallelism = n;
+        self
+    }
+
+    /// Runtime switch for the same setting (used by the partitioned-table layer).
+    pub fn set_scan_parallelism(&mut self, n: usize) {
+        self.scan_parallelism = n;
     }
 
     /// The underlying dataset (used by the partitioned-table layer).
@@ -255,12 +272,21 @@ impl TableProvider for SplayedDatasetProvider {
             .collect();
         let output_schema = Arc::new(ArrowSchema::new(fields));
 
+        // Partition count: row-balanced slices of the resolved ranges (capped
+        // by the number of ranges; >= 1 so the plan always has an output).
+        let scanner = Scanner::new(&self.dataset);
+        let plan0 = scanner
+            .plan(&req)
+            .map_err(|e| DataFusionError::Execution(format!("scan plan failed: {e}")))?;
+        let partitions = self.scan_parallelism.min(plan0.ranges.len()).max(1);
+
         Ok(Arc::new(SplayedScanExec::new(
             Arc::clone(&self.dataset),
             output_schema,
             projected_indices,
             req,
             limit,
+            partitions,
         )))
     }
 }

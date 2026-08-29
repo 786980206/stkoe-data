@@ -17,7 +17,7 @@ use datafusion::physical_plan::{
     stream::RecordBatchStreamAdapter,
 };
 
-use splayed_core::{scan_owned, Dataset, ScanRequest, Scanner, SymbolSelection};
+use splayed_core::{scan_owned, split_ranges, Dataset, ScanPlan, ScanRequest, Scanner, SymbolSelection};
 
 use crate::convert::batch_to_record_batch;
 
@@ -27,15 +27,22 @@ use crate::convert::batch_to_record_batch;
 
 /// A leaf execution plan that scans a single Splayed dataset directory
 /// (Layer 1's plan, also reused as one partition of a `SplayedTableScanExec`).
+///
+/// The dataset's row ranges are split into `partitions` output partitions
+/// (row-balanced, order-preserving slices) so DataFusion's multi-threaded
+/// executor can scan one dataset in parallel 鈥?each partition streams through
+/// its own `spawn_blocking` producer.
 #[derive(Debug)]
 pub(crate) struct SplayedScanExec {
     dataset: Arc<Dataset>,
-    /// Output schema (after projection — only projected columns).
+    /// Output schema (after projection 鈥?only projected columns).
     output_schema: SchemaRef,
     /// Indices into the full table schema that are projected.
     projected_indices: Vec<usize>,
     scan_request: ScanRequest,
     limit: Option<usize>,
+    /// Number of DataFusion output partitions this dataset is split into.
+    partitions: usize,
     properties: Arc<PlanProperties>,
 }
 
@@ -46,10 +53,13 @@ impl SplayedScanExec {
         projected_indices: Vec<usize>,
         scan_request: ScanRequest,
         limit: Option<usize>,
+        partitions: usize,
     ) -> Self {
         let properties = Arc::new(PlanProperties::new(
             equivalence_properties(&output_schema, &scan_request.symbols),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(
+                partitions.max(1),
+            ),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
@@ -59,6 +69,7 @@ impl SplayedScanExec {
             projected_indices,
             scan_request,
             limit,
+            partitions: partitions.max(1),
             properties,
         }
     }
@@ -66,8 +77,8 @@ impl SplayedScanExec {
 
 /// Equivalence properties for a single-dataset scan.
 ///
-/// The scanner emits rows in `(sym, time)` ascending order — *provided* no sym
-/// filter reorders the selection (`SymbolSelection::All`) — and the projected
+/// The scanner emits rows in `(sym, time)` ascending order 鈥?*provided* no sym
+/// filter reorders the selection (`SymbolSelection::All`) 鈥?and the projected
 /// output keeps both columns. Advertise that ordering so `ORDER BY sym, time`
 /// (e.g. TOP-N) can be satisfied without a sort. A filtered selection may come
 /// back in query-literal order, so it never advertises.
@@ -126,7 +137,7 @@ impl ExecutionPlan for SplayedScanExec {
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Leaf node — return self unchanged.
+        // Leaf node 鈥?return self unchanged.
         Ok(self)
     }
 
@@ -139,7 +150,7 @@ impl ExecutionPlan for SplayedScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let dataset = Arc::clone(&self.dataset);
@@ -149,7 +160,16 @@ impl ExecutionPlan for SplayedScanExec {
             .map_err(|e| DataFusionError::Execution(format!("scan plan failed: {e}")))?;
         let request = self.scan_request.clone();
 
-        let iter = scan_owned(Arc::clone(&dataset), &plan, &request)
+        // This partition's slice of the row ranges (order-preserving).
+        let groups = split_ranges(&plan, self.partitions);
+        let ranges = groups.get(partition).cloned().unwrap_or_default();
+        let sub_plan = ScanPlan {
+            columns: plan.columns.clone(),
+            ranges,
+            total_rows: 0,
+        };
+
+        let iter = scan_owned(Arc::clone(&dataset), &sub_plan, &request)
             .map_err(|e| DataFusionError::Execution(format!("scan failed: {e}")))?;
 
         let meta = dataset.meta.clone();
@@ -157,7 +177,7 @@ impl ExecutionPlan for SplayedScanExec {
         let projected_indices = self.projected_indices.clone();
         let limit = self.limit;
 
-        // Bounded channel → backpressure → memory stays ~constant (a couple of
+        // Bounded channel 鈫?backpressure 鈫?memory stays ~constant (a couple of
         // batches). A blocking producer thread does the mmap reads off the async
         // executor.
         let (tx, rx) = tokio::sync::mpsc::channel::<DFResult<datafusion::arrow::array::RecordBatch>>(2);
@@ -199,7 +219,7 @@ fn producer(
 
         let batch = match iter.next_batch() {
             Ok(Some(b)) if b.row_count > 0 => b,
-            Ok(Some(_)) => continue, // 0-row batch → keep scanning
+            Ok(Some(_)) => continue, // 0-row batch 鈫?keep scanning
             Ok(None) => break,
             Err(e) => {
                 let _ = tx.blocking_send(Err(DataFusionError::Execution(format!(
@@ -255,9 +275,15 @@ impl SplayedTableScanExec {
         output_schema: SchemaRef,
         plans: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Self {
+        // Flatten each child's output partitions into this plan's partitioning
+        // (a child may itself be sliced into several output partitions).
+        let partition_count = plans
+            .iter()
+            .map(|p| p.properties().output_partitioning().partition_count())
+            .sum();
         let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(output_schema.clone()),
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(plans.len()),
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(partition_count),
             datafusion::physical_plan::execution_plan::EmissionType::Incremental,
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
@@ -272,7 +298,12 @@ impl SplayedTableScanExec {
 
 impl DisplayAs for SplayedTableScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "SplayedTableScan: {} ({} partitions)", self.dir.display(), self.plans.len())
+        write!(
+            f,
+            "SplayedTableScan: {} ({} partitions)",
+            self.dir.display(),
+            self.properties.output_partitioning().partition_count()
+        )
     }
 }
 
@@ -317,13 +348,17 @@ impl ExecutionPlan for SplayedTableScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let plan = self.plans.get(partition).ok_or_else(|| {
-            DataFusionError::Execution(format!(
-                "SplayedTableScanExec: partition {partition} out of range ({})",
-                self.plans.len()
-            ))
-        })?;
-        // Each partition plan is single-partition itself.
-        plan.execute(0, context)
+        // Map the flattened partition index to (child plan, inner partition).
+        let mut acc = 0usize;
+        for plan in &self.plans {
+            let n = plan.properties().output_partitioning().partition_count();
+            if partition < acc + n {
+                return plan.execute(partition - acc, context);
+            }
+            acc += n;
+        }
+        Err(DataFusionError::Execution(format!(
+            "SplayedTableScanExec: partition {partition} out of range ({acc})"
+        )))
     }
 }

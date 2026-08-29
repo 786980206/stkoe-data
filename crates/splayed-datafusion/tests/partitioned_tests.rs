@@ -238,6 +238,80 @@ async fn layer1_dataset_provider_direct() {
     fs::remove_dir_all(&single).ok();
 }
 
+/// A single dataset sliced into multiple DataFusion output partitions must
+/// return identical results (COUNT / filters / ORDER BY) to the serial scan.
+#[tokio::test]
+async fn layer1_multi_partition_parallel_scan() {
+    let single = temp_dir("layer1_par");
+    create_table(&single, &make_batch(&[0, 1, 2, 3, 4], 100.0), true).unwrap();
+
+    let ctx = SessionContext::new();
+    let provider = SplayedDatasetProvider::new(&single)
+        .unwrap()
+        .with_scan_parallelism(4);
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    // All rows present, in (sym, time) order (ORDER BY forces the merge path).
+    let all = run_query(&ctx, "SELECT sym, time, close FROM t ORDER BY sym, time").await;
+    assert_eq!(total_rows(&all), 5);
+    let close = all
+        .iter()
+        .flat_map(|b| {
+            b.column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(close, vec![100.0, 101.0, 102.0, 103.0, 104.0]);
+
+    // Filters + aggregates still exact.
+    let cnt = run_query(&ctx, "SELECT COUNT(*) AS c FROM t WHERE close >= 102").await;
+    assert_eq!(count_value(&cnt), 3);
+
+    // LIMIT honored even with multiple partitions.
+    let lim = run_query(&ctx, "SELECT close FROM t LIMIT 2").await;
+    assert_eq!(total_rows(&lim), 2);
+
+    fs::remove_dir_all(&single).ok();
+}
+
+/// Layer 2: per-partition slicing can be enabled table-wide.
+#[tokio::test]
+async fn layer2_with_scan_parallelism() {
+    let root = make_table_dir();
+    let provider = SplayedTableProvider::new(&root)
+        .unwrap()
+        .with_scan_parallelism(2);
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+    let batches = run_query(&ctx, "SELECT COUNT(*) AS c FROM t WHERE close > 150").await;
+    // 2024 close 100-104 (none > 150), 2025 close 200-204 (all 5) → 5
+    assert_eq!(count_value(&batches), 5);
+
+    let ord = run_query(&ctx, "SELECT close FROM t ORDER BY close LIMIT 3").await;
+    assert_eq!(
+        ord.iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>(),
+        vec![100.0, 101.0, 102.0]
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3 — DataFusion binding
 // ---------------------------------------------------------------------------
