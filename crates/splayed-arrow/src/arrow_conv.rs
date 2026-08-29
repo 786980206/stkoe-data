@@ -10,9 +10,9 @@
 
 use splayed_format::{DataType, RawValue, TimeType};
 use arrow_array::{
-    builder::BooleanBuilder,
-    Array, ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, TimestampMicrosecondArray, UInt16Array, UInt32Array,
+    UInt64Array, UInt8Array, builder::BooleanBuilder,
 };
 use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 
@@ -25,11 +25,18 @@ use arrow_schema::{DataType as ArrowDataType, TimeUnit};
 pub fn arrow_to_splayed_type(arrow: &ArrowDataType) -> Option<DataType> {
     match arrow {
         ArrowDataType::Boolean => Some(DataType::Bool),
+        ArrowDataType::Int8 => Some(DataType::Int8),
+        ArrowDataType::Int16 => Some(DataType::Int16),
         ArrowDataType::Int32 => Some(DataType::Int32),
         ArrowDataType::Int64 => Some(DataType::Int64),
+        ArrowDataType::UInt8 => Some(DataType::UInt8),
+        ArrowDataType::UInt16 => Some(DataType::UInt16),
+        ArrowDataType::UInt32 => Some(DataType::UInt32),
+        ArrowDataType::UInt64 => Some(DataType::UInt64),
         ArrowDataType::Float32 => Some(DataType::Float32),
         ArrowDataType::Float64 => Some(DataType::Float64),
         ArrowDataType::Date32 => Some(DataType::Date32),
+        ArrowDataType::Date64 => Some(DataType::Date64),
         ArrowDataType::Timestamp(TimeUnit::Microsecond, _) => Some(DataType::TimestampUs),
         _ => None,
     }
@@ -39,11 +46,18 @@ pub fn arrow_to_splayed_type(arrow: &ArrowDataType) -> Option<DataType> {
 pub fn splayed_to_arrow_type(splayed: DataType) -> ArrowDataType {
     match splayed {
         DataType::Bool => ArrowDataType::Boolean,
+        DataType::Int8 => ArrowDataType::Int8,
+        DataType::Int16 => ArrowDataType::Int16,
         DataType::Int32 => ArrowDataType::Int32,
         DataType::Int64 => ArrowDataType::Int64,
+        DataType::UInt8 => ArrowDataType::UInt8,
+        DataType::UInt16 => ArrowDataType::UInt16,
+        DataType::UInt32 => ArrowDataType::UInt32,
+        DataType::UInt64 => ArrowDataType::UInt64,
         DataType::Float32 => ArrowDataType::Float32,
         DataType::Float64 => ArrowDataType::Float64,
         DataType::Date32 => ArrowDataType::Date32,
+        DataType::Date64 => ArrowDataType::Date64,
         DataType::TimestampUs => ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
     }
 }
@@ -72,6 +86,14 @@ pub fn arrow_value_to_raw(arr: &dyn Array, i: usize, splayed_ty: DataType) -> Op
             let a = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
             RawValue::from_bool(a.value(i))
         }
+        DataType::Int8 => {
+            let a = arr.as_any().downcast_ref::<Int8Array>().unwrap();
+            RawValue::from_i8(a.value(i))
+        }
+        DataType::Int16 => {
+            let a = arr.as_any().downcast_ref::<Int16Array>().unwrap();
+            RawValue::from_i16(a.value(i))
+        }
         DataType::Int32 => {
             let a = arr.as_any().downcast_ref::<Int32Array>().unwrap();
             RawValue::from_i32(a.value(i))
@@ -79,6 +101,22 @@ pub fn arrow_value_to_raw(arr: &dyn Array, i: usize, splayed_ty: DataType) -> Op
         DataType::Int64 => {
             let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
             RawValue::from_i64(a.value(i))
+        }
+        DataType::UInt8 => {
+            let a = arr.as_any().downcast_ref::<UInt8Array>().unwrap();
+            RawValue::from_u8(a.value(i))
+        }
+        DataType::UInt16 => {
+            let a = arr.as_any().downcast_ref::<UInt16Array>().unwrap();
+            RawValue::from_u16(a.value(i))
+        }
+        DataType::UInt32 => {
+            let a = arr.as_any().downcast_ref::<UInt32Array>().unwrap();
+            RawValue::from_u32(a.value(i))
+        }
+        DataType::UInt64 => {
+            let a = arr.as_any().downcast_ref::<UInt64Array>().unwrap();
+            RawValue::from_u64(a.value(i))
         }
         DataType::Float32 => {
             let a = arr.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -91,6 +129,10 @@ pub fn arrow_value_to_raw(arr: &dyn Array, i: usize, splayed_ty: DataType) -> Op
         DataType::Date32 => {
             let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
             RawValue::from_date32(a.value(i))
+        }
+        DataType::Date64 => {
+            let a = arr.as_any().downcast_ref::<Date64Array>().unwrap();
+            RawValue::from_date64(a.value(i))
         }
         DataType::TimestampUs => {
             let a = arr
@@ -160,6 +202,97 @@ pub fn column_view_to_arrow(view: &splayed_core::ColumnView) -> ArrayRef {
                 })
                 .collect();
             Arc::new(Int64Array::from(vals))
+        }
+        DataType::Int8 => {
+            let vals: Vec<Option<i8>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i8::from_le_bytes([bytes[off]]))
+                    }
+                })
+                .collect();
+            Arc::new(Int8Array::from(vals))
+        }
+        DataType::Int16 => {
+            let vals: Vec<Option<i16>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i16::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Int16Array::from(vals))
+        }
+        DataType::UInt8 => {
+            let vals: Vec<Option<u8>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(bytes[off])
+                    }
+                })
+                .collect();
+            Arc::new(UInt8Array::from(vals))
+        }
+        DataType::UInt16 => {
+            let vals: Vec<Option<u16>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(u16::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(UInt16Array::from(vals))
+        }
+        DataType::UInt32 => {
+            let vals: Vec<Option<u32>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(u32::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(UInt32Array::from(vals))
+        }
+        DataType::UInt64 => {
+            let vals: Vec<Option<u64>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(u64::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(UInt64Array::from(vals))
+        }
+        DataType::Date64 => {
+            let vals: Vec<Option<i64>> = (0..n)
+                .map(|i| {
+                    let off = i * sz;
+                    if &bytes[off..off + sz] == null_pat {
+                        None
+                    } else {
+                        Some(i64::from_le_bytes(bytes[off..off + sz].try_into().unwrap()))
+                    }
+                })
+                .collect();
+            Arc::new(Date64Array::from(vals))
         }
         DataType::Float32 => {
             let vals: Vec<Option<f32>> = (0..n)

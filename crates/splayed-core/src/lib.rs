@@ -7,6 +7,7 @@
 //! `create_table` / `update_table` (exchange layers convert their data to
 //! [`TableColumn`] raw bytes — no Arrow needed).
 
+pub mod batch;
 pub mod column_view;
 pub mod dataset;
 pub mod field_writer;
@@ -15,6 +16,10 @@ pub mod scanner;
 pub mod simd_filter;
 pub mod table_writer;
 
+pub use batch::{
+    Bitmap, Buffer, CoreBatch, CoreColumn, CoreColumnKind, CoreField, CoreSchema, CoreStringDict,
+    CoreTimeUnit, CoreType,
+};
 pub use column_view::{ColumnView, ColumnViewIter};
 pub use dataset::{open_dataset, Dataset, DatasetError};
 pub use field_writer::{
@@ -23,8 +28,8 @@ pub use field_writer::{
 };
 pub use reader::{FieldReader, ReaderError};
 pub use scanner::{
-    Filter, FilterValue, OwnedScanBatches, ParallelScanBatches, ScanBatchOwned, ScanBatches,
-    ScanPlan, ScanRequest, Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
+    Filter, FilterValue, OwnedScanBatches, ParallelScanBatches, ScanBatches, ScanPlan,
+    ScanRequest, Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
     scan_owned_parallel, split_ranges,
 };
 pub use table_writer::{

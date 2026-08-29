@@ -140,6 +140,13 @@ row-balanced, order-preserving slices across N threads; DataFusion
 `SplayedDatasetProvider`/`SplayedTableProvider::with_scan_parallelism(n)`
 splits one dataset into N output partitions for parallel execution.
 
+Memory model: the core scanner produces an engine-agnostic **`CoreBatch`**
+(`splayed_core::batch`) — typed columns (Buffer + validity bitmap + a shared
+SYM dictionary) with no Arrow dependency. Adapters convert it zero-copy:
+`splayed_arrow::corebatch_into_record_batch` hands the data buffers straight
+to Arrow (field/time data is not copied; no bitmap is built for fields whose
+header reports zero NULLs).
+
 ---
 
 ## Function API

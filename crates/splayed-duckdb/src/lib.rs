@@ -29,10 +29,7 @@ use arrow_schema::{
     DataType as ArrowDataType, Field, Schema, SchemaRef, TimeUnit as ArrowTimeUnit,
 };
 
-use splayed_arrow::column_view_to_arrow;
-use splayed_core::{
-    open_dataset, Dataset, ScanBatchOwned, ScanRequest, Scanner, SymbolSelection, TimeRange,
-};
+use splayed_core::{open_dataset, Dataset, ScanRequest, Scanner, SymbolSelection, TimeRange};
 use splayed_format::TimeType;
 
 /// Errors that can occur during Splayed → Arrow IPC export.
@@ -91,62 +88,17 @@ pub fn build_arrow_schema(dataset: &Dataset) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// Convert a `ScanBatchOwned` to an Arrow `RecordBatch`.
+/// Convert a `CoreBatch` to an Arrow `RecordBatch` via the zero-copy adapter.
 ///
-/// Reconstructs the `time` and `sym` columns from the batch's `time_values`
-/// and `sym_indices`, then converts each FIELD column via `column_view_to_arrow`.
+/// The batch layout `[time, sym, fields...]` matches `build_arrow_schema`, so
+/// the projection is the identity and the schema fields carry the types.
 fn scan_batch_to_record_batch(
-    batch: &ScanBatchOwned,
+    batch: splayed_core::CoreBatch,
     schema: &SchemaRef,
-    dataset: &Dataset,
-    field_names: &[String],
 ) -> Result<RecordBatch, ExportError> {
-    use arrow_array::{Date32Array, StringArray, TimestampMicrosecondArray};
-
-    let time_type = dataset.meta.time_type();
-
-    // Build time column
-    let time_array: Arc<dyn arrow_array::Array> = match time_type {
-        TimeType::Date32 => {
-            Arc::new(Date32Array::from(
-                batch.time_values.iter().map(|&t| t as i32).collect::<Vec<_>>(),
-            ))
-        }
-        TimeType::TimestampUs => {
-            Arc::new(TimestampMicrosecondArray::from(batch.time_values.clone()))
-        }
-    };
-
-    // Build sym column from sym_indices
-    let symbols = &dataset.meta.symbols;
-    let sym_vals: Vec<&str> = batch
-        .sym_indices
-        .iter()
-        .map(|&i| symbols[i].as_str())
-        .collect();
-    let sym_array = Arc::new(StringArray::from(sym_vals));
-
-    // Build field columns
-    let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::new();
-    columns.push(time_array);
-    columns.push(sym_array);
-
-    for name in field_names {
-        if let Some(view) = batch.column_view(name) {
-            let arrow_arr = column_view_to_arrow(&view);
-            columns.push(arrow_arr);
-        } else {
-            // Missing column — fill with nulls
-            let arrow_ty = schema
-                .field_with_name(name)
-                .map_err(|e| ExportError::Ipc(e.to_string()))?
-                .data_type()
-                .clone();
-            columns.push(arrow_array::new_null_array(&arrow_ty, batch.row_count));
-        }
-    }
-
-    RecordBatch::try_new(schema.clone(), columns)
+    let indices: Vec<usize> = (0..schema.fields().len()).collect();
+    let fields: Vec<arrow_schema::Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    splayed_arrow::corebatch_into_record_batch(batch, &indices, &fields, None)
         .map_err(|e| ExportError::Ipc(e.to_string()))
 }
 
@@ -195,7 +147,7 @@ pub fn export_to_arrow_ipc(dataset_dir: &Path, output_path: &Path) -> Result<usi
         .next_batch()
         .map_err(|e| ExportError::Scan(e.to_string()))?
     {
-        let record_batch = scan_batch_to_record_batch(&batch, &schema, &dataset, &field_names)?;
+        let record_batch = scan_batch_to_record_batch(batch, &schema)?;
         writer
             .write(&record_batch)
             .map_err(|e| ExportError::Ipc(e.to_string()))?;

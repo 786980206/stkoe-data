@@ -10,7 +10,7 @@ use arrow_array::{
     Array, BooleanArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use arrow_schema::{DataType as ArrowDT, Field, Schema};
-use splayed_arrow::{column_view_to_arrow, create_table};
+use splayed_arrow::{corebatch_into_record_batch, create_table};
 use splayed_core::{open_dataset, ScanRequest, Scanner, SymbolSelection, TimeRange};
 
 fn make_batch() -> RecordBatch {
@@ -72,11 +72,20 @@ fn scan_to_arrow_float64_with_null() {
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
 
-    assert_eq!(batch.row_count, 4);
+    assert_eq!(batch.num_rows(), 4);
 
-    let view = batch.column_view("close").unwrap();
-    let arr = column_view_to_arrow(&view);
-    let f64_arr = arr.as_any().downcast_ref::<Float64Array>().unwrap();
+    let rb = corebatch_into_record_batch(
+        batch,
+        &[2], // close (layout: time, sym, close)
+        &[arrow_schema::Field::new("close", ArrowDT::Float64, true)],
+        None,
+    )
+    .unwrap();
+    let f64_arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
 
     // SYM01 day 0 = 100.0, SYM01 day 1 = NULL, SYM02 day 0 = 200.0, SYM02 day 1 = 201.0
     assert_eq!(f64_arr.len(), 4);
@@ -113,9 +122,18 @@ fn scan_to_arrow_int64_with_null() {
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
 
-    let view = batch.column_view("vol").unwrap();
-    let arr = column_view_to_arrow(&view);
-    let i64_arr = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    let rb = corebatch_into_record_batch(
+        batch,
+        &[2], // vol (layout: time, sym, vol)
+        &[arrow_schema::Field::new("vol", ArrowDT::Int64, true)],
+        None,
+    )
+    .unwrap();
+    let i64_arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
 
     // vol: 1000, NULL, NULL, 2000
     assert_eq!(i64_arr.len(), 4);
@@ -149,9 +167,18 @@ fn scan_to_arrow_bool_with_null() {
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
 
-    let view = batch.column_view("flag").unwrap();
-    let arr = column_view_to_arrow(&view);
-    let bool_arr = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+    let rb = corebatch_into_record_batch(
+        batch,
+        &[2], // flag (layout: time, sym, flag)
+        &[arrow_schema::Field::new("flag", ArrowDT::Boolean, true)],
+        None,
+    )
+    .unwrap();
+    let bool_arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
 
     // flag: true, false, NULL, true
     assert_eq!(bool_arr.len(), 4);
@@ -186,19 +213,32 @@ fn scan_to_arrow_multi_column() {
 
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
-    assert_eq!(batch.row_count, 2);
+    assert_eq!(batch.num_rows(), 2);
 
-    // close: 200.0, 201.0
-    let close_view = batch.column_view("close").unwrap();
-    let close_arr = column_view_to_arrow(&close_view);
-    let f64_arr = close_arr.as_any().downcast_ref::<Float64Array>().unwrap();
+    // close + vol (layout: time, sym, close, vol)
+    let rb = corebatch_into_record_batch(
+        batch,
+        &[2, 3],
+        &[
+            arrow_schema::Field::new("close", ArrowDT::Float64, true),
+            arrow_schema::Field::new("vol", ArrowDT::Int64, true),
+        ],
+        None,
+    )
+    .unwrap();
+    let f64_arr = rb
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
     assert_eq!(f64_arr.value(0), 200.0);
     assert_eq!(f64_arr.value(1), 201.0);
 
-    // vol: NULL, 2000
-    let vol_view = batch.column_view("vol").unwrap();
-    let vol_arr = column_view_to_arrow(&vol_view);
-    let i64_arr = vol_arr.as_any().downcast_ref::<Int64Array>().unwrap();
+    let i64_arr = rb
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
     assert!(i64_arr.is_null(0));
     assert_eq!(i64_arr.value(1), 2000);
 

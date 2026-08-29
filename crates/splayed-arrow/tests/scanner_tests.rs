@@ -60,6 +60,34 @@ fn temp_dir(suffix: &str) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// CoreBatch decode helpers (layout: [time, sym, fields...], names via schema)
+// ---------------------------------------------------------------------------
+
+fn col_of(b: &splayed_core::CoreBatch, name: &str) -> usize {
+    b.schema().index_of(name).expect("column present")
+}
+
+fn f64_at(b: &splayed_core::CoreBatch, name: &str, i: usize) -> f64 {
+    let d = b.column(col_of(b, name)).data();
+    f64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap())
+}
+
+fn i64_at(b: &splayed_core::CoreBatch, name: &str, i: usize) -> i64 {
+    let d = b.column(col_of(b, name)).data();
+    i64::from_le_bytes(d[i * 8..i * 8 + 8].try_into().unwrap())
+}
+
+fn time_at(b: &splayed_core::CoreBatch, i: usize) -> i64 {
+    let d = b.column(0).data();
+    i32::from_le_bytes(d[i * 4..i * 4 + 4].try_into().unwrap()) as i64
+}
+
+fn sym_at(b: &splayed_core::CoreBatch, i: usize) -> usize {
+    let d = b.column(1).dictionary_indices().unwrap();
+    u32::from_le_bytes(d[i * 4..i * 4 + 4].try_into().unwrap()) as usize
+}
+
+// ---------------------------------------------------------------------------
 // Projection + predicate (SYM + TIME) pruning
 // ---------------------------------------------------------------------------
 
@@ -88,17 +116,15 @@ fn scan_projection_and_sym_filter() {
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
 
-    assert_eq!(batch.row_count, 5);
-    assert_eq!(batch.columns.len(), 1); // only "close" projected
+    assert_eq!(batch.num_rows(), 5);
+    assert_eq!(batch.num_columns(), 3); // time + sym + projected "close"
 
     // All rows should be SYM02 (sym_idx = 1)
-    assert!(batch.sym_indices.iter().all(|&i| i == 1));
+    assert!((0..5).all(|i| sym_at(&batch, i) == 1));
 
     // close values: 200, 201, 202, 203, 204
-    let view = batch.column_view("close").unwrap();
     for i in 0..5 {
-        let v = view.get(i).unwrap();
-        assert_eq!(v.as_f64(), Some(200.0 + i as f64));
+        assert_eq!(f64_at(&batch, "close", i), 200.0 + i as f64);
     }
 
     fs::remove_dir_all(&dir).ok();
@@ -131,10 +157,11 @@ fn scan_time_range_filter() {
 
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
-    assert_eq!(batch.row_count, 6);
+    assert_eq!(batch.num_rows(), 6);
 
     // Verify time values are in range.
-    for &t in &batch.time_values {
+    for i in 0..batch.num_rows() {
+        let t = time_at(&batch, i);
         assert!(t >= 2 && t < 4, "time {t} not in [2,4)");
     }
 
@@ -165,20 +192,18 @@ fn scan_sym_and_time_combined() {
 
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
-    assert_eq!(batch.row_count, 3);
-    assert_eq!(batch.columns.len(), 2);
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(batch.num_columns(), 4); // time + sym + close + volume
 
     // close: 101, 102, 103
-    let close_view = batch.column_view("close").unwrap();
-    assert_eq!(close_view.get(0).unwrap().as_f64(), Some(101.0));
-    assert_eq!(close_view.get(1).unwrap().as_f64(), Some(102.0));
-    assert_eq!(close_view.get(2).unwrap().as_f64(), Some(103.0));
+    assert_eq!(f64_at(&batch, "close", 0), 101.0);
+    assert_eq!(f64_at(&batch, "close", 1), 102.0);
+    assert_eq!(f64_at(&batch, "close", 2), 103.0);
 
     // volume: 2000, 3000, 4000
-    let vol_view = batch.column_view("volume").unwrap();
-    assert_eq!(vol_view.get(0).unwrap().as_i64(), Some(2000));
-    assert_eq!(vol_view.get(1).unwrap().as_i64(), Some(3000));
-    assert_eq!(vol_view.get(2).unwrap().as_i64(), Some(4000));
+    assert_eq!(i64_at(&batch, "volume", 0), 2000);
+    assert_eq!(i64_at(&batch, "volume", 1), 3000);
+    assert_eq!(i64_at(&batch, "volume", 2), 4000);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -214,13 +239,11 @@ fn scan_with_value_filter() {
     let batch = batches.next_batch().unwrap().unwrap();
 
     // close values > 150: SYM02 (200..204) = 5, SYM03 (300..302) = 3 → 8 total
-    assert_eq!(batch.row_count, 8);
+    assert_eq!(batch.num_rows(), 8);
 
     // All values should be > 150.
-    let view = batch.column_view("close").unwrap();
-    for i in 0..batch.row_count {
-        let v = view.get(i).unwrap();
-        let f = v.as_f64().unwrap();
+    for i in 0..batch.num_rows() {
+        let f = f64_at(&batch, "close", i);
         assert!(f > 150.0, "value {f} should be > 150");
     }
 
@@ -256,7 +279,7 @@ fn scan_batch_iteration() {
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let mut total = 0;
     while let Some(batch) = batches.next_batch().unwrap() {
-        total += batch.row_count;
+        total += batch.num_rows();
     }
     assert_eq!(total, 13);
 
@@ -339,16 +362,15 @@ fn scan_compressed_field_zstd() {
 
     let mut batches = scanner.scan(&plan, &req).unwrap();
     let batch = batches.next_batch().unwrap().unwrap();
-    assert_eq!(batch.row_count, 13);
+    assert_eq!(batch.num_rows(), 13);
 
     // Verify values: SYM01 close = 100..104, SYM02 = 200..204, SYM03 = 300..302
-    let view = batch.column_view("close").unwrap();
     // Row 0 = SYM01 day 0 = 100.0
-    assert_eq!(view.get(0).unwrap().as_f64(), Some(100.0));
+    assert_eq!(f64_at(&batch, "close", 0), 100.0);
     // Row 5 = SYM02 day 0 = 200.0
-    assert_eq!(view.get(5).unwrap().as_f64(), Some(200.0));
+    assert_eq!(f64_at(&batch, "close", 5), 200.0);
     // Row 10 = SYM03 day 0 = 300.0
-    assert_eq!(view.get(10).unwrap().as_f64(), Some(300.0));
+    assert_eq!(f64_at(&batch, "close", 10), 300.0);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -387,12 +409,10 @@ fn scan_compressed_field_lz4_with_filter() {
     let batch = batches.next_batch().unwrap().unwrap();
 
     // close > 150: SYM02 (5 rows) + SYM03 (3 rows) = 8 rows
-    assert_eq!(batch.row_count, 8);
+    assert_eq!(batch.num_rows(), 8);
 
-    let view = batch.column_view("close").unwrap();
-    for i in 0..batch.row_count {
-        let v = view.get(i).unwrap();
-        assert!(v.as_f64().unwrap() > 150.0);
+    for i in 0..batch.num_rows() {
+        assert!(f64_at(&batch, "close", i) > 150.0);
     }
 
     fs::remove_dir_all(&dir).ok();
@@ -424,7 +444,7 @@ fn scan_parallel_matches_sequential() {
     let mut seq_batches = scanner.scan(&plan_seq, &req_seq).unwrap();
     let mut seq_rows = 0;
     while let Some(b) = seq_batches.next_batch().unwrap() {
-        seq_rows += b.row_count;
+        seq_rows += b.num_rows();
     }
     assert_eq!(seq_rows, 13);
 
@@ -439,7 +459,7 @@ fn scan_parallel_matches_sequential() {
     };
     let plan_par = scanner.plan(&req_par).unwrap();
     let par_batches = scanner.scan_all_parallel(&plan_par, &req_par).unwrap();
-    let par_rows: usize = par_batches.iter().map(|b| b.row_count).sum();
+    let par_rows: usize = par_batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(par_rows, 13);
 
     // Verify data correctness: check close values
@@ -448,12 +468,10 @@ fn scan_parallel_matches_sequential() {
     let seq_batch = seq_iter.next_batch().unwrap().unwrap();
     let par_batch = &par_batches[0];
 
-    let seq_close = seq_batch.column_view("close").unwrap();
-    let par_close = par_batch.column_view("close").unwrap();
-    for i in 0..seq_batch.row_count.min(par_batch.row_count) {
+    for i in 0..seq_batch.num_rows().min(par_batch.num_rows()) {
         assert_eq!(
-            seq_close.get(i).unwrap().as_f64(),
-            par_close.get(i).unwrap().as_f64()
+            f64_at(&seq_batch, "close", i),
+            f64_at(par_batch, "close", i)
         );
     }
 

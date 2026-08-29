@@ -145,10 +145,17 @@ fn create_table_writes_fields_in_one_pass() {
     let plan = scanner.plan(&request).unwrap();
     let mut batches = scanner.scan(&plan, &request).unwrap();
     let batch = batches.next_batch().unwrap().expect("one batch");
-    assert_eq!(batch.row_count, 5);
-    let close_view = batch.column_view("close").unwrap();
-    assert_eq!(close_view.get(0).unwrap().as_f64(), Some(100.0));
-    assert_eq!(close_view.get(4).unwrap().as_f64(), Some(200.0));
+    assert_eq!(batch.num_rows(), 5);
+    // CorBatch layout: [time, sym, close, volume]; close = f64 column (index 2).
+    let close = batch.column(2).data();
+    assert_eq!(
+        f64::from_le_bytes(close[0..8].try_into().unwrap()),
+        100.0
+    );
+    assert_eq!(
+        f64::from_le_bytes(close[4 * 8..5 * 8].try_into().unwrap()),
+        200.0
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

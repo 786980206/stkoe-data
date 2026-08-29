@@ -62,21 +62,24 @@ fn make_dataset() -> PathBuf {
     dir
 }
 
-/// Fully consume a stream into a comparable signature: (sym_idx, time, col bytes).
-fn drain(it: &mut splayed_core::OwnedScanBatches) -> Vec<(usize, i64, Vec<u8>)> {
+/// Row signature from a CoreBatch whose layout is [time(Date32), sym(dict), close(f64)].
+fn row_signature(b: &splayed_core::CoreBatch, i: usize) -> (usize, i64, Vec<u8>) {
+    let time = b.column(0).data();
+    let sym = b.column(1).dictionary_indices().unwrap();
+    let close = b.column(2).data();
+    let t = i32::from_le_bytes(time[i * 4..i * 4 + 4].try_into().unwrap()) as i64;
+    let s = u32::from_le_bytes(sym[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
+    (s, t, close[i * 8..i * 8 + 8].to_vec())
+}
+
+/// Fully consume a batch stream into comparable row signatures.
+fn collect_rows(
+    mut next: impl FnMut() -> Option<splayed_core::CoreBatch>,
+) -> Vec<(usize, i64, Vec<u8>)> {
     let mut out = Vec::new();
-    while let Some(b) = it.next_batch().unwrap() {
-        assert_eq!(b.sym_indices.len(), b.row_count);
-        assert_eq!(b.time_values.len(), b.row_count);
-        let col = &b.columns[0];
-        let elem = col.2.size_of();
-        for i in 0..b.row_count {
-            let start = i * elem;
-            out.push((
-                b.sym_indices[i],
-                b.time_values[i],
-                col.1[start..start + elem].to_vec(),
-            ));
+    while let Some(b) = next() {
+        for i in 0..b.num_rows() {
+            out.push(row_signature(&b, i));
         }
     }
     out
@@ -133,19 +136,13 @@ fn parallel_stream_matches_serial() {
     // Serial reference.
     let serial = {
         let mut it = scan_owned(Arc::clone(&dataset), &plan, &request).unwrap();
-        drain(&mut it)
+        collect_rows(|| it.next_batch().unwrap())
     };
 
     // Parallel (4 threads) must produce the identical ordered stream.
     let parallel = {
         let mut it = scan_owned_parallel(Arc::clone(&dataset), &plan, &request, 4).unwrap();
-        let mut out = Vec::new();
-        while let Some(b) = it.next_batch().unwrap() {
-            for i in 0..b.row_count {
-                out.push((b.sym_indices[i], b.time_values[i], b.columns[0].1[i * 8..i * 8 + 8].to_vec()));
-            }
-        }
-        out
+        collect_rows(|| it.next_batch().unwrap())
     };
 
     assert_eq!(serial.len(), parallel.len(), "row count differs");
@@ -171,10 +168,10 @@ fn parallel_scan_respects_filters_and_time_range() {
     let plan = scanner.plan(&req).unwrap();
 
     let mut it = scan_owned_parallel(Arc::new(dataset), &plan, &req, 4).unwrap();
-    let mut times = Vec::new();
-    while let Some(b) = it.next_batch().unwrap() {
-        times.extend(b.time_values.iter().copied());
-    }
+    let times: Vec<i64> = collect_rows(|| it.next_batch().unwrap())
+        .into_iter()
+        .map(|r| r.1)
+        .collect();
     assert!(!times.is_empty());
     assert!(times.iter().all(|t| (10..20).contains(t)), "time range not respected");
 

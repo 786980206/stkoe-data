@@ -275,6 +275,16 @@ update_info = [start_row, values[]]
 | 4 | `FLOAT64` | 8 B | canonical NaN |
 | 5 | `DATE32` | 4 B | `INT32_MIN` |
 | 6 | `TIMESTAMP_US` | 8 B | `INT64_MIN` |
+| 7 | `INT8` | 1 B | `INT8_MIN`（`0x80`） |
+| 8 | `INT16` | 2 B | `INT16_MIN`（`0x8000`） |
+| 9 | `UINT8` | 1 B | 全 1（`0xFF`） |
+| 10 | `UINT16` | 2 B | 全 1（`0xFFFF`） |
+| 11 | `UINT32` | 4 B | 全 1（`0xFFFFFFFF`） |
+| 12 | `UINT64` | 8 B | 全 1（`0xFFFF…`） |
+| 13 | `DATE64` | 8 B | `INT64_MIN` |
+
+> 7–13 为**增量扩展**：只新增 ID 取值，不改动 ID 0–6 的语义，旧文件零迁移。
+> 无符号类型的 NULL 借用全 1（MAX）位型——比较仍是 bit pattern。
 
 Arrow / Parquet 对应关系：
 
@@ -298,6 +308,9 @@ META Header 的 `time_type` 直接声明其一，不再拆 `time_type` / `time_u
 | DATE32 | `0x80000000` |
 | TIMESTAMP_US | `0x8000000000000000` |
 | BOOL | 保留值，例如 `0x02` |
+| INT8 / INT16 | `0x80` / `0x8000` |
+| UINT8 / UINT16 / UINT32 / UINT64 | 全 1（`0xFF…`） |
+| DATE64 | `0x8000000000000000` |
 
 FLOAT 语义：
 
@@ -847,19 +860,36 @@ Scanner
 
 Arrow 只是交换层。
 
-### Splayed → Arrow
+### 内存列式表示：CoreBatch（引擎无关核心层）
+
+扫描输出由 **CoreBatch** 承载（`splayed-core::batch`，零 Arrow 依赖）：
 
 ```text
-Splayed Field
-      |
-      v
- native array
-      |
-      v
- Arrow Array
-      |
-      v
- RecordBatch
+CoreBatch
++-- schema: Arc<CoreSchema>          [time, sym, fields...]
++-- columns: Vec<CoreColumn>
+|   +-- Primitive { ty, data: Buffer }         定长数值/日期/时间戳（LE 连续字节）
+|   +-- Dictionary { indices: u32, values }    SYM 列（共享字典，零拷贝）
+|   +-- Varlen { offsets, data }               Utf8/Binary（内存支持，磁盘本轮不存）
+|   +-- nulls: Option<Bitmap>                  validity（无 NULL 时 None，零分配）
++-- num_rows
+```
+
+- **NULL**：磁盘仍是哨兵位型；读时哨兵 → validity 位图（**每批次每列一次**
+  O(n) 判空），数据缓冲原样保留；`FieldHeader.null_count == 0` 时跳过扫描
+  （无位图、零开销）。写回时位图 → 哨兵。
+- **TIME 列按类型产出**（Date32 直接 i32、TimestampUs 直接 i64），消除转换端收窄拷贝。
+- **SYM 列字典化**（u32 索引 + 共享字典），取代逐行字符串展开。
+
+### Splayed → Arrow（零拷贝）
+
+`splayed-arrow::corebatch_into_record_batch(batch, projected, fields, sym_dict)`
+利用 CoreBatch 原始缓冲**移交**给 Arrow（`Buffer::from_vec` 零拷贝）：
+
+```text
+CoreBatch buffer → Arrow Buffer（数据不复制）
+Bitmap           → Arrow NullBuffer（无 NULL 列不产生）
+Dictionary (sym) → 展开为 Utf8（小拷贝，schema 为 Utf8）
 ```
 
 ### NULL 语义保留

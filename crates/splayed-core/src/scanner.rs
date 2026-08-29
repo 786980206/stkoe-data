@@ -16,10 +16,14 @@
 //! Key: `WHERE sym = ...` is NOT a scan-then-filter — it's a direct META → row
 //! range lookup.  This is the performance-critical design.
 
-use splayed_format::DataType;
+use splayed_format::{DataType, TimeType};
 
 use std::sync::Arc;
 
+use crate::batch::{
+    Bitmap, Buffer, CoreBatch, CoreColumn, CoreField, CoreSchema, CoreStringDict, CoreTimeUnit,
+    CoreType,
+};
 use crate::dataset::Dataset;
 use crate::reader::FieldReader;
 use crate::ColumnView;
@@ -148,19 +152,6 @@ pub struct RowRange {
     pub sym_idx: usize,
     /// The time axis indices this range covers: `[time_start_idx, time_start_idx + count)`.
     pub time_start_idx: u32,
-}
-
-/// A batch of scanned rows.  Each column is a `ColumnView` borrowed from
-/// the underlying `FieldReader` mmap.
-pub struct ScanBatch<'a> {
-    /// Column name → ColumnView
-    pub columns: Vec<(String, ColumnView<'a>)>,
-    /// The number of rows in this batch.
-    pub row_count: usize,
-    /// The symbol index for each row (for SYM column reconstruction).
-    pub sym_indices: Vec<usize>,
-    /// The time value for each row (for TIME column reconstruction).
-    pub time_values: Vec<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +292,12 @@ impl<'ds> Scanner<'ds> {
         // If there's a filter on a field not in the projection, it will error
         // during next_batch with FilterFieldNotProjected.
 
+        let schema = scan_schema(self.dataset.meta.time_type(), &readers);
+        let sym_dict = Arc::new(CoreStringDict::new(
+            self.dataset.meta.symbols.clone(),
+            true,
+        ));
+
         Ok(ScanBatches {
             dataset: self.dataset,
             ranges: &plan.ranges,
@@ -310,6 +307,8 @@ impl<'ds> Scanner<'ds> {
             current_range_idx: 0,
             current_row_in_range: 0,
             exhausted: false,
+            schema,
+            sym_dict,
         })
     }
 
@@ -324,7 +323,7 @@ impl<'ds> Scanner<'ds> {
         &self,
         plan: &ScanPlan,
         request: &ScanRequest,
-    ) -> Result<Vec<ScanBatchOwned>, ScannerError> {
+    ) -> Result<Vec<CoreBatch>, ScannerError> {
         if request.parallelism <= 1 || plan.ranges.len() <= 1 {
             // Single-threaded path: use the existing iterator.
             let mut batches = self.scan(plan, request)?;
@@ -356,6 +355,12 @@ impl<'ds> Scanner<'ds> {
         // Wrap in Arc to avoid cloning the full time_axis per thread (P2).
         let time_axis: Arc<[i64]> = Arc::from(self.dataset.meta.time_axis.as_slice());
 
+        let time_type = self.dataset.meta.time_type();
+        let sym_dict = Arc::new(CoreStringDict::new(
+            self.dataset.meta.symbols.clone(),
+            true,
+        ));
+
         // Spawn threads.
         let handles: Vec<_> = range_chunks
             .into_iter()
@@ -363,8 +368,9 @@ impl<'ds> Scanner<'ds> {
                 let col_paths = col_paths.clone();
                 let filters = filters.clone();
                 let time_axis = Arc::clone(&time_axis); // cheap ref-count clone
+                let sym_dict = Arc::clone(&sym_dict);
 
-                std::thread::spawn(move || -> Result<Vec<ScanBatchOwned>, ScannerError> {
+                std::thread::spawn(move || -> Result<Vec<CoreBatch>, ScannerError> {
                     // Open readers in this thread.
                     let mut readers: Vec<(String, FieldReader)> = Vec::with_capacity(col_paths.len());
                     for (name, path) in &col_paths {
@@ -372,6 +378,8 @@ impl<'ds> Scanner<'ds> {
                             .map_err(|e| ScannerError::ReaderError(name.clone(), e))?;
                         readers.push((name.clone(), reader));
                     }
+
+                    let schema = scan_schema(time_type, &readers);
 
                     let mut out = Vec::new();
                     for range in chunk {
@@ -387,12 +395,14 @@ impl<'ds> Scanner<'ds> {
                             // Read each column.
                             let mut col_data: Vec<(String, Vec<u8>, DataType)> =
                                 Vec::with_capacity(readers.len());
+                            let mut has_nulls: Vec<bool> = Vec::with_capacity(readers.len());
                             for (name, reader) in &readers {
                                 let dt = reader.data_type();
                                 let raw = reader
                                     .read_range_raw(start_row, to_read)
                                     .map_err(|e| ScannerError::ReaderError(name.clone(), e))?;
                                 col_data.push((name.clone(), raw.to_vec(), dt));
+                                has_nulls.push(reader.header().null_count > 0);
                             }
 
                             // Fill sym_indices and time_values.
@@ -424,12 +434,19 @@ impl<'ds> Scanner<'ds> {
                             row_count = new_count;
 
                             if row_count > 0 {
-                                out.push(ScanBatchOwned {
-                                    columns: col_data,
-                                    row_count,
-                                    sym_indices,
-                                    time_values,
-                                });
+                                let fields = col_data
+                                    .into_iter()
+                                    .zip(has_nulls)
+                                    .map(|((name, bytes, ty), hn)| (name, bytes, ty, hn))
+                                    .collect();
+                                out.push(build_core_batch(
+                                    &schema,
+                                    &sym_dict,
+                                    time_type,
+                                    fields,
+                                    &sym_indices,
+                                    &time_values,
+                                ));
                             }
 
                             current_row += to_read as u32;
@@ -457,7 +474,112 @@ impl<'ds> Scanner<'ds> {
 // ScanBatches — lazy batch iterator
 // ---------------------------------------------------------------------------
 
-/// An iterator that lazily produces `ScanBatch` items.
+// ---------------------------------------------------------------------------
+// CoreBatch construction
+// ---------------------------------------------------------------------------
+
+/// Build the in-memory scan schema: [time, sym, requested fields...].
+fn scan_schema(
+    time_type: TimeType,
+    readers: &[(String, FieldReader)],
+) -> Arc<CoreSchema> {
+    let time_ty = match time_type {
+        TimeType::Date32 => CoreType::Date32,
+        TimeType::TimestampUs => CoreType::Timestamp(CoreTimeUnit::Microsecond, None),
+    };
+    let mut fields = vec![
+        CoreField::new("time", time_ty, false),
+        CoreField::new("sym", CoreType::Utf8, false),
+    ];
+    for (name, reader) in readers {
+        fields.push(CoreField::new(
+            name.clone(),
+            CoreType::from_disk(reader.data_type()),
+            true,
+        ));
+    }
+    Arc::new(CoreSchema::new(fields))
+}
+
+/// Scan `data` for NULL-sentinel bit patterns; returns a validity bitmap only
+/// when at least one NULL was found (data buffer itself is used as-is).
+fn build_validity(ty: DataType, data: &[u8], row_count: usize) -> Option<Bitmap> {
+    let null_pat = ty.null_bytes();
+    let sz = ty.size_of();
+    let mut bm = Bitmap::with_all_valid(row_count);
+    let mut found = false;
+    for i in 0..row_count {
+        let off = i * sz;
+        if &data[off..off + sz] == null_pat {
+            bm.set(i, false);
+            found = true;
+        }
+    }
+    found.then_some(bm)
+}
+
+/// Build a [`CoreBatch`] from filtered scan parts. Column order is
+/// `[time, sym, fields...]`; `sym_indices`/`time_values` are per-row and
+/// already filter-compacted.
+fn build_core_batch(
+    schema: &Arc<CoreSchema>,
+    sym_dict: &Arc<CoreStringDict>,
+    time_type: TimeType,
+    fields: Vec<(String, Vec<u8>, DataType, bool)>,
+    sym_indices: &[usize],
+    time_values: &[i64],
+) -> CoreBatch {
+    let row_count = sym_indices.len();
+
+    // TIME column — typed for zero-copy (Date32: i32, TimestampUs: i64).
+    let mut time_buf = Buffer::with_capacity(row_count * 8);
+    match time_type {
+        TimeType::Date32 => {
+            for t in time_values {
+                time_buf.extend_from_slice(&(*t as i32).to_le_bytes());
+            }
+        }
+        TimeType::TimestampUs => {
+            for t in time_values {
+                time_buf.extend_from_slice(&t.to_le_bytes());
+            }
+        }
+    }
+    let time_col = CoreColumn::primitive(
+        CoreType::time_from_disk_meta(time_type),
+        time_buf,
+        None,
+    );
+
+    // SYM column — dictionary-encoded (u32 indices into the shared dict).
+    let mut idx_buf = Buffer::with_capacity(row_count * 4);
+    for &si in sym_indices {
+        idx_buf.extend_from_slice(&(si as u32).to_le_bytes());
+    }
+    let sym_col = CoreColumn::dictionary(idx_buf, Arc::clone(sym_dict));
+
+    // FIELD columns — raw bytes as-is + validity bitmap (skipped when the
+    // FIELD header reported zero NULLs).
+    let mut columns = Vec::with_capacity(2 + fields.len());
+    columns.push(time_col);
+    columns.push(sym_col);
+    for (_, bytes, ty, has_nulls) in fields {
+        let nulls = if has_nulls {
+            build_validity(ty, &bytes, row_count)
+        } else {
+            None
+        };
+        columns.push(CoreColumn::primitive(
+            CoreType::from_disk(ty),
+            Buffer::from_vec(bytes),
+            nulls,
+        ));
+    }
+
+    CoreBatch::new(Arc::clone(schema), columns, row_count)
+}
+
+/// An iterator that lazily produces `CoreBatch` items.
 ///
 /// For each `RowRange` in the plan, reads `batch_size` rows at a time across
 /// all requested column readers.  Filter is applied row-by-row after reading.
@@ -470,11 +592,13 @@ pub struct ScanBatches<'ds, 'r> {
     current_range_idx: usize,
     current_row_in_range: u32,
     exhausted: bool,
+    schema: Arc<CoreSchema>,
+    sym_dict: Arc<CoreStringDict>,
 }
 
 impl<'ds, 'r> ScanBatches<'ds, 'r> {
     /// Get the next batch of rows, or `None` if exhausted.
-    pub fn next_batch(&mut self) -> Result<Option<ScanBatchOwned>, ScannerError> {
+    pub fn next_batch(&mut self) -> Result<Option<CoreBatch>, ScannerError> {
         if self.exhausted {
             return Ok(None);
         }
@@ -530,12 +654,18 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             return Ok(None);
         }
 
-        // Build col_data from accumulated buffers.
+        // Build col_data from accumulated buffers (3-tuples; null hints kept
+        // separately in column order).
         let col_data: Vec<(String, Vec<u8>, DataType)> = self
             .readers
             .iter()
             .zip(col_bufs.into_iter())
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
+            .collect();
+        let has_nulls: Vec<bool> = self
+            .readers
+            .iter()
+            .map(|(_, reader)| reader.header().null_count > 0)
             .collect();
 
         // Apply all pushed-down value filters (AND semantics; shared with
@@ -553,32 +683,20 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             return Ok(None);
         }
 
-        Ok(Some(ScanBatchOwned {
-            columns: col_data,
-            row_count,
-            sym_indices,
-            time_values,
-        }))
-    }
-}
+        let fields = col_data
+            .into_iter()
+            .zip(has_nulls)
+            .map(|((name, bytes, ty), hn)| (name, bytes, ty, hn))
+            .collect();
 
-/// A batch with owned column data (copied from mmap for filter support).
-pub struct ScanBatchOwned {
-    pub columns: Vec<(String, Vec<u8>, DataType)>,
-    pub row_count: usize,
-    pub sym_indices: Vec<usize>,
-    pub time_values: Vec<i64>,
-}
-
-impl ScanBatchOwned {
-    /// Get a ColumnView over a column in this batch.
-    pub fn column_view(&self, name: &str) -> Option<ColumnView<'_>> {
-        for (n, bytes, dt) in &self.columns {
-            if n == name {
-                return Some(ColumnView::new(*dt, bytes, self.row_count));
-            }
-        }
-        None
+        Ok(Some(build_core_batch(
+            &self.schema,
+            &self.sym_dict,
+            self.dataset.meta.time_type(),
+            fields,
+            &sym_indices,
+            &time_values,
+        )))
     }
 }
 
@@ -600,6 +718,8 @@ pub struct OwnedScanBatches {
     current_range_idx: usize,
     current_row_in_range: u32,
     exhausted: bool,
+    schema: Arc<CoreSchema>,
+    sym_dict: Arc<CoreStringDict>,
 }
 
 /// Create an owned scan iterator over an `Arc<Dataset>` (no borrows).
@@ -624,6 +744,12 @@ pub fn scan_owned(
         readers.push((col_name.clone(), reader));
     }
 
+    let schema = scan_schema(dataset.meta.time_type(), &readers);
+    let sym_dict = Arc::new(CoreStringDict::new(
+        dataset.meta.symbols.clone(),
+        true,
+    ));
+
     Ok(OwnedScanBatches {
         dataset,
         ranges: plan.ranges.clone(),
@@ -633,6 +759,8 @@ pub fn scan_owned(
         current_range_idx: 0,
         current_row_in_range: 0,
         exhausted: false,
+        schema,
+        sym_dict,
     })
 }
 
@@ -641,7 +769,7 @@ impl OwnedScanBatches {
     ///
     /// Identical semantics to [`ScanBatches::next_batch`], but with owned
     /// state so the iterator is `Send + 'static`.
-    pub fn next_batch(&mut self) -> Result<Option<ScanBatchOwned>, ScannerError> {
+    pub fn next_batch(&mut self) -> Result<Option<CoreBatch>, ScannerError> {
         if self.exhausted {
             return Ok(None);
         }
@@ -697,12 +825,17 @@ impl OwnedScanBatches {
             return Ok(None);
         }
 
-        // Build col_data from accumulated buffers.
+        // Build col_data from accumulated buffers (3-tuples).
         let col_data: Vec<(String, Vec<u8>, DataType)> = self
             .readers
             .iter()
             .zip(col_bufs.into_iter())
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
+            .collect();
+        let has_nulls: Vec<bool> = self
+            .readers
+            .iter()
+            .map(|(_, reader)| reader.header().null_count > 0)
             .collect();
 
         let (col_data, row_count) = apply_filters(
@@ -718,12 +851,20 @@ impl OwnedScanBatches {
             return Ok(None);
         }
 
-        Ok(Some(ScanBatchOwned {
-            columns: col_data,
-            row_count,
-            sym_indices,
-            time_values,
-        }))
+        let fields = col_data
+            .into_iter()
+            .zip(has_nulls)
+            .map(|((name, bytes, ty), hn)| (name, bytes, ty, hn))
+            .collect();
+
+        Ok(Some(build_core_batch(
+            &self.schema,
+            &self.sym_dict,
+            self.dataset.meta.time_type(),
+            fields,
+            &sym_indices,
+            &time_values,
+        )))
     }
 }
 
@@ -805,7 +946,7 @@ pub fn split_ranges(plan: &ScanPlan, n: usize) -> Vec<Vec<RowRange>> {
 /// batches through per-group bounded channels. The consumer drains the groups
 /// in order, so the stream is byte-for-byte equivalent to a serial scan.
 pub struct ParallelScanBatches {
-    receivers: Vec<std::sync::mpsc::Receiver<Result<ScanBatchOwned, ScannerError>>>,
+    receivers: Vec<std::sync::mpsc::Receiver<Result<CoreBatch, ScannerError>>>,
     current: usize,
 }
 
@@ -832,7 +973,7 @@ pub fn scan_owned_parallel(
     let mut receivers = Vec::with_capacity(groups.len());
 
     for group in groups {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<ScanBatchOwned, ScannerError>>(2);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Result<CoreBatch, ScannerError>>(2);
         receivers.push(rx);
 
         let dataset = Arc::clone(&dataset);
@@ -873,7 +1014,7 @@ impl ParallelScanBatches {
     ///
     /// Drains the per-group channels in order; a group whose producer has
     /// finished (channel disconnected) advances to the next group.
-    pub fn next_batch(&mut self) -> Result<Option<ScanBatchOwned>, ScannerError> {
+    pub fn next_batch(&mut self) -> Result<Option<CoreBatch>, ScannerError> {
         while self.current < self.receivers.len() {
             match self.receivers[self.current].recv() {
                 Ok(item) => return item.map(Some),

@@ -306,6 +306,73 @@ async fn contradictory_sym_filters_empty() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Extended fixed-width field types (Phase 2): Int16 / UInt32 / UInt64 / Date64
+/// must survive the full create_table → scan → DataFusion path.
+#[tokio::test]
+async fn extended_field_types_query() {
+    let dir = temp_dir("ext_df");
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("time", ArrowDT::Date32, false),
+            Field::new("sym", ArrowDT::Utf8, false),
+            Field::new("i16", ArrowDT::Int16, true),
+            Field::new("u32", ArrowDT::UInt32, true),
+            Field::new("count", ArrowDT::UInt64, false),
+            Field::new("d64", ArrowDT::Date64, true),
+        ])),
+        vec![
+            Arc::new(Date32Array::from(vec![0, 1])),
+            Arc::new(StringArray::from(vec![Some("SYM01"), Some("SYM02")])),
+            Arc::new(arrow_array::Int16Array::from(vec![Some(7), None])),
+            Arc::new(arrow_array::UInt32Array::from(vec![Some(10), Some(20)])),
+            Arc::new(arrow_array::UInt64Array::from(vec![100, 200])),
+            Arc::new(arrow_array::Date64Array::from(vec![Some(86400000), Some(172800000)])),
+        ],
+    )
+    .unwrap();
+    create_table(&dir, &batch, true).unwrap();
+
+    // Full projection returns all 2 rows with correct values.
+    let all = run_query(&dir, "SELECT i16, u32, count FROM splayed").await;
+    assert_eq!(all.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+    // Value filter on a UInt32 field (not pushed down, but correct via DF).
+    let f = run_query(&dir, "SELECT count FROM splayed WHERE u32 >= 20").await;
+    let total: usize = f.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1);
+    let count = f
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::UInt64Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(count, vec![200]);
+
+    // Empty (non-null) i16 values read back correctly.
+    let i = run_query(&dir, "SELECT i16 FROM splayed WHERE i16 IS NOT NULL").await;
+    let vals: Vec<i16> = i
+        .iter()
+        .flat_map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::Int16Array>()
+                .unwrap()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(vals, vec![7]);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ---------------------------------------------------------------------------
 // Deferred items now implemented: sym IN (...), IS [NOT] NULL, identity casts
 // ---------------------------------------------------------------------------

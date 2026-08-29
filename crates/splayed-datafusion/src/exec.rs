@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::StringArray;
 use datafusion::arrow::compute::SortOptions;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::{tree_node::TreeNodeRecursion, DataFusionError, Result as DFResult};
@@ -30,12 +31,12 @@ use crate::convert::batch_to_record_batch;
 ///
 /// The dataset's row ranges are split into `partitions` output partitions
 /// (row-balanced, order-preserving slices) so DataFusion's multi-threaded
-/// executor can scan one dataset in parallel 鈥?each partition streams through
+/// executor can scan one dataset in parallel — each partition streams through
 /// its own `spawn_blocking` producer.
 #[derive(Debug)]
 pub(crate) struct SplayedScanExec {
     dataset: Arc<Dataset>,
-    /// Output schema (after projection 鈥?only projected columns).
+    /// Output schema (after projection — only projected columns).
     output_schema: SchemaRef,
     /// Indices into the full table schema that are projected.
     projected_indices: Vec<usize>,
@@ -43,6 +44,8 @@ pub(crate) struct SplayedScanExec {
     limit: Option<usize>,
     /// Number of DataFusion output partitions this dataset is split into.
     partitions: usize,
+    /// Cached SYM dictionary as an Arrow StringArray (built once per dataset).
+    sym_dict: Arc<StringArray>,
     properties: Arc<PlanProperties>,
 }
 
@@ -55,6 +58,9 @@ impl SplayedScanExec {
         limit: Option<usize>,
         partitions: usize,
     ) -> Self {
+        let sym_dict = Arc::new(StringArray::from_iter_values(
+            dataset.meta.symbols.iter().map(|s| s.as_str()),
+        ));
         let properties = Arc::new(PlanProperties::new(
             equivalence_properties(&output_schema, &scan_request.symbols),
             datafusion::physical_plan::Partitioning::UnknownPartitioning(
@@ -70,6 +76,7 @@ impl SplayedScanExec {
             scan_request,
             limit,
             partitions: partitions.max(1),
+            sym_dict,
             properties,
         }
     }
@@ -77,8 +84,8 @@ impl SplayedScanExec {
 
 /// Equivalence properties for a single-dataset scan.
 ///
-/// The scanner emits rows in `(sym, time)` ascending order 鈥?*provided* no sym
-/// filter reorders the selection (`SymbolSelection::All`) 鈥?and the projected
+/// The scanner emits rows in `(sym, time)` ascending order — *provided* no sym
+/// filter reorders the selection (`SymbolSelection::All`) — and the projected
 /// output keeps both columns. Advertise that ordering so `ORDER BY sym, time`
 /// (e.g. TOP-N) can be satisfied without a sort. A filtered selection may come
 /// back in query-literal order, so it never advertises.
@@ -137,7 +144,7 @@ impl ExecutionPlan for SplayedScanExec {
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        // Leaf node 鈥?return self unchanged.
+        // Leaf node — return self unchanged.
         Ok(self)
     }
 
@@ -172,12 +179,12 @@ impl ExecutionPlan for SplayedScanExec {
         let iter = scan_owned(Arc::clone(&dataset), &sub_plan, &request)
             .map_err(|e| DataFusionError::Execution(format!("scan failed: {e}")))?;
 
-        let meta = dataset.meta.clone();
         let output_schema = Arc::clone(&self.output_schema);
         let projected_indices = self.projected_indices.clone();
+        let sym_dict = Arc::clone(&self.sym_dict);
         let limit = self.limit;
 
-        // Bounded channel 鈫?backpressure 鈫?memory stays ~constant (a couple of
+        // Bounded channel → backpressure → memory stays ~constant (a couple of
         // batches). A blocking producer thread does the mmap reads off the async
         // executor.
         let (tx, rx) = tokio::sync::mpsc::channel::<DFResult<datafusion::arrow::array::RecordBatch>>(2);
@@ -186,8 +193,8 @@ impl ExecutionPlan for SplayedScanExec {
             iter,
             tx,
             &stream_schema,
-            &meta,
             &projected_indices,
+            sym_dict,
             limit,
         ));
 
@@ -205,8 +212,8 @@ fn producer(
     mut iter: splayed_core::OwnedScanBatches,
     tx: tokio::sync::mpsc::Sender<DFResult<datafusion::arrow::array::RecordBatch>>,
     output_schema: &SchemaRef,
-    meta: &splayed_format::MetaFile,
     projected_indices: &[usize],
+    sym_dict: Arc<StringArray>,
     limit: Option<usize>,
 ) {
     let mut emitted: usize = 0;
@@ -218,8 +225,8 @@ fn producer(
         }
 
         let batch = match iter.next_batch() {
-            Ok(Some(b)) if b.row_count > 0 => b,
-            Ok(Some(_)) => continue, // 0-row batch 鈫?keep scanning
+            Ok(Some(b)) if b.num_rows() > 0 => b,
+            Ok(Some(_)) => continue, // 0-row batch → keep scanning
             Ok(None) => break,
             Err(e) => {
                 let _ = tx.blocking_send(Err(DataFusionError::Execution(format!(
@@ -229,7 +236,7 @@ fn producer(
             }
         };
 
-        let rb = match batch_to_record_batch(&batch, output_schema, meta, projected_indices) {
+        let rb = match batch_to_record_batch(batch, output_schema, projected_indices, Arc::clone(&sym_dict)) {
             Ok(rb) => rb,
             Err(e) => {
                 let _ = tx.blocking_send(Err(e));
