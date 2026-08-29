@@ -4,15 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "ADBC 风格的引擎无关 Splayed 连接组件（Connection / Statement / Arrow 流）"
+description = "上层 ADBC 驱动：内部经 DataFusion 执行 SQL，返回 Arrow 结果（面向外部应用）"
 
 [dependencies]
 splayed-format.workspace = true
 splayed-core.workspace = true
 splayed-arrow.workspace = true
+splayed-datafusion.workspace = true
+datafusion = { workspace = true }
 arrow.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
-
-[dev-dependencies]
-splayed-arrow.workspace = true
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }

@@ -2642,9 +2642,13 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-schema",
+ "datafusion",
+ "futures",
  "splayed-arrow",
  "splayed-core",
+ "splayed-datafusion",
  "splayed-format",
+ "tokio",
 ]
 
 [[package]]

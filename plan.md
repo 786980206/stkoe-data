@@ -1003,36 +1003,49 @@ Batch scan、LIMIT。
 
 未来（暂缓）：`INSERT INTO` 写回（`update_table`）。
 
-## 10.3b 适配层组件化（三个逻辑可选组件）
+## 10.3b 分层组件架构（非并列）
 
-对外数据引擎通过**三个逻辑可选适配组件**接入，共享 `splayed-core`（Scanner /
-CoreBatch / Filter）与 `splayed-arrow::corebatch_into_record_batch`（零拷贝
-转换）做统一底座：
+组件按**层次**组织，引擎无关的核心在最底，ADBC 驱动在最上：
 
 ```text
-splayed（umbrella，cargo features 开关）
-  ├─ core / format / codec / arrow       恒有（引擎无关）
-  └─ 适配组件（可选）
-     ├─ adbc        splayed-adbc       ADBC 风格统一连接组件（引擎无关）
-     ├─ datafusion  splayed-datafusion DataFusion TableProvider 三层对接
-     └─ duckdb      splayed-duckdb     DuckDB Arrow IPC 桥
+外部应用
+  │
+  ▼
+splayed-adbc          上层 ADBC 驱动：内部经 DataFusion 执行 SQL → Arrow 结果
+  │（调用执行 SQL；DuckDB 可作平替后端）
+  ├▶ splayed-datafusion   DataFusion TableProvider（查询自定义格式）+ SQL 执行
+  └▶ splayed-duckdb       DuckDB 扩展 / Arrow IPC 桥
+  │
+splayed-core           引擎无关核心：数据扫描与写入（Scanner / CoreBatch / Filter）
+  ▲
+  │ 共享转换工具（可选用）
+splayed-arrow          CoreBatch → Arrow 零拷贝转换
 ```
 
-- **`splayed-adbc`**：`Connection::open` → `Statement`（select/select_all/
-  filter/symbols/time_range/limit/batch_size/parallelism）→ `CoreBatchStream`
-  （引擎无关）或 `ArrowStream`（零拷贝 RecordBatch，同步迭代）；不依赖
-  DataFusion/DuckDB/async。SQL 解析与 ADBC C ABI（`adbc.h`）FFI 可在此接口
-  上加薄层实现。
-- 新引擎（Velox / Flink 等）：在 umbrella 增一个 feature + 一个适配 crate，
-  用新增的数据格式转换到 CoreBatch 即可（写路径复用 §8.4 原生接口）。
+- **`splayed-core`**：引擎无关，提供数据扫描与写入；不依赖 Arrow。
+- **`splayed-datafusion`**：实现 DataFusion `TableProvider`，使 DataFusion 能
+  查询自定义格式；同时提供 SQL 执行能力（`SessionContext`）。
+- **`splayed-duckdb`**：实现 DuckDB 扩展能力（当前为 Arrow IPC 桥）。
+- **`splayed-adbc`**：**上层**接口，面向外部应用；**内部使用 DataFusion 执行
+  SQL**、返回 Arrow `RecordBatch` 流——不是与 DataFusion/DuckDB 并列的适配层，
+  也**不复实现 SQL 解析**（ADBC C ABI / `adbc.h` FFI 可在
+  `Connection`/`Statement` 上加薄层）。
+- **`splayed-arrow`**：**可选的共享转换工具库**，位于核心层之上，被需要
+  Arrow 的适配层（DataFusion、ADBC）复用；解决重复转换代码问题，同时保持
+  核心层独立。仅一个 Arrow 消费者时也可把转换逻辑直接放进对应适配层。
+
+umbrella crate `splayed` 用 features 开关（`arrow` 默认开、可关；`adbc` 隐式
+拉入 datafusion）。
 
 依赖矩阵：
 
 | 组件 | 依赖 | 说明 |
 | --- | --- | --- |
-| splayed-adbc | core + arrow | 纯读取连接组件 |
-| splayed-datafusion | core + arrow + datafusion | 查询引擎适配 |
-| splayed-duckdb | core + arrow + arrow-ipc | 导出桥接 |
+| splayed-core | format + codec | 引擎无关核心 |
+| splayed-arrow | core | 共享转换工具（可选） |
+| splayed-datafusion | core + arrow + datafusion | TableProvider + SQL |
+| splayed-duckdb | core + arrow + arrow-ipc | DuckDB 桥 |
+| splayed-adbc | datafusion + arrow | 上层 ADBC 驱动（无独立 SQL 解析） |
 
 ## 10.4 DuckDB 集成
 

@@ -1,8 +1,9 @@
-//! splayed-adbc 集成测试：CoreBatch 流 / 零拷贝 Arrow 流 / 过滤 / limit / 并行。
+//! splayed-adbc 集成测试：上层 ADBC 驱动（内部经 DataFusion 执行 SQL →
+//! Arrow 结果流），覆盖全表 / 过滤 / 聚合 / 流式迭代 / 分区表。
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray as ArrowStringArray};
+use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray as ArrowStringArray};
 use arrow_schema::{DataType as ArrowDT, Field, Schema};
 use splayed_arrow::create_table;
 use splayed_adbc::Connection;
@@ -20,7 +21,7 @@ fn temp_dir(suffix: &str) -> std::path::PathBuf {
     dir
 }
 
-/// time 0..4 × SYM01/02，close 100..104 / 200..204，vol 1000.. / 2000..
+/// time 0..4 × SYM01/02，close 100..104 / 200..204，vol 1000.. / 2000..（含一个 NULL）
 fn make_batch() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("time", ArrowDT::Date32, false),
@@ -58,129 +59,85 @@ fn make_batch() -> RecordBatch {
     .unwrap()
 }
 
+fn fold_rows(conn_result: Vec<RecordBatch>) -> usize {
+    conn_result.iter().map(|rb| rb.num_rows()).sum()
+}
+
 #[test]
-fn core_stream_full_and_filtered() {
-    let dir = temp_dir("core");
+fn sql_filter_and_projection() {
+    let dir = temp_dir("sql_filter");
     create_table(&dir, &make_batch(), true).unwrap();
     let conn = Connection::open(&dir).unwrap();
 
-    // Full scan: 10 rows.
-    let full = conn.statement().execute().unwrap();
-    let rows: usize = full.map(|b| b.unwrap().num_rows()).sum();
-    assert_eq!(rows, 10);
-
-    // Filter close > 150: SYM02 (200..204) → 5 rows.
-    let filtered = conn
-        .statement()
-        .select_all()
-        .filter(splayed_core::Filter::GreaterThan {
-            field: "close".into(),
-            value: splayed_core::FilterValue::Float64(150.0),
-        })
-        .execute()
+    // SQL 由 DataFusion 执行：过滤 + 投影。
+    let rows = conn
+        .execute("SELECT close FROM splayed WHERE sym = 'SYM02' AND close >= 201")
         .unwrap();
-    let rows: usize = filtered.map(|b| b.unwrap().num_rows()).sum();
-    assert_eq!(rows, 5);
+    assert_eq!(fold_rows(rows), 4); // 201..204
+
+    // 聚合（SQL 能力来自 DataFusion，adbc 不复实现解析）。
+    let count = conn.execute("SELECT COUNT(*) AS c FROM splayed").unwrap();
+    let c = count[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(c, 10);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn arrow_stream_values_and_nulls() {
-    let dir = temp_dir("arrow");
+fn streamed_iteration() {
+    let dir = temp_dir("stream");
     create_table(&dir, &make_batch(), true).unwrap();
     let conn = Connection::open(&dir).unwrap();
 
-    let stream = conn
-        .statement()
-        .select_all()
-        .execute_arrow()
-        .unwrap();
-
+    let stream = conn.statement("SELECT sym, close FROM splayed").execute().unwrap();
     let mut total = 0usize;
-    let mut null_vols = 0usize;
+    let mut first_sym: Option<String> = None;
     for rb in stream {
         let rb = rb.unwrap();
         total += rb.num_rows();
-        // vol column index 3; row 2 of SYM01 is NULL (global row 2).
-        let vol = rb
-            .column(3)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .unwrap();
-        for i in 0..vol.len() {
-            if vol.is_null(i) {
-                null_vols += 1;
-            }
+        if first_sym.is_none() {
+            let s = rb
+                .column(0)
+                .as_any()
+                .downcast_ref::<ArrowStringArray>()
+                .unwrap();
+            first_sym = Some(s.value(0).to_string());
         }
-        let sym = rb
-            .column(1)
-            .as_any()
-            .downcast_ref::<ArrowStringArray>()
-            .unwrap();
-        assert_eq!(sym.value(0), "SYM01");
     }
     assert_eq!(total, 10);
-    assert_eq!(null_vols, 1); // exactly the one NULL cell
+    assert_eq!(first_sym.as_deref(), Some("SYM01"));
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn limit_truncates_in_batch() {
-    let dir = temp_dir("limit");
+fn null_values_preserved() {
+    let dir = temp_dir("nulls");
     create_table(&dir, &make_batch(), true).unwrap();
     let conn = Connection::open(&dir).unwrap();
 
-    let stream = conn.statement().select_all().limit(3).execute_arrow().unwrap();
-    let total: usize = stream.filter_map(|rb| rb.ok().map(|b| b.num_rows())).sum();
-    assert_eq!(total, 3);
+    // vol 列恰有一个 NULL（SYM01 第 2 天）。
+    let rows = conn.execute("SELECT vol FROM splayed WHERE vol IS NULL").unwrap();
+    assert_eq!(fold_rows(rows), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn parallelism_keeps_order_and_count() {
-    let dir = temp_dir("par");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let conn = Connection::open(&dir).unwrap();
+fn partitioned_table_open() {
+    let root = temp_dir("parts");
+    // 两个 dataset 目录做分区表（自动探测）。
+    create_table(&root.join("2024"), &make_batch(), true).unwrap();
+    create_table(&root.join("2025"), &make_batch(), true).unwrap();
 
-    let serial: Vec<i64> = conn
-        .statement()
-        .select_all()
-        .execute_arrow()
-        .unwrap()
-        .filter_map(|rb| rb.ok())
-        .flat_map(|rb| {
-            rb.column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::Date32Array>()
-                .unwrap()
-                .iter()
-                .map(|v| v.unwrap() as i64)
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let conn = Connection::open(&root).unwrap();
+    let rows = conn.execute("SELECT close FROM splayed").unwrap();
+    assert_eq!(fold_rows(rows), 20); // 10 + 10
 
-    let parallel: Vec<i64> = conn
-        .statement()
-        .select_all()
-        .parallelism(4)
-        .execute_arrow()
-        .unwrap()
-        .filter_map(|rb| rb.ok())
-        .flat_map(|rb| {
-            rb.column(0)
-                .as_any()
-                .downcast_ref::<arrow_array::Date32Array>()
-                .unwrap()
-                .iter()
-                .map(|v| v.unwrap() as i64)
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
-    assert_eq!(serial, parallel);
-
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&root).ok();
 }

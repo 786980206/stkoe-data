@@ -52,26 +52,33 @@ Designed for **extremely low I/O, O(1) row location, mmap/zero-copy reads, and h
 splayed/
 ├── splayed-format/      # Binary format: META + FIELD headers, types, NULL encoding (no deps)
 ├── splayed-codec/       # Encoding (PLAIN) + compression (NONE/ZSTD/LZ4)
-├── splayed-core/        # Reader (mmap), field writer, dataset, scanner, CoreBatch (no Arrow)
-├── splayed-arrow/       # Arrow exchange: create_meta/table/update_table + CoreBatch→Arrow 零拷贝
-├── splayed-adbc/        # [可选] ADBC 风格引擎无关连接组件（Connection/Statement/Arrow 流）
-├── splayed-datafusion/  # [可选] DataFusion TableProvider: SQL queries with pushdown
-├── splayed-duckdb/      # [可选] DuckDB Arrow IPC 桥
-├── splayed/             # [可选] umbrella：核心恒有 + 上述三组件用 features 开关
+├── splayed-core/        # 引擎无关核心：扫描/写入、Scanner、CoreBatch（no Arrow）
+├── splayed-arrow/       # [可选共享工具] CoreBatch → Arrow 零拷贝转换
+├── splayed-datafusion/  # [可选] DataFusion TableProvider + SQL 执行能力
+├── splayed-duckdb/      # [可选] DuckDB 扩展 / Arrow IPC 桥
+├── splayed-adbc/        # [可选·上层] ADBC 驱动：内部经 DataFusion 执行 SQL → Arrow
+├── splayed/             # [可选 umbrella] 分层组件，cargo features 开关
 └── splayed-cli/         # CLI
 ```
 
-三个适配组件是**逻辑可选**的 — umbrella crate 按引擎开关：
+分层（非并列组件）：
+
+```text
+外部应用 → splayed-adbc（上层 ADBC 驱动，内部用 DataFusion 执行 SQL，返回 Arrow）
+             ├→ splayed-datafusion（TableProvider + SQL 执行）
+             └→ splayed-duckdb（DuckDB 扩展 / IPC 桥）
+splayed-core（引擎无关核心：扫描与写入）
+共享工具：splayed-arrow（CoreBatch → Arrow，被需要 Arrow 的适配层复用，可选用）
+```
+
+umbrella 用法（`arrow` 默认开、可关；`adbc` 隐式拉入 datafusion）：
 
 ```toml
 [dependencies]
-splayed = { path = "crates/splayed", features = ["adbc", "datafusion", "duckdb"] }
+splayed = { path = "crates/splayed", features = ["arrow", "adbc", "duckdb"] }
 ```
 
-新引擎（Velox / Flink 等）只需新增一个 feature + 一个适配 crate，把引擎数据
-格式转换到 `CoreBatch` 即可。
-
-Dependency direction: `format ← codec ← core → arrow → {adbc, datafusion, duckdb}`
+Dependency direction: `format ← codec ← core → arrow → {datafusion, duckdb} → adbc`
 
 ---
 
