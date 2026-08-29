@@ -20,6 +20,7 @@ use crate::{CreateFieldError, DatasetError, FieldReader, UpdateError, open_datas
 ///
 /// `values.len() = n_rows × data_type.size_of()`; `create_table` /
 /// `update_table` place each input row at its `global_row` internally.
+#[derive(Debug, Clone)]
 pub struct TableColumn {
     pub name: String,
     pub data_type: DataType,

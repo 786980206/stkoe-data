@@ -770,3 +770,104 @@ async fn stats_agg_rule_answers_without_filter() {
     let dir = temp_dir("agg_rule_cleanup");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 分区写能力联动：create_partitioned_table / update_partition_table /
+/// append_partition 之后 `SplayedTableProvider::reload()` 让 SQL 立即看到。
+#[tokio::test]
+async fn partition_write_reload_reflects() {
+    use splayed_core::{
+        PartitionWriteInput, append_partition, create_partitioned_table, update_partition_table,
+    };
+    use splayed_format::{DataType as ST, RawValue, TimeType};
+
+    let root = temp_dir("pw_reload");
+    let mk = |vals: &[f64]| {
+        let mut b = vec![0u8; vals.len() * 8];
+        for (i, v) in vals.iter().enumerate() {
+            RawValue::from_f64(*v).write_le(&mut b, i * 8);
+        }
+        b
+    };
+    let col = |name: &str, values: Vec<u8>| splayed_core::TableColumn {
+        name: name.to_string(),
+        data_type: ST::Float64,
+        values,
+    };
+    let inp = |name: &str, base: f64| {
+        let mut s = Vec::new();
+        let mut t = Vec::new();
+        let mut vals = Vec::new();
+        for si in 0..2i64 {
+            for ti in 0..3i64 {
+                s.push(if si == 0 { "SYM01" } else { "SYM02" }.to_string());
+                t.push(ti);
+                vals.push(base + (si * 100) as f64 + ti as f64);
+            }
+        }
+        PartitionWriteInput {
+            name: name.to_string(),
+            time_type: TimeType::Date32,
+            sym: s,
+            time: t,
+            columns: vec![col("close", mk(&vals))],
+            sorted: true,
+        }
+    };
+    create_partitioned_table(&root, TimeType::Date32, &[inp("2024", 100.0), inp("2025", 500.0)])
+        .unwrap();
+
+    let mut provider = splayed_datafusion::SplayedTableProvider::new(&root).unwrap();
+    let count = |ctx: SessionContext| async move {
+        ctx.sql("SELECT COUNT(*) AS c FROM splayed")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap()[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    let ctx = SessionContext::new();
+    ctx.register_table("splayed", Arc::new(provider.clone())).unwrap();
+    assert_eq!(count(ctx.clone()).await, 12);
+
+    // 格子更新（2024 的 SYM01 t0 → 999）+ reload。
+    let cols = vec![col("close", mk(&[999.0]))];
+    update_partition_table(
+        &root,
+        &["SYM01".to_string()],
+        &[0i64],
+        &cols,
+        false,
+        Some("2024"),
+    )
+    .unwrap();
+    provider.reload().unwrap();
+    let ctx2 = SessionContext::new();
+    ctx2.register_table("splayed", Arc::new(provider.clone())).unwrap();
+    let v = ctx2
+        .sql("SELECT close FROM splayed WHERE time = 0 AND sym = 'SYM01'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap()[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(v, 999.0);
+
+    // 追加分区 + reload → 行数变化。
+    append_partition(&root, &inp("2026", 900.0)).unwrap();
+    provider.reload().unwrap();
+    let ctx3 = SessionContext::new();
+    ctx3.register_table("splayed", Arc::new(provider)).unwrap();
+    assert_eq!(count(ctx3.clone()).await, 18); // 12 + 6
+
+    fs::remove_dir_all(&root).ok();
+}

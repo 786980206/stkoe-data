@@ -88,6 +88,11 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | 分区表 | `PartitionedTable::open(dir)` | 发现（单 dataset 兼容）+ schema 合并校验 + 符号并集 + **key=value 目录名解析为声明式分区列**（`PartitionColumn`，Int64/String） |
 | | `plan(&PartitionScanRequest)` | 四层剪裁：TIME（分区时间轴）/ 符号（分区缺失剔除）/ 统计（footer min-max 不相交→跳过分区）/ **分区列**（`partition_filters` 与 declared 值不相交→跳过） |
 | | `scan(&plan, &req) -> PartitionScanBatches` | 按分区名升序流式合并 CoreBatch（DataFusion / DuckDB 共用此实现） |
+| | `create_partitioned_table(root, tt, &[PartitionWriteInput])` | 一次建整表（root + N 分区，并发 create_table；schema/命名风格预检） |
+| | `append_partition(root, input)` | 追加分区（校验与既有 schema/命名/分区列一致；重复→`PartitionExists`） |
+| | `drop_partition(root, name)` | 删除分区目录（不存在→`PartitionNotFound`） |
+| | `update_partition_table(root, sym, time, columns, create_missing, target?)` | **表级格子写入**：跨分区路由（存在性自动定位或显式 target；无命中→`SymTimeNotFound`）后逐分区 `update_table` |
+| | `update_partition_meta(root, &[PartitionWriteInput])` | **表级布局重排**：既有分区 `update_meta`（gather 重散布）+ 新增 `create_table` + 移除未保留分区（并发） |
 | 请求类型 | `ScanRequest{columns, symbols, time_range, filters, batch_size, parallelism, limit}` | 一次扫描的全部下推条件 |
 | | `SymbolSelection::All \| Symbols` / `TimeRange::new`, `Filter`(8 种) / `FilterValue`(全定长类型) | 下推值类型 |
 | 内存模型 | `CoreBatch/CoreColumn/CoreSchema/CoreType/CoreStringDict/Buffer/Bitmap` | 引擎无关列式表示（见 2.5） |

@@ -113,3 +113,4 @@ cargo test         # all tests must pass
 - 分区管理下沉 core（`splayed-core::partition`：发现/schema 合并/三层剪裁/流式合并），DataFusion 与 DuckDB 共用：**Complete**。
 - 分区列（key=value 虚拟列）+ 分区级符号剪裁透传 + polars 分区表 + 编码器接线 + 聚合下推 rule：**Complete**。
   （workspace rust-version 升到 1.86：stats-agg rule 需要 `dyn TableSource as &dyn Any` 上转型。）
+- 分区写能力：`create_partitioned_table` / `append_partition` / `drop_partition` / `update_partition_table`（跨分区路由格子写）/ `update_partition_meta`（表级布局重排）+ DataFusion `SplayedTableProvider::reload`：**Complete**。

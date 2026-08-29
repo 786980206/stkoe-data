@@ -33,7 +33,7 @@ use crate::exec::SplayedTableScanExec;
 use crate::filter::{classify, parse_filters};
 
 /// A partitioned Splayed table ("Hive partition table" analogue).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SplayedTableProvider {
     dir: PathBuf,
     /// core 分区层（引擎无关：发现/校验/剪裁）。
@@ -100,6 +100,13 @@ impl SplayedTableProvider {
     /// The individual partition providers.
     pub fn partitions(&self) -> &[Arc<SplayedDatasetProvider>] {
         &self.partitions
+    }
+
+    /// 重新加载磁盘状态（`update_partition_table` / `update_partition_meta` /
+    /// `append_partition` / `drop_partition` 之后调用，使 SQL 立即看到新布局）。
+    pub fn reload(&mut self) -> DFResult<()> {
+        *self = Self::new(self.dir.clone())?;
+        Ok(())
     }
 
     /// The engine-agnostic partition layer (useful for reload / debugging).

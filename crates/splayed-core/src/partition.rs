@@ -6,6 +6,7 @@
 //! 提供：发现 + schema 合并校验 + 三层剪裁（TIME / 符号 / 分区统计 min-max）
 //! + 按分区名升序的流式合并扫描（产出 `CoreBatch`）。
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::scanner::{
     Filter, ParallelScanBatches, ScanRequest, Scanner, SymbolSelection, TimeRange,
     scan_owned_parallel,
 };
+use crate::table_writer::{TableColumn, create_table, update_meta, update_table};
 
 /// 分区表错误。
 #[derive(Debug)]
@@ -43,6 +45,14 @@ pub enum PartitionError {
     MixedPartitionNaming { partition: String },
     /// 分区列声明不一致（不同 key）。
     PartitionColumnMismatch { partition: String, expected: String, found: String },
+    /// 下层表写入失败（create_table / update_table / update_meta）。
+    Table(crate::TableError),
+    /// 分区已存在。
+    PartitionExists { name: String },
+    /// 分区不存在。
+    PartitionNotFound { name: String },
+    /// (SYM, TIME) 在目标分区中不存在（表级格子写入路由失败）。
+    SymTimeNotFound { row: usize },
     Scan(String),
 }
 
@@ -71,6 +81,12 @@ impl std::fmt::Display for PartitionError {
                 f,
                 "partition {partition}: partition column mismatch — expected {expected}, found {found}"
             ),
+            Self::Table(e) => write!(f, "partition table write error: {e}"),
+            Self::PartitionExists { name } => write!(f, "partition '{name}' already exists"),
+            Self::PartitionNotFound { name } => write!(f, "partition '{name}' not found"),
+            Self::SymTimeNotFound { row } => {
+                write!(f, "(SYM, TIME) at row {row} not found in any partition")
+            }
             Self::Scan(s) => write!(f, "partition scan error: {s}"),
         }
     }
@@ -121,7 +137,7 @@ pub struct PartitionSchema {
 }
 
 /// 分区表（引擎无关）。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PartitionedTable {
     dir: PathBuf,
     partitions: Vec<Partition>,
@@ -497,6 +513,421 @@ impl PartitionScanBatches {
     pub fn total_partitions(&self) -> usize {
         self.streams.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// 分区写能力（引擎无关；DataFusion / DuckDB 下次打开自动看到）
+// ---------------------------------------------------------------------------
+
+/// 一个分区的写入输入（建表 / 追加 / 重写共用）。
+#[derive(Debug, Clone)]
+pub struct PartitionWriteInput {
+    /// 分区名 = 目录名（可含 `key=value`，如 `"year=2024"`）。
+    pub name: String,
+    pub time_type: TimeType,
+    /// 逐行 (SYM, TIME)。
+    pub sym: Vec<String>,
+    pub time: Vec<i64>,
+    /// 与全表 schema 一致的列（输入行序原始 LE 字节）。
+    pub columns: Vec<TableColumn>,
+    /// 输入是否已按 (SYM, TIME) 升序（性能提示；误报自动回退）。
+    pub sorted: bool,
+}
+
+/// 一次建出整个分区表：root + N 个分区（每分区并发 `create_table`）。
+pub fn create_partitioned_table(
+    root: impl AsRef<Path>,
+    time_type: TimeType,
+    inputs: &[PartitionWriteInput],
+) -> Result<(), PartitionError> {
+    let root = root.as_ref();
+    if inputs.is_empty() {
+        return Err(PartitionError::NoPartition {
+            dir: root.to_path_buf(),
+        });
+    }
+    // 命名风格统一（key=value 与普通目录名不可混用）。
+    if let Some(offender) = inputs
+        .iter()
+        .find(|i| is_kv_name(&i.name) != is_kv_name(&inputs[0].name))
+    {
+        return Err(PartitionError::MixedPartitionNaming {
+            partition: offender.name.clone(),
+        });
+    }
+    // schema 预检：列名+类型一致。
+    for inp in &inputs[1..] {
+        if !columns_match(&inputs[0].columns, &inp.columns) {
+            return Err(PartitionError::SchemaMismatch {
+                partition: inp.name.clone(),
+                expected: field_fingerprint(&inputs[0].columns),
+                found: field_fingerprint(&inp.columns),
+            });
+        }
+    }
+
+    fs::create_dir_all(root).map_err(PartitionError::Io)?;
+    first_err(
+        std::thread::scope(|s| {
+            let handles: Vec<_> = inputs
+                .iter()
+                .map(|inp| {
+                    s.spawn(move || {
+                        create_table(
+                            root.join(&inp.name),
+                            time_type,
+                            &inp.sym,
+                            &inp.time,
+                            &inp.columns,
+                            inp.sorted,
+                        )
+                        .map(|_| ())
+                        .map_err(PartitionError::Table)
+                    })
+                })
+                .collect();
+            collect_results(handles)
+        }),
+        root.join(&inputs[0].name),
+    )
+}
+
+/// 追加一个分区（校验与既有分区 schema / 命名风格 / 分区列一致）。
+pub fn append_partition(
+    root: impl AsRef<Path>,
+    input: &PartitionWriteInput,
+) -> Result<(), PartitionError> {
+    let root = root.as_ref();
+    let table = PartitionedTable::open(root)?;
+    if table.partitions().iter().any(|p| p.name == input.name) {
+        return Err(PartitionError::PartitionExists {
+            name: input.name.clone(),
+        });
+    }
+    let any_kv = table.partitions().iter().any(|p| is_kv_name(&p.name));
+    if any_kv != is_kv_name(&input.name) {
+        return Err(PartitionError::MixedPartitionNaming {
+            partition: input.name.clone(),
+        });
+    }
+    if !columns_match_schema(table.fields(), &input.columns) {
+        return Err(PartitionError::SchemaMismatch {
+            partition: input.name.clone(),
+            expected: fields_fingerprint(table.fields()),
+            found: field_fingerprint(&input.columns),
+        });
+    }
+    // key=value 新分区：key 不能与字段同名、且与既有分区列名一致。
+    if let Some(key) = input.name.split_once('=').map(|(k, _)| k.to_string()) {
+        if table.fields().iter().any(|(n, _)| n == &key) {
+            return Err(PartitionError::PartitionColumnMismatch {
+                partition: input.name.clone(),
+                expected: "key=value key must differ from field names".to_string(),
+                found: key,
+            });
+        }
+        if let Some(pc) = table.partition_columns().first() {
+            if pc.name != key {
+                return Err(PartitionError::PartitionColumnMismatch {
+                    partition: input.name.clone(),
+                    expected: pc.name.clone(),
+                    found: key,
+                });
+            }
+        }
+    }
+    create_table(
+        root.join(&input.name),
+        table.schema().time_type,
+        &input.sym,
+        &input.time,
+        &input.columns,
+        input.sorted,
+    )
+    .map_err(PartitionError::Table)
+    .map(|_| ())
+}
+
+/// 删除一个分区（目录整体删除；分区不存在报错）。
+pub fn drop_partition(root: impl AsRef<Path>, name: &str) -> Result<(), PartitionError> {
+    let root = root.as_ref();
+    let table = PartitionedTable::open(root)?;
+    if !table.partitions().iter().any(|p| p.name == name) {
+        return Err(PartitionError::PartitionNotFound {
+            name: name.to_string(),
+        });
+    }
+    fs::remove_dir_all(root.join(name)).map_err(PartitionError::Io)?;
+    Ok(())
+}
+
+/// 表级格子写入（跨分区路由）。
+///
+/// - `target_partition = Some(name)`：所有行必须落在该分区（否则
+///   `SymTimeNotFound`）；
+/// - `None`：每行路由到**唯一**包含该 (SYM, TIME) 的分区（meta 二分定位）；
+///   没有任何分区包含 → `SymTimeNotFound`。
+///
+/// 路由后按分区分组，逐个委托单 dataset 的 `update_table`。
+#[allow(clippy::too_many_arguments)]
+pub fn update_partition_table(
+    root: impl AsRef<Path>,
+    sym: &[String],
+    time: &[i64],
+    columns: &[TableColumn],
+    create_missing_fields: bool,
+    target_partition: Option<&str>,
+) -> Result<(), PartitionError> {
+    let root = root.as_ref();
+    if sym.len() != time.len() {
+        return Err(PartitionError::Table(
+            crate::TableError::LengthMismatch {
+                field: "sym/time".to_string(),
+                expected: sym.len(),
+                got: time.len(),
+            },
+        ));
+    }
+    let table = PartitionedTable::open(root)?;
+    let n = sym.len();
+
+    // 行 → 分区（下标桶）。
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); table.partitions().len()];
+    for row in 0..n {
+        let target: Option<usize> = match target_partition {
+            Some(name) => {
+                let idx = table
+                    .partitions()
+                    .iter()
+                    .position(|p| p.name == name)
+                    .ok_or_else(|| PartitionError::PartitionNotFound {
+                        name: name.to_string(),
+                    })?;
+                // 行必须真的落在该分区（meta 区间包含）。
+                if !meta_contains(&table.partitions()[idx].meta, &sym[row], time[row]) {
+                    return Err(PartitionError::SymTimeNotFound { row });
+                }
+                Some(idx)
+            }
+            None => table
+                .partitions()
+                .iter()
+                .position(|p| meta_contains(&p.meta, &sym[row], time[row])),
+        };
+        match target {
+            Some(idx) => buckets[idx].push(row),
+            None => return Err(PartitionError::SymTimeNotFound { row }),
+        }
+    }
+
+    // 按分区分组委托 update_table（列值按行切片）。
+    for (idx, rows) in buckets.iter().enumerate() {
+        if rows.is_empty() {
+            continue;
+        }
+        let name = table.partitions()[idx].name.clone();
+        let sub_sym: Vec<String> = rows.iter().map(|&r| sym[r].clone()).collect();
+        let sub_time: Vec<i64> = rows.iter().map(|&r| time[r]).collect();
+        let sub_columns: Vec<TableColumn> = columns
+            .iter()
+            .map(|col| {
+                let w = col.data_type.size_of();
+                let mut values = Vec::with_capacity(rows.len() * w);
+                for &r in rows {
+                    values.extend_from_slice(&col.values[r * w..(r + 1) * w]);
+                }
+                TableColumn {
+                    name: col.name.clone(),
+                    data_type: col.data_type,
+                    values,
+                }
+            })
+            .collect();
+        update_table(
+            root.join(&name),
+            &sub_sym,
+            &sub_time,
+            &sub_columns,
+            create_missing_fields,
+        )
+        .map_err(PartitionError::Table)?;
+    }
+    Ok(())
+}
+
+/// 表级布局重排：输入里已存在的分区 → `update_meta`（gather 重散布，数据
+/// 保留）；新增分区 → `create_table`（需提供 columns）；未出现在输入中的
+/// 既有分区 → 删除。分区处理并发执行。
+pub fn update_partition_meta(
+    root: impl AsRef<Path>,
+    inputs: &[PartitionWriteInput],
+) -> Result<(), PartitionError> {
+    let root = root.as_ref();
+    let table = PartitionedTable::open(root)?;
+    let existing: HashSet<String> = table.partitions().iter().map(|p| p.name.clone()).collect();
+
+    // 校验：新增分区 schema/time_type/命名风格一致。
+    let any_kv = table.partitions().iter().any(|p| is_kv_name(&p.name));
+    for inp in inputs {
+        if !existing.contains(&inp.name) {
+            if any_kv != is_kv_name(&inp.name) {
+                return Err(PartitionError::MixedPartitionNaming {
+                    partition: inp.name.clone(),
+                });
+            }
+            if !columns_match_schema(table.fields(), &inp.columns) {
+                return Err(PartitionError::SchemaMismatch {
+                    partition: inp.name.clone(),
+                    expected: fields_fingerprint(table.fields()),
+                    found: field_fingerprint(&inp.columns),
+                });
+            }
+            if inp.time_type != table.schema().time_type {
+                return Err(PartitionError::TimeTypeMismatch {
+                    partition: inp.name.clone(),
+                    expected: table.schema().time_type,
+                    found: inp.time_type,
+                });
+            }
+        }
+    }
+
+    // 并发：update_meta（既有）/ create_table（新增）。
+    // `is_existing` 预计算成 Vec<bool>（move 闭包可克隆，避免捕获整个 HashSet）。
+    let is_existing: Vec<bool> = inputs
+        .iter()
+        .map(|inp| existing.contains(&inp.name))
+        .collect();
+    let write_err = std::thread::scope(|s| {
+        let handles: Vec<_> = inputs
+            .iter()
+            .zip(is_existing.iter())
+            .map(|(inp, exist)| {
+                let exist = *exist;
+                s.spawn(move || {
+                    if exist {
+                        update_meta(
+                            root.join(&inp.name),
+                            inp.time_type,
+                            &inp.sym,
+                            &inp.time,
+                        )
+                        .map(|_| ())
+                        .map_err(PartitionError::Table)
+                    } else {
+                        create_table(
+                            root.join(&inp.name),
+                            inp.time_type,
+                            &inp.sym,
+                            &inp.time,
+                            &inp.columns,
+                            inp.sorted,
+                        )
+                        .map(|_| ())
+                        .map_err(PartitionError::Table)
+                    }
+                })
+            })
+            .collect();
+        collect_results(handles)
+    });
+
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+
+    // 移除未保留的分区。
+    let input_names: HashSet<&str> = inputs.iter().map(|i| i.name.as_str()).collect();
+    for name in existing.iter().filter(|n| !input_names.contains(n.as_str())) {
+        fs::remove_dir_all(root.join(name)).map_err(PartitionError::Io)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 写路径助手
+// ---------------------------------------------------------------------------
+
+/// 目录名是否 key=value 风格。
+fn is_kv_name(name: &str) -> bool {
+    name.contains('=')
+}
+
+/// 列（输入）↔ 全表 schema 字段（名→类型，忽略顺序）。
+fn columns_match_schema(fields: &[(String, DataType)], columns: &[TableColumn]) -> bool {
+    if fields.len() != columns.len() {
+        return false;
+    }
+    let mut want: Vec<(&str, DataType)> = fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    want.sort_by_key(|(n, _)| *n);
+    let mut got: Vec<(&str, DataType)> = columns
+        .iter()
+        .map(|c| (c.name.as_str(), c.data_type))
+        .collect();
+    got.sort_by_key(|(n, _)| *n);
+    want == got
+}
+
+fn columns_match(a: &[TableColumn], b: &[TableColumn]) -> bool {
+    columns_match_schema(
+        &a.iter().map(|c| (c.name.clone(), c.data_type)).collect::<Vec<_>>(),
+        b,
+    )
+}
+
+fn field_fingerprint(columns: &[TableColumn]) -> String {
+    let mut v: Vec<(&str, DataType)> = columns.iter().map(|c| (c.name.as_str(), c.data_type)).collect();
+    v.sort_by_key(|(n, _)| *n);
+    format!("{v:?}")
+}
+
+fn fields_fingerprint(fields: &[(String, DataType)]) -> String {
+    let mut v: Vec<(&str, DataType)> = fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    v.sort_by_key(|(n, _)| *n);
+    format!("{v:?}")
+}
+
+/// 分区 meta 是否包含 (SYM, TIME)。
+fn meta_contains(meta: &MetaFile, sym: &str, time: i64) -> bool {
+    let Some(si) = meta.find_symbol(sym) else {
+        return false;
+    };
+    let rec = &meta.sym_index[si];
+    let lo = rec.time_start as usize;
+    let hi = lo + rec.time_count as usize;
+    meta.time_axis[lo..hi].binary_search(&time).is_ok()
+}
+
+/// 收集线程结果，返回第一个错误。
+fn collect_results<T>(
+    handles: Vec<std::thread::ScopedJoinHandle<'_, Result<T, PartitionError>>>,
+) -> Option<PartitionError> {
+    let mut first: Option<PartitionError> = None;
+    for h in handles {
+        if first.is_some() {
+            continue;
+        }
+        match h.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => first = Some(e),
+            Err(_) => first = Some(PartitionError::Scan(
+                "partition write thread panicked".to_string(),
+            )),
+        }
+    }
+    first
+}
+
+/// 写路径通用收尾：并发错误优先返回；错误时清理 root 下新建产物。
+fn first_err(
+    err: Option<PartitionError>,
+    first_dir: PathBuf,
+) -> Result<(), PartitionError> {
+    if let Some(e) = err {
+        let _ = fs::remove_dir_all(first_dir);
+        return Err(e);
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

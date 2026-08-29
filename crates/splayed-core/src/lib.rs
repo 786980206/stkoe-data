@@ -35,7 +35,9 @@ pub use scanner::{
 };
 pub use partition::{
     Partition, PartitionColumn, PartitionColumnKind, PartitionError, PartitionPlan,
-    PartitionScanBatches, PartitionScanRequest, PartitionSchema, PartitionTask, PartitionedTable,
+    PartitionScanBatches, PartitionScanRequest, PartitionSchema, PartitionTask,
+    PartitionWriteInput, PartitionedTable, append_partition, create_partitioned_table,
+    drop_partition, update_partition_meta, update_partition_table,
 };
 pub use table_writer::{
     TableColumn, TableError, create_meta, create_table, update_meta, update_table,

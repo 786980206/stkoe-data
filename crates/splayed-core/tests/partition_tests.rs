@@ -238,6 +238,191 @@ fn symbol_and_stats_pruning() {
 }
 
 #[test]
+fn partition_write_lifecycle() {
+    use splayed_core::{
+        PartitionWriteInput, append_partition, create_partitioned_table, drop_partition,
+        update_partition_meta,
+    };
+    use splayed_format::DataType as ST;
+
+    let root = temp_dir("write");
+    let mk = |vals: &[f64]| {
+        let mut b = vec![0u8; vals.len() * 8];
+        for (i, v) in vals.iter().enumerate() {
+            RawValue::from_f64(*v).write_le(&mut b, i * 8);
+        }
+        b
+    };
+    let col = |name: &str, values: Vec<u8>| TableColumn {
+        name: name.to_string(),
+        data_type: ST::Float64,
+        values,
+    };
+
+    // 建表：两个分区（SYM01/02 × t0..2）。
+    let inp = |name: &str, base: f64| {
+        let mut s = Vec::new();
+        let mut t = Vec::new();
+        let mut vals = Vec::new();
+        for si in 0..2i64 {
+            for ti in 0..3i64 {
+                s.push(if si == 0 { "SYM01" } else { "SYM02" }.to_string());
+                t.push(ti);
+                vals.push(base + (si * 100) as f64 + ti as f64);
+            }
+        }
+        PartitionWriteInput {
+            name: name.to_string(),
+            time_type: TimeType::Date32,
+            sym: s,
+            time: t,
+            columns: vec![col("close", mk(&vals))],
+            sorted: true,
+        }
+    };
+    create_partitioned_table(&root, TimeType::Date32, &[inp("2024", 100.0), inp("2025", 500.0)])
+        .unwrap();
+
+    let table = PartitionedTable::open(&root).unwrap();
+    assert_eq!(table.partition_count(), 2);
+
+    // 追加分区 2026。
+    append_partition(&root, &inp("2026", 900.0)).unwrap();
+    assert_eq!(PartitionedTable::open(&root).unwrap().partition_count(), 3);
+    // 重复追加 → PartitionExists。
+    assert!(matches!(
+        append_partition(&root, &inp("2026", 1.0)),
+        Err(splayed_core::PartitionError::PartitionExists { .. })
+    ));
+
+    // 删除分区 2025。
+    drop_partition(&root, "2025").unwrap();
+    let table = PartitionedTable::open(&root).unwrap();
+    assert_eq!(table.partition_count(), 2);
+    assert_eq!(table.partitions()[0].name, "2024");
+    assert_eq!(table.partitions()[1].name, "2026");
+    // 删除不存在的 → PartitionNotFound。
+    assert!(matches!(
+        drop_partition(&root, "2025"),
+        Err(splayed_core::PartitionError::PartitionNotFound { .. })
+    ));
+
+    // 布局重排：2024 → 只留 SYM01 t0..1（update_meta）+ 新增 2027，移除 2026。
+    let relayout = PartitionWriteInput {
+        columns: vec![col("close", mk(&[100.0, 101.0]))],
+        ..inp("2024", 0.0)
+    };
+    let relayout_syms = vec!["SYM01".to_string(); 2];
+    let mut relayout = relayout;
+    relayout.sym = relayout_syms;
+    relayout.time = vec![0, 1];
+    let added = inp("2027", 700.0);
+    update_partition_meta(&root, &[relayout, added]).unwrap();
+
+    let table = PartitionedTable::open(&root).unwrap();
+    let names: Vec<&str> = table.partitions().iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, vec!["2024", "2027"]); // 2026 被移除
+    let preq = splayed_core::PartitionScanRequest {
+        columns: vec!["close".to_string()],
+        ..Default::default()
+    };
+    assert_eq!(
+        read_close(&table.plan(&preq).unwrap(), &preq, &table).len(),
+        (2 + 2 * 3) as usize // 2024 重排后 2 行 + 2027 6 行
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn update_partition_table_routes_rows() {
+    use splayed_core::{
+        PartitionWriteInput, create_partitioned_table, update_partition_table,
+    };
+    use splayed_format::DataType as ST;
+
+    let root = temp_dir("write_upd");
+    let mk = |vals: &[f64]| {
+        let mut b = vec![0u8; vals.len() * 8];
+        for (i, v) in vals.iter().enumerate() {
+            RawValue::from_f64(*v).write_le(&mut b, i * 8);
+        }
+        b
+    };
+    let col = |name: &str, values: Vec<u8>| TableColumn {
+        name: name.to_string(),
+        data_type: ST::Float64,
+        values,
+    };
+    let inp = |name: &str, base: f64| {
+        let mut s = Vec::new();
+        let mut t = Vec::new();
+        let mut vals = Vec::new();
+        for si in 0..2i64 {
+            for ti in 0..3i64 {
+                s.push(if si == 0 { "SYM01" } else { "SYM02" }.to_string());
+                t.push(ti);
+                vals.push(base + (si * 100) as f64 + ti as f64);
+            }
+        }
+        PartitionWriteInput {
+            name: name.to_string(),
+            time_type: TimeType::Date32,
+            sym: s,
+            time: t,
+            columns: vec![col("close", mk(&vals))],
+            sorted: true,
+        }
+    };
+    create_partitioned_table(&root, TimeType::Date32, &[inp("2024", 100.0), inp("2025", 500.0)])
+        .unwrap();
+
+    // 跨分区更新：2024 的 SYM01 t0（行基 100）与 2025 的 SYM02 t2（行基 500）。
+    let syms = vec!["SYM01".to_string(), "SYM02".to_string()];
+    let times = vec![0i64, 2];
+    let vals: Vec<f64> = vec![999.0, 888.0];
+    let columns = vec![col("close", mk(&vals))];
+    // 按存在性路由：两分区都含这两个 (sym,time) → 都落到第一个命中（2024）。
+    update_partition_table(&root, &syms, &times, &columns, false, None).unwrap();
+
+    // 显式目标分区：SYM02 t2 → 777 写到 2025。
+    let vals2 = mk(&[777.0]);
+    let columns2 = vec![col("close", vals2)];
+    update_partition_table(
+        &root,
+        &["SYM02".to_string()],
+        &[2i64],
+        &columns2,
+        false,
+        Some("2025"),
+    )
+    .unwrap();
+
+    let r24 = splayed_core::FieldReader::open(root.join("2024").join("close")).unwrap();
+    let r25 = splayed_core::FieldReader::open(root.join("2025").join("close")).unwrap();
+    // 全局行序（SYM 升序 × TIME 升序）：SYM01 t0 为第 0 行；SYM02 t2 为第 5 行。
+    assert_eq!(r24.read_row(0).unwrap().as_f64(), Some(999.0));
+    assert_eq!(r24.read_row(5).unwrap().as_f64(), Some(888.0)); // 存在性路由命中 2024
+    assert_eq!(r25.read_row(5).unwrap().as_f64(), Some(777.0)); // 显式目标分区命中 2025
+
+    // 指定分区 + 行不存在 → SymTimeNotFound。
+    let err = update_partition_table(
+        &root,
+        &["SYM02".to_string()],
+        &[7i64],
+        &columns,
+        false,
+        Some("2024"),
+    );
+    assert!(matches!(
+        err,
+        Err(splayed_core::PartitionError::SymTimeNotFound { row: 0 })
+    ));
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn partition_columns_key_value() {
     use splayed_core::{FilterValue, PartitionColumnKind};
 
