@@ -85,6 +85,9 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | | `scan_owned(...) / scan_owned_parallel(..., n)` | 自有 / 有序并行流 |
 | | `scan_all_parallel(...)` | 全收集（并行，支持 limit） |
 | | `split_ranges(plan, n)` | 行均衡切片（并行分组） |
+| 分区表 | `PartitionedTable::open(dir)` | 发现（单 dataset 兼容）+ schema 合并校验 + 符号并集 |
+| | `plan(&PartitionScanRequest)` | 三层剪裁：TIME（分区时间轴）/ 符号（分区缺失剔除）/ 统计（footer min-max 不相交→跳过分区） |
+| | `scan(&plan, &req) -> PartitionScanBatches` | 按分区名升序流式合并 CoreBatch（DataFusion / DuckDB 共用此实现） |
 | 请求类型 | `ScanRequest{columns, symbols, time_range, filters, batch_size, parallelism, limit}` | 一次扫描的全部下推条件 |
 | | `SymbolSelection::All \| Symbols` / `TimeRange::new`, `Filter`(8 种) / `FilterValue`(全定长类型) | 下推值类型 |
 | 内存模型 | `CoreBatch/CoreColumn/CoreSchema/CoreType/CoreStringDict/Buffer/Bitmap` | 引擎无关列式表示（见 2.5） |
@@ -165,7 +168,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | 接口 | 说明 |
 |---|---|
 | `SplayedDatasetProvider::new(dir)` | **Layer 1**：单 dataset provider；`with_scan_parallelism(n)`（单数据集多输出分区）、**`reload()`**（`update_meta` 后刷新）、`statistics()`（num_rows/byte_size/null_count/min/max 上报） |
-| `SplayedTableProvider::new(dir)` | **Layer 2**：分区表（每个子目录一个分区，时间/目录剪裁，schema 合并校验） |
+| `SplayedTableProvider::new(dir)` | **Layer 2**：分区表（基于 `core::partition` 发现/剪裁；每个子目录一个分区，时间/符号/统计剪裁，schema 合并校验） |
 | `register_splayed_table(ctx, name, dir)` / `auto_provider(dir)` | **Layer 3**：自动探测 dataset/分区表并注册 |
 | `SplayedTableFunction` | `read_splayed('dir')` 表函数（`register_udtf`） |
 | `SplayedTableFactory` | `CREATE EXTERNAL TABLE ... STORED AS SPLAYED LOCATION 'dir'` |
@@ -191,6 +194,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | `export_to_arrow_ipc(dir, out.arrow)`（feature "arrow"） | Splayed → Arrow IPC 文件（DuckDB `read_arrow`） |
 | `build_arrow_schema(dataset)` | 导出 schema（time/sym/fields） |
 | `native::scan_to_chunks(dataset, req, n, sink)` | **零 Arrow**：CoreBatch 流直出（扩展层逐批消费，数据/validity 与 DuckDB `Vector` 布局同构） |
+| `native::scan_table_to_chunks(dir, preq, n, sink)` | **零 Arrow 分区表**：走 `core::partition`（与 DataFusion 共用剪裁/合并） |
 | `ffi::splayed_dataset_open/close`、`splayed_scan_open/next/close`、`splayed_scan_dict_value`、`splayed_last_error` | **C ABI**：句柄=裸指针（谁创建谁释放）、扁平列视图（`SplayedColumnFFI{kind, type_id, data, data_len, validity, dict_count}`，SYM 字典串经 dict_value 取回）、错误消息线程本地 |
 
 **产物**：`cargo build -p splayed-duckdb --release --config "lib.crate-type=['cdylib','staticlib']"` → dll/import-lib/static-lib；引擎内扩展由 `splayed-duckdb-extension`（C++ 壳骨架）消费。

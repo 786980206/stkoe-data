@@ -1,13 +1,11 @@
 //! Layer 2 — a partitioned Splayed table as a `TableProvider`.
 //!
-//! The Splayed analogue of a Hive partitioned table: a directory whose direct
-//! children each contain their own `.meta` + FIELD files (one "partition" per
-//! sub-directory, e.g. `2024/`, `2025/`). A directory that directly contains
-//! `.meta` is treated as a single-partition table (backward compatible).
+//! 分区管理（发现 / schema 合并校验 / TIME / 符号 / 分区统计剪裁）在
+//! **`splayed_core::partition`（引擎无关）**——DataFusion / DuckDB 共用同一套
+//! 实现；本层只是把 core 分区层的剪裁结果接回 DataFusion 执行计划。
 
 use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{Field as ArrowField, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef};
@@ -18,7 +16,9 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 
-use splayed_format::META_FILE_NAME;
+use splayed_core::{
+    PartitionScanRequest, PartitionedTable, SymbolSelection, TimeRange,
+};
 
 use crate::dataset::SplayedDatasetProvider;
 use crate::exec::SplayedTableScanExec;
@@ -28,39 +28,43 @@ use crate::filter::{classify, parse_filters};
 #[derive(Debug)]
 pub struct SplayedTableProvider {
     dir: PathBuf,
+    /// core 分区层（引擎无关：发现/校验/剪裁）。
+    table: PartitionedTable,
+    /// 每分区一个 dataset provider（schema / statistics / 执行扫描）。
     partitions: Vec<Arc<SplayedDatasetProvider>>,
     schema: ArrowSchemaRef,
     /// Union of symbol sets across all partitions.
     known_symbols: HashSet<String>,
-    /// Per-partition `[time_min, time_max]` (inclusive) for partition pruning.
-    time_ranges: Vec<(i64, i64)>,
     stats: Option<Statistics>,
 }
 
 impl SplayedTableProvider {
-    /// Auto-detect the layout of `dir`:
+    /// Auto-detect the layout of `dir`（走 `splayed_core::partition`）:
     /// - `dir/.meta` exists → single-partition table (backward compatible);
     /// - otherwise → every child directory containing `.meta` is a partition.
     pub fn new(dir: impl Into<PathBuf>) -> DFResult<Self> {
         let dir = dir.into();
-        let partition_dirs = discover_partitions(&dir)?;
+        let table = PartitionedTable::open(&dir).map_err(|e| {
+            DataFusionError::Execution(format!("SplayedTable open failed: {e}"))
+        })?;
 
-        let mut partitions = Vec::with_capacity(partition_dirs.len());
-        let mut schemas: Vec<ArrowSchema> = Vec::with_capacity(partition_dirs.len());
-        for pd in &partition_dirs {
-            let provider = SplayedDatasetProvider::new(pd)?;
+        let mut partitions = Vec::with_capacity(table.partition_count());
+        let mut schemas: Vec<ArrowSchema> = Vec::with_capacity(table.partition_count());
+        for p in table.partitions() {
+            let provider = SplayedDatasetProvider::new(&p.path)?;
             schemas.push(provider.schema().as_ref().clone());
             partitions.push(Arc::new(provider));
         }
 
-        // Hive-style: all partitions must share the same schema.
+        // Hive-style: all partitions must share the same schema（core 层已校验，
+        // 这里再转一遍 Arrow schema 供执行用）。
         let base = &schemas[0];
         for (i, s) in schemas[1..].iter().enumerate() {
             if !same_schema(base, s) {
                 return Err(DataFusionError::Execution(format!(
-                    "SplayedTable: partition schema mismatch — {} does not match {}",
-                    partition_dirs[i + 1].display(),
-                    partition_dirs[0].display()
+                    "SplayedTable: partition schema mismatch — partition {} does not match {}",
+                    i + 1,
+                    0
                 )));
             }
         }
@@ -70,24 +74,14 @@ impl SplayedTableProvider {
             .iter()
             .flat_map(|p| p.symbols().iter().cloned())
             .collect();
-        let time_ranges = partitions
-            .iter()
-            .map(|p| {
-                let axis = &p.dataset().meta.time_axis;
-                (
-                    axis.first().copied().unwrap_or(i64::MIN),
-                    axis.last().copied().unwrap_or(i64::MAX),
-                )
-            })
-            .collect();
         let stats = aggregate_statistics(&partitions);
 
         Ok(Self {
             dir,
+            table,
             partitions,
             schema,
             known_symbols,
-            time_ranges,
             stats: Some(stats),
         })
     }
@@ -95,6 +89,11 @@ impl SplayedTableProvider {
     /// The individual partition providers.
     pub fn partitions(&self) -> &[Arc<SplayedDatasetProvider>] {
         &self.partitions
+    }
+
+    /// The engine-agnostic partition layer (useful for reload / debugging).
+    pub fn partition_table(&self) -> &PartitionedTable {
+        &self.table
     }
 
     /// Builder: how many output partitions each partition's dataset is split
@@ -110,37 +109,6 @@ impl SplayedTableProvider {
             Arc::make_mut(p).set_scan_parallelism(n);
         }
     }
-}
-
-/// Find the dataset directories that make up this table.
-fn discover_partitions(dir: &Path) -> DFResult<Vec<PathBuf>> {
-    if dir.join(META_FILE_NAME).exists() {
-        // Single dataset folder = single-partition table.
-        return Ok(vec![dir.to_path_buf()]);
-    }
-
-    let mut out: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir)
-        .map_err(|e| DataFusionError::Execution(format!("read_dir {} failed: {e}", dir.display())))?
-    {
-        let entry = entry.map_err(|e| {
-            DataFusionError::Execution(format!("read_dir entry failed: {e}"))
-        })?;
-        let p = entry.path();
-        if p.is_dir() && p.join(META_FILE_NAME).exists() {
-            out.push(p);
-        }
-    }
-
-    if out.is_empty() {
-        return Err(DataFusionError::Execution(format!(
-            "SplayedTable: no partition (directory containing .meta) found under {}",
-            dir.display()
-        )));
-    }
-
-    out.sort();
-    Ok(out)
 }
 
 fn same_schema(a: &ArrowSchema, b: &ArrowSchema) -> bool {
@@ -249,20 +217,27 @@ impl TableProvider for SplayedTableProvider {
             .collect();
         let output_schema = Arc::new(ArrowSchema::new(fields));
 
-        // Partition pruning: skip partitions whose time range cannot overlap.
+        // 分区剪裁（core 层：TIME → 符号 → 分区统计）→ 只执行命中的分区。
         let pd = parse_filters(filters, &self.schema, &self.known_symbols);
-        let time_range = pd.time_range;
+        let preq = PartitionScanRequest {
+            columns: Vec::new(),
+            symbols: SymbolSelection::All, // 符号级剪裁仍由 dataset 扫描处理
+            time_range: pd.time_range.unwrap_or_else(TimeRange::all),
+            filters: pd.value_filters.clone(),
+            batch_size: 65536,
+            parallelism: 1,
+        };
+        let pplan = self.table.plan(&preq).map_err(|e| {
+            DataFusionError::Execution(format!("SplayedTable plan failed: {e}"))
+        })?;
 
-        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(self.partitions.len());
-        for (i, part) in self.partitions.iter().enumerate() {
-            if let Some(tr) = &time_range {
-                let (pmin, pmax) = self.time_ranges[i];
-                // Half-open [start, end) overlap check.
-                if tr.end <= pmin || tr.start >= pmax {
-                    continue; // pruned
-                }
-            }
-            plans.push(part.scan(state, projection, filters, limit).await?);
+        let mut plans: Vec<Arc<dyn ExecutionPlan>> = Vec::with_capacity(pplan.tasks.len());
+        for task in &pplan.tasks {
+            plans.push(
+                self.partitions[task.partition]
+                    .scan(state, projection, filters, limit)
+                    .await?,
+            );
         }
 
         if plans.is_empty() {

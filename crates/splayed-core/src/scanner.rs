@@ -1320,7 +1320,8 @@ fn truncate_batch(
 /// 用列统计 `[min, max]`（已排除 NULL 哨兵）判断 filter 是否可能命中。
 ///
 /// 边界语义直接复用行级 `filter_passes`：对降序/升序极值做保守判定。
-fn matches_range(filter: &Filter, min_v: &RawValue, max_v: &RawValue) -> bool {
+/// `pub(crate)`：分区层（`partition.rs`）用它做「分区级统计剪裁」。
+pub(crate) fn matches_range(filter: &Filter, min_v: &RawValue, max_v: &RawValue) -> bool {
     match filter {
         Filter::GreaterThan { .. } | Filter::GreaterOrEqual { .. } => {
             filter_passes(filter, max_v)

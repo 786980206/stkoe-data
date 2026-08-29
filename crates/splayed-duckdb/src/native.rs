@@ -29,7 +29,10 @@
 
 use std::sync::Arc;
 
-use splayed_core::{CoreBatch, Dataset, ScanRequest, Scanner, scan_owned_parallel};
+use splayed_core::{
+    CoreBatch, Dataset, PartitionScanRequest, PartitionedTable, ScanRequest, Scanner,
+    scan_owned_parallel,
+};
 
 /// 原生扫描错误。
 #[derive(Debug)]
@@ -66,6 +69,41 @@ where
         .plan(request)
         .map_err(|e| NativeError::Scan(e.to_string()))?;
     let mut stream = scan_owned_parallel(dataset, &plan, request, parallelism)
+        .map_err(|e| NativeError::Scan(e.to_string()))?;
+
+    let mut total = 0usize;
+    while let Some(batch) = stream
+        .next_batch()
+        .map_err(|e| NativeError::Scan(e.to_string()))?
+    {
+        total += batch.num_rows();
+        sink(batch);
+    }
+    Ok(total)
+}
+
+/// 分区表原生扫描（零 Arrow）：走 `splayed_core::partition`（发现/剪裁/流式
+/// 合并——与 DataFusion 共用同一套实现），把每个分区产出的 `CoreBatch`
+/// 逐批交给 `sink`（按分区名升序）。
+///
+/// 返回产出的总行数。
+pub fn scan_table_to_chunks<F>(
+    dir: impl AsRef<std::path::Path>,
+    request: &PartitionScanRequest,
+    parallelism: usize,
+    mut sink: F,
+) -> Result<usize, NativeError>
+where
+    F: FnMut(CoreBatch),
+{
+    let table = PartitionedTable::open(dir).map_err(|e| NativeError::Scan(e.to_string()))?;
+    let mut preq = request.clone();
+    preq.parallelism = parallelism.max(1);
+    let plan = table
+        .plan(&preq)
+        .map_err(|e| NativeError::Scan(e.to_string()))?;
+    let mut stream = table
+        .scan(&plan, &preq)
         .map_err(|e| NativeError::Scan(e.to_string()))?;
 
     let mut total = 0usize;

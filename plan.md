@@ -1030,6 +1030,25 @@ Layer 1   SplayedDatasetProvider 单个 dataset 目录（对标一个 parquet �
 （`UnknownPartitioning(plans.len())`，每个物理分区 = 一个输出分区）。
 没有命中分区时返回 `EmptyExec`（如 `COUNT(*)` → 0）。
 
+### Layer 2 分区管理在 core（引擎无关，DataFusion / DuckDB 共用）
+
+分区管理**下沉到 `splayed-core::partition`**（`SplayedTableProvider` 不再自带
+`discover_partitions`）：
+
+```rust
+PartitionedTable::open(dir)              // dir/.meta 存在→单分区(".")；否则子目录含 .meta 者为分区（按名升序）
+PartitionSchema { time_type, fields }    // 合并校验：字段名+类型一致、time_type 一致；符号并集
+plan(&PartitionScanRequest)              // 三层剪裁：
+  //  TIME：分区 meta time_axis 与半开区间 [start,end) 相交性
+  //  符号：Symbols 选择剔除分区不存在的符号；一个都不存在→跳过分区
+  //  统计：值 filter 与分区字段 footer [min,max] 不相交 → 跳过分区（整分区文件级跳过）
+scan(&plan, &req) -> PartitionScanBatches// 按分区名升序流式合并 CoreBatch
+```
+
+- DataFusion：`SplayedTableProvider::scan` 用 core 分区计划的 tasks 选分区执行；
+- DuckDB：`splayed_duckdb::native::scan_table_to_chunks` 走同一实现；
+- Polars/其它引擎可直接调用 `PartitionedTable`（core 依赖即可）。
+
 并行能力：
 
 - **core**：`scan_all_parallel`（按 `ScanRequest.parallelism` 分块 + 线程）与

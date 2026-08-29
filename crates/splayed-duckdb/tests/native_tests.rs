@@ -39,6 +39,44 @@ fn make_batch() -> RecordBatch {
 }
 
 #[test]
+fn scan_table_to_chunks_merges_partitions() {
+    use splayed_core::PartitionScanRequest;
+    use splayed_duckdb::native::scan_table_to_chunks;
+
+    let root = std::env::temp_dir().join(format!("splayed_duck_tbl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    create_table(&root.join("2024"), &make_batch(), true).unwrap();
+    create_table(&root.join("2025"), &make_batch(), true).unwrap();
+
+    let mut values = Vec::new();
+    let total = scan_table_to_chunks(
+        &root,
+        &PartitionScanRequest {
+            columns: vec!["close".to_string()],
+            ..Default::default()
+        },
+        2,
+        |cb| {
+            let data = cb.column(2).data();
+            for i in 0..cb.num_rows() {
+                values.push(f64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap()));
+            }
+        },
+    )
+    .unwrap();
+
+    // 两个分区 × 6 行（make_batch = 2 sym × 3 time）；按分区名升序（2024 → 2025）。
+    assert_eq!(total, 12);
+    assert_eq!(values.len(), 12);
+    assert_eq!(&values[..3], &[100.0, 101.0, 102.0]);
+    assert_eq!(&values[3..6], &[200.0, 201.0, 202.0]);
+    assert_eq!(&values[6..9], &[100.0, 101.0, 102.0]);
+    assert_eq!(&values[9..], &[200.0, 201.0, 202.0]);
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn scan_to_chunks_feeds_corebatches() {
     let dir = temp_dir("chunks");
     create_table(&dir, &make_batch(), true).unwrap();

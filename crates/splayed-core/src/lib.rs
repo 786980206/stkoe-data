@@ -11,6 +11,7 @@ pub mod batch;
 pub mod column_view;
 pub mod dataset;
 pub mod field_writer;
+pub mod partition;
 pub mod reader;
 pub mod scanner;
 pub mod simd_filter;
@@ -31,6 +32,10 @@ pub use scanner::{
     Filter, FilterValue, OwnedScanBatches, ParallelScanBatches, ScanBatches, ScanPlan,
     ScanRequest, Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,
     scan_owned_parallel, split_ranges,
+};
+pub use partition::{
+    Partition, PartitionError, PartitionPlan, PartitionScanBatches, PartitionScanRequest,
+    PartitionSchema, PartitionTask, PartitionedTable,
 };
 pub use table_writer::{
     TableColumn, TableError, create_meta, create_table, update_meta, update_table,

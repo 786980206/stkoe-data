@@ -110,3 +110,4 @@ cargo test         # all tests must pass
 - 适配层组件化（umbrella）/ DuckDB C ABI / Polars AnonymousScan：**Complete**。
 - FIELD 统计 footer（min/max，§5.2.2）+ 扫描期剪裁 + ScanRequest.limit：**Complete**。
 - core `update_meta`（布局重排 + 并发字段重散布 + generation 原子提交）+ DataFusion reload / ADBC refresh 联动：**Complete**。
+- 分区管理下沉 core（`splayed-core::partition`：发现/schema 合并/三层剪裁/流式合并），DataFusion 与 DuckDB 共用：**Complete**。
