@@ -6,10 +6,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use splayed_format::field_footer::{
-    FOOTER_MAGIC, FOOTER_SIZE, compute_stats, encode_footer,
-};
-use splayed_format::{fill_null, DataType, FieldHeader, HEADER_SIZE, META_FILE_NAME};
+use splayed_format::field_footer::{FOOTER_SIZE, compute_stats, encode_footer, parse_footer};
+use splayed_format::{fill_null, DataType, FieldHeader, RawValue, HEADER_SIZE, META_FILE_NAME};
 
 /// One update entry: write `values` starting at absolute row `start_row`.
 #[derive(Debug, Clone)]
@@ -103,7 +101,12 @@ pub fn create_field_with_data(
         });
     }
 
-    let header = splayed_format::new_plain_field_header(data_type, meta.header.generation, total_rows);
+    let mut header = splayed_format::new_plain_field_header(data_type, meta.header.generation, total_rows);
+    // 真实 NULL 计数（区别于预分配占位语义；update_field 增量维护以此为基线）。
+    header.null_count = values
+        .chunks(elem_sz)
+        .filter(|c| *c == data_type.null_bytes())
+        .count() as u32;
 
     let mut file = File::create(field_path).map_err(CreateFieldError::Io)?;
 
@@ -174,6 +177,17 @@ pub fn update_field(
         }
     }
 
+    // 写前快照被覆盖行段的旧值（统计维护需要「覆盖前」的值判断 null/极值）。
+    let mut old_spans: Vec<(u32, Vec<u8>)> = Vec::with_capacity(items.len());
+    for item in items {
+        let offset = splayed_format::row_byte_offset(data_type, item.start_row);
+        let mut old = vec![0u8; item.values.len()];
+        file.seek(SeekFrom::Start(offset))
+            .map_err(UpdateError::Io)?;
+        file.read_exact(&mut old).map_err(UpdateError::Io)?;
+        old_spans.push((item.start_row, old));
+    }
+
     // Write each item.
     for item in items {
         let offset = splayed_format::row_byte_offset(data_type, item.start_row);
@@ -183,31 +197,136 @@ pub fn update_field(
             .map_err(UpdateError::Io)?;
     }
 
-    // Bump generation.
+    // Bump generation（header 末尾统一重写，含 null_count 增量）。
     let new_gen = header.generation.wrapping_add(1);
     let mut new_header = *header;
     new_header.generation = new_gen;
+
+    // -- 统计维护（增量，O(k)；命中旧极值才全列重扫）----------------------------
+    // 读取待写入行段的旧值（null 增量 + 极值命中检测）。
+    let mut null_delta: i64 = 0;
+    let mut batch_min: Option<[u8; 8]> = None; // 写入批次（非 NULL）极值槽
+    let mut batch_max: Option<[u8; 8]> = None;
+    let mut extreme_touched = false;
+
+    let file_len = file.metadata().map_err(UpdateError::Io)?.len();
+    let footer_old = if file_len >= (HEADER_SIZE + FOOTER_SIZE) as u64 {
+        let mut tail = [0u8; FOOTER_SIZE];
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
+            .map_err(UpdateError::Io)?;
+        file.read_exact(&mut tail).map_err(UpdateError::Io)?;
+        parse_footer(&tail)
+    } else {
+        None
+    };
+    let old_valid = footer_old.map(|(v, _, _)| v).unwrap_or(false);
+    let (old_min, old_max) = footer_old
+        .map(|(_, mn, mx)| (mn, mx))
+        .unwrap_or(([0u8; 8], [0u8; 8]));
+
+    for (item, (_, old_bytes)) in items.iter().zip(old_spans.iter()) {
+        let n_values = (item.values.len() / elem_sz) as u32;
+
+        let nulls = data_type.null_bytes();
+        for i in 0..n_values as usize {
+            let old = &old_bytes[i * elem_sz..(i + 1) * elem_sz];
+            let new = &item.values[i * elem_sz..(i + 1) * elem_sz];
+            let old_null = old == nulls;
+            let new_null = new == nulls;
+            if old_null != new_null {
+                null_delta += if new_null { 1 } else { -1 };
+            }
+            if old_valid && !old_null
+                && (old == &old_min[..elem_sz] || old == &old_max[..elem_sz])
+            {
+                extreme_touched = true;
+            }
+            if !new_null {
+                let mut slot = [0u8; 8];
+                slot[..elem_sz].copy_from_slice(new);
+                batch_min = Some(match batch_min {
+                    Some(m) if slot_cmp(data_type, &m, &slot) == std::cmp::Ordering::Less => m,
+                    _ => slot,
+                });
+                batch_max = Some(match batch_max {
+                    Some(m) if slot_cmp(data_type, &m, &slot) == std::cmp::Ordering::Greater => m,
+                    _ => slot,
+                });
+            }
+        }
+    }
+
+    // header null_count 精确维护（增量）。
+    let new_null_count = (header.null_count as i64 + null_delta).max(0) as u32;
+    new_header.null_count = new_null_count;
+
+    // footer：命中旧极值 → 全列重扫精确重算；否则 O(1) 保守上界。
+    if old_valid {
+        let stats_opt = if extreme_touched {
+            // 覆盖了旧极值所在行：精确重算（写一次读多次，罕见路径）。
+            let data_len = header.data_length as usize;
+            let mut all = vec![0u8; data_len];
+            file.seek(SeekFrom::Start(HEADER_SIZE as u64))
+                .map_err(UpdateError::Io)?;
+            file.read_exact(&mut all).map_err(UpdateError::Io)?;
+            splayed_format::field_footer::compute_stats(data_type, &all)
+        } else {
+            // 保守上界：新区间 ⊇ 真实区间（永远安全）。
+            let mut mn = old_min;
+            let mut mx = old_max;
+            if let Some(b) = batch_min {
+                if slot_cmp(data_type, &b, &mn) == std::cmp::Ordering::Less {
+                    mn = b;
+                }
+            }
+            if let Some(b) = batch_max {
+                if slot_cmp(data_type, &b, &mx) == std::cmp::Ordering::Greater {
+                    mx = b;
+                }
+            }
+            Some((mn, mx))
+        };
+        let footer = splayed_format::field_footer::encode_footer(stats_opt);
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
+            .map_err(UpdateError::Io)?;
+        file.write_all(&footer).map_err(UpdateError::Io)?;
+    } else {
+        // 无有效 footer（从未建立或已失效）：保持无统计（归档时重算）。
+        let _ = (old_min, old_max);
+    }
+
+    // 先重写 header（generation + null_count）。
     file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
     file.write_all(bytemuck::bytes_of(&new_header))
         .map_err(UpdateError::Io)?;
 
-    // 原地写后统计失效：若存在 footer，把 magic 归零（不改变文件大小）。
-    let file_len = file.metadata().map_err(UpdateError::Io)?.len();
-    if file_len >= (HEADER_SIZE + FOOTER_SIZE) as u64 {
-        let mut tail_magic = [0u8; 4];
-        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
-            .map_err(UpdateError::Io)?;
-        file.read_exact(&mut tail_magic).map_err(UpdateError::Io)?;
-        if u32::from_le_bytes(tail_magic) == FOOTER_MAGIC {
-            file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
-                .map_err(UpdateError::Io)?;
-            file.write_all(&0u32.to_le_bytes())
-                .map_err(UpdateError::Io)?;
-        }
-    }
-
     file.sync_all().map_err(UpdateError::Io)?;
     Ok(())
+}
+
+/// 槽值数值比较（小端；按类型语义：有符号/无符号/浮点/BOOL）。
+fn slot_cmp(data_type: DataType, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use splayed_format::DataType;
+    let av = RawValue::read_le(a, 0, data_type);
+    let bv = RawValue::read_le(b, 0, data_type);
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::TimestampUs => av.as_i64().cmp(&bv.as_i64()),
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+            av.as_u64().cmp(&bv.as_u64())
+        }
+        DataType::Float32 | DataType::Float64 => {
+            av.as_f64()
+                .partial_cmp(&bv.as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }
+        DataType::Bool => av.as_bool().cmp(&bv.as_bool()),
+    }
 }
 
 /// Delete a FIELD file.  No-op if it doesn't exist.

@@ -282,17 +282,22 @@ update_info = [start_row, values[]]
 
 - **min/max 计算跳过 NULL 哨兵**（浮点 canonical NaN、INT_MIN、无符号全 1）；
   全 NULL 列 flags=0（或无 footer）。`FieldReader::stats() -> Option<FieldStats>`。
-- **写入时机**：`create_field_with_data`（含 `create_table`）写值后追加；
-  `compact_field` 按原始数据**重算**（compacted 只读，统计永久有效）；
-  `update_field` 原地写后把 magic 归零使统计失效（不改变文件大小）。
+- **写入时机**：`create_field_with_data`（含 `create_table`）写值后追加并写**真实 `null_count`**；
+  `compact_field` 按原始数据**重算**（compacted 只读，统计永久有效）。
+- **`update_field` 增量维护（O(k)，不失效）**：
+  写前快照被覆盖行段旧值 → `null_count` 精确增量（header，写回）；min/max =
+  `min(旧 min, 写入批次 min)` / `max(旧 max, 写入批次 max)`（**保守上界**，
+  永远安全）；仅当被覆盖行**命中旧极值**才全列重扫精确重算（罕见路径）。
+  无有效 footer（从未建立/已失效）时保持无统计（归档时重算）。
 - **读侧**：`field_length` 仍指纯数据字节；读取按末尾 magic 检测 footer，
   数据区按 `[header, data)` 界定（压缩文件同理，payload 排除 footer）。
 - **消费**：`Scanner::plan` 用 filter 列的 min/max 做**整数据集剪裁**——任一
   filter 与统计不相交（如 `close > 204` 而 max=204）→ 空计划，任何 FIELD
   都不读；DataFusion `statistics()` 对 FIELD 列上报 min/max（`Precision::Exact`）
   与 TIME 列的 `[time_axis[0], time_axis[-1]]`。
-- **注意**：header 的 `null_count` 是「预分配全 NULL」语义（见 §5.2.1），写
-  路径不维护，**不可用于剪裁判断**（IsNull/IsNotNull 交给行级过滤保证）。
+- **注意**：header `null_count` 自 `create_field_with_data`/`update_field` 起为
+  **真实值**（精确增量维护），预分配占位语义仅剩 `create_field`（全 NULL）；
+  `IsNull/IsNotNull` 剪裁仍交由行级过滤保证。
 
 ### 5.2.3 读取期限值（LIMIT 下推）
 

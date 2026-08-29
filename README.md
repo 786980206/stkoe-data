@@ -74,7 +74,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | | `stats() -> Option<FieldStats>` | footer min/max（无 footer/失效 → None） |
 | 字段写入 | `create_field(path, dt)` | 预分配全 NULL 字段 |
 | | `create_field_with_data(path, dt, values)` | 建字段 + 一次写值 + 统计 footer |
-| | `update_field(path, &[UpdateItem])` | 原地写；成功后 footer 失效 |
+| | `update_field(path, &[UpdateItem])` | 原地写；**统计增量维护**：null_count 精确、min/max 保守上界（O(k)；命中旧极值才重扫） |
 | | `delete_field(path)` | 删除字段（幂等） |
 | 表写入（原生） | `create_meta(dir, time_type, sym, time)` | 仅建 `.meta` |
 | | `create_table(dir, time_type, sym, time, columns, sorted)` | 一步建表（`sorted=true` 走 O(n) 快路径） |

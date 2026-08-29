@@ -113,13 +113,67 @@ fn footer_stats_roundtrip_and_invalidation() {
     assert_eq!(i64::from_le_bytes(st.min), 1);
     assert_eq!(i64::from_le_bytes(st.max), 5);
 
-    // update 后统计失效（magic 归零）。
+    // update：增量维护，不再是「失效」。row0 旧值 100 = 旧 min → 命中极值 →
+    // 全列重扫精确重算：min=101（次小），max=420（新写入）。
     let mut items = Vec::new();
     let mut vals = vec![0u8; 8];
     RawValue::from_f64(420.0).write_le(&mut vals, 0);
     items.push(UpdateItem::new(0, vals.clone()));
-    let _ = update_field(dir.join("close"), &items);
-    assert!(FieldReader::open(dir.join("close")).unwrap().stats().is_none());
+    update_field(dir.join("close"), &items).unwrap();
+    let st = FieldReader::open(dir.join("close")).unwrap().stats().expect("maintained");
+    assert_eq!(f64::from_le_bytes(st.min), 101.0);
+    assert_eq!(f64::from_le_bytes(st.max), 420.0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn update_field_incremental_stats_and_null_count() {
+    // vol 数据：[1, NULL, 3, 4, 5, 6]？——build_dataset 的 vol = [Some(1),...]
+    // 仅用 close 与 vol 无需重读；直接验证：
+    // 1) 不命中极值的更新 → min/max 保守上界不变（O(k) 路径）；
+    // 2) null_count 精确增量（写 NULL / 写回值）。
+    let dir = temp_dir("incr");
+    build_dataset(&dir);
+
+    // close 原 min=100 max=204。把 row 5（值 105）改为 106 —— 不触极值。
+    let mut items = Vec::new();
+    let mut vals = vec![0u8; 8];
+    RawValue::from_f64(106.0).write_le(&mut vals, 0);
+    items.push(UpdateItem::new(5, vals.clone()));
+    update_field(dir.join("close"), &items).unwrap();
+    let st = FieldReader::open(dir.join("close")).unwrap().stats().unwrap();
+    assert_eq!(f64::from_le_bytes(st.min), 100.0); // 未触极值 → 原样
+    assert_eq!(f64::from_le_bytes(st.max), 204.0);
+    assert_eq!(FieldReader::open(dir.join("close")).unwrap().header().null_count, 0);
+
+    // 覆盖唯一 max 行（row 9 = 204 → 10）→ 命中极值 → 精确收缩 max=203。
+    let mut items2 = Vec::new();
+    RawValue::from_f64(10.0).write_le(&mut vals, 0);
+    items2.push(UpdateItem::new(9, vals.clone()));
+    update_field(dir.join("close"), &items2).unwrap();
+    let st = FieldReader::open(dir.join("close")).unwrap().stats().unwrap();
+    assert_eq!(f64::from_le_bytes(st.max), 203.0);
+
+    // null_count 精确增量：vol 基底 null_count=1（SYM01 首行起 5 个值里…见
+    // build_dataset：前 5 个值 [1,1,1,1,1] 后 5 个 [None,2,3,4,5] → 1 个 NULL）。
+    let nulls = ST::Int64.null_bytes();
+    let mut items3 = Vec::new();
+    items3.push(UpdateItem::new(0, nulls.to_vec()));
+    update_field(dir.join("vol"), &items3).unwrap();
+    let vr = FieldReader::open(dir.join("vol")).unwrap();
+    assert_eq!(vr.header().null_count, 2); // 值 1 → NULL +1
+
+    // 写回值（row0 NULL → 7）→ null_count 归 1；max 扩展 5→7（不触旧极值，上界）。
+    let mut items4 = Vec::new();
+    let mut vals4 = vec![0u8; 8];
+    RawValue::from_i64(7).write_le(&mut vals4, 0);
+    items4.push(UpdateItem::new(0, vals4));
+    update_field(dir.join("vol"), &items4).unwrap();
+    let vr = FieldReader::open(dir.join("vol")).unwrap();
+    assert_eq!(vr.header().null_count, 1);
+    let st = vr.stats().unwrap();
+    assert_eq!(i64::from_le_bytes(st.max), 7);
 
     std::fs::remove_dir_all(&dir).ok();
 }
