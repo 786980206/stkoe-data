@@ -189,9 +189,17 @@ fn compute_statistics(
 
 fn fixed_width_bytes(ty: &ArrowDataType) -> Option<usize> {
     match ty {
-        ArrowDataType::Boolean => Some(1),
-        ArrowDataType::Int32 | ArrowDataType::Float32 | ArrowDataType::Date32 => Some(4),
-        ArrowDataType::Int64 | ArrowDataType::Float64 | ArrowDataType::Timestamp(_, _) => Some(8),
+        ArrowDataType::Boolean | ArrowDataType::Int8 | ArrowDataType::UInt8 => Some(1),
+        ArrowDataType::Int16 | ArrowDataType::UInt16 => Some(2),
+        ArrowDataType::Int32
+        | ArrowDataType::UInt32
+        | ArrowDataType::Float32
+        | ArrowDataType::Date32 => Some(4),
+        ArrowDataType::Int64
+        | ArrowDataType::UInt64
+        | ArrowDataType::Float64
+        | ArrowDataType::Timestamp(_, _)
+        | ArrowDataType::Date64 => Some(8),
         _ => None,
     }
 }

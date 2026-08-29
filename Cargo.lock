@@ -2623,6 +2623,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
+name = "splayed"
+version = "0.1.0"
+dependencies = [
+ "splayed-adbc",
+ "splayed-arrow",
+ "splayed-codec",
+ "splayed-core",
+ "splayed-datafusion",
+ "splayed-duckdb",
+ "splayed-format",
+]
+
+[[package]]
+name = "splayed-adbc"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-array",
+ "arrow-schema",
+ "splayed-arrow",
+ "splayed-core",
+ "splayed-format",
+]
+
+[[package]]
 name = "splayed-arrow"
 version = "0.1.0"
 dependencies = [

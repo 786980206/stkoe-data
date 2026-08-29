@@ -5,8 +5,10 @@ members = [
     "crates/splayed-codec",
     "crates/splayed-core",
     "crates/splayed-arrow",
+    "crates/splayed-adbc",
     "crates/splayed-datafusion",
     "crates/splayed-duckdb",
+    "crates/splayed",
     "crates/splayed-cli",
 ]
 
@@ -21,6 +23,7 @@ splayed-format = { path = "crates/splayed-format" }
 splayed-codec = { path = "crates/splayed-codec" }
 splayed-core = { path = "crates/splayed-core" }
 splayed-arrow = { path = "crates/splayed-arrow" }
+splayed-adbc = { path = "crates/splayed-adbc" }
 splayed-datafusion = { path = "crates/splayed-datafusion" }
 splayed-duckdb = { path = "crates/splayed-duckdb" }
 

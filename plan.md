@@ -1001,7 +1001,38 @@ time_axis 均升序，range 依 SYM INDEX 顺序生成）。因此 Layer 1 在
 重点支持：Projection Pushdown、Predicate Pushdown、SYM pruning、TIME pruning、
 Batch scan、LIMIT。
 
-未来（暂缓）：零拷贝 Arrow 转换、`INSERT INTO` 写回（`update_table`）。
+未来（暂缓）：`INSERT INTO` 写回（`update_table`）。
+
+## 10.3b 适配层组件化（三个逻辑可选组件）
+
+对外数据引擎通过**三个逻辑可选适配组件**接入，共享 `splayed-core`（Scanner /
+CoreBatch / Filter）与 `splayed-arrow::corebatch_into_record_batch`（零拷贝
+转换）做统一底座：
+
+```text
+splayed（umbrella，cargo features 开关）
+  ├─ core / format / codec / arrow       恒有（引擎无关）
+  └─ 适配组件（可选）
+     ├─ adbc        splayed-adbc       ADBC 风格统一连接组件（引擎无关）
+     ├─ datafusion  splayed-datafusion DataFusion TableProvider 三层对接
+     └─ duckdb      splayed-duckdb     DuckDB Arrow IPC 桥
+```
+
+- **`splayed-adbc`**：`Connection::open` → `Statement`（select/select_all/
+  filter/symbols/time_range/limit/batch_size/parallelism）→ `CoreBatchStream`
+  （引擎无关）或 `ArrowStream`（零拷贝 RecordBatch，同步迭代）；不依赖
+  DataFusion/DuckDB/async。SQL 解析与 ADBC C ABI（`adbc.h`）FFI 可在此接口
+  上加薄层实现。
+- 新引擎（Velox / Flink 等）：在 umbrella 增一个 feature + 一个适配 crate，
+  用新增的数据格式转换到 CoreBatch 即可（写路径复用 §8.4 原生接口）。
+
+依赖矩阵：
+
+| 组件 | 依赖 | 说明 |
+| --- | --- | --- |
+| splayed-adbc | core + arrow | 纯读取连接组件 |
+| splayed-datafusion | core + arrow + datafusion | 查询引擎适配 |
+| splayed-duckdb | core + arrow + arrow-ipc | 导出桥接 |
 
 ## 10.4 DuckDB 集成
 

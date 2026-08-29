@@ -104,11 +104,18 @@ pub enum Filter {
 #[derive(Debug, Clone)]
 pub enum FilterValue {
     Bool(bool),
+    Int8(i8),
+    Int16(i16),
     Int32(i32),
     Int64(i64),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
     Float32(f32),
     Float64(f64),
     Date32(i32),
+    Date64(i64),
     TimestampUs(i64),
 }
 
@@ -1221,10 +1228,16 @@ fn compare(val: &splayed_format::RawValue, fv: &FilterValue) -> Option<i8> {
             let v = val.as_bool()?;
             Some(if v == *b { 0 } else if !v { -1 } else { 1 })
         }
+        (DataType::Int8, FilterValue::Int8(i)) => Some(val.as_i8()?.cmp(i) as i8),
+        (DataType::Int16, FilterValue::Int16(i)) => Some(val.as_i16()?.cmp(i) as i8),
         (DataType::Int32, FilterValue::Int32(i)) => Some(val.as_i32()?.cmp(i) as i8),
         (DataType::Int32, FilterValue::Int64(i)) => Some((val.as_i32()? as i64).cmp(i) as i8),
         (DataType::Int64, FilterValue::Int64(i)) => Some(val.as_i64()?.cmp(i) as i8),
         (DataType::Int64, FilterValue::Int32(i)) => Some(val.as_i64()?.cmp(&(*i as i64)) as i8),
+        (DataType::UInt8, FilterValue::UInt8(i)) => Some(val.as_u8()?.cmp(i) as i8),
+        (DataType::UInt16, FilterValue::UInt16(i)) => Some(val.as_u16()?.cmp(i) as i8),
+        (DataType::UInt32, FilterValue::UInt32(i)) => Some(val.as_u32()?.cmp(i) as i8),
+        (DataType::UInt64, FilterValue::UInt64(i)) => Some(val.as_u64()?.cmp(i) as i8),
         (DataType::Float32, FilterValue::Float32(f)) => {
             let v = val.as_f32()?;
             Some(if v > *f { 1 } else if v < *f { -1 } else { 0 })
@@ -1234,6 +1247,7 @@ fn compare(val: &splayed_format::RawValue, fv: &FilterValue) -> Option<i8> {
             Some(if v > *f { 1 } else if v < *f { -1 } else { 0 })
         }
         (DataType::Date32, FilterValue::Date32(d)) => Some(val.as_i32()?.cmp(d) as i8),
+        (DataType::Date64, FilterValue::Date64(d)) => Some(val.as_date64()?.cmp(d) as i8),
         (DataType::TimestampUs, FilterValue::TimestampUs(t)) => {
             Some(val.as_i64()?.cmp(t) as i8)
         }

@@ -1,0 +1,18 @@
+[package]
+name = "splayed-adbc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ADBC 风格的引擎无关 Splayed 连接组件（Connection / Statement / Arrow 流）"
+
+[dependencies]
+splayed-format.workspace = true
+splayed-core.workspace = true
+splayed-arrow.workspace = true
+arrow.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+
+[dev-dependencies]
+splayed-arrow.workspace = true

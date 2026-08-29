@@ -1,0 +1,23 @@
+[package]
+name = "splayed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Splayed umbrella: 引擎无关核心 + 三个可选适配组件（adbc / datafusion / duckdb）"
+
+[dependencies]
+splayed-format.workspace = true
+splayed-codec.workspace = true
+splayed-core.workspace = true
+splayed-arrow.workspace = true
+splayed-adbc = { workspace = true, optional = true }
+splayed-datafusion = { workspace = true, optional = true }
+splayed-duckdb = { workspace = true, optional = true }
+
+[features]
+default = []
+# 三个逻辑可选适配组件：按引擎开启。
+adbc = ["dep:splayed-adbc"]
+datafusion = ["dep:splayed-datafusion"]
+duckdb = ["dep:splayed-duckdb"]

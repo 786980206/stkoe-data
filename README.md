@@ -52,12 +52,26 @@ Designed for **extremely low I/O, O(1) row location, mmap/zero-copy reads, and h
 splayed/
 ├── splayed-format/      # Binary format: META + FIELD headers, types, NULL encoding (no deps)
 ├── splayed-codec/       # Encoding (PLAIN) + compression (NONE/ZSTD/LZ4)
-├── splayed-core/        # Reader (mmap), field writer, dataset, scanner (no Arrow)
-├── splayed-arrow/       # Arrow exchange: create_meta, create_table, update_table, ColumnView→Arrow
-└── splayed-datafusion/  # DataFusion TableProvider: SQL queries with pushdown
+├── splayed-core/        # Reader (mmap), field writer, dataset, scanner, CoreBatch (no Arrow)
+├── splayed-arrow/       # Arrow exchange: create_meta/table/update_table + CoreBatch→Arrow 零拷贝
+├── splayed-adbc/        # [可选] ADBC 风格引擎无关连接组件（Connection/Statement/Arrow 流）
+├── splayed-datafusion/  # [可选] DataFusion TableProvider: SQL queries with pushdown
+├── splayed-duckdb/      # [可选] DuckDB Arrow IPC 桥
+├── splayed/             # [可选] umbrella：核心恒有 + 上述三组件用 features 开关
+└── splayed-cli/         # CLI
 ```
 
-Dependency direction: `format ← codec ← core → arrow → datafusion`
+三个适配组件是**逻辑可选**的 — umbrella crate 按引擎开关：
+
+```toml
+[dependencies]
+splayed = { path = "crates/splayed", features = ["adbc", "datafusion", "duckdb"] }
+```
+
+新引擎（Velox / Flink 等）只需新增一个 feature + 一个适配 crate，把引擎数据
+格式转换到 `CoreBatch` 即可。
+
+Dependency direction: `format ← codec ← core → arrow → {adbc, datafusion, duckdb}`
 
 ---
 

@@ -365,12 +365,20 @@ fn build_value_filter(
 fn scalar_to_filter_value(scalar: &ScalarValue, splayed_ty: SplayedDataType) -> Option<FilterValue> {
     match (splayed_ty, scalar) {
         (SplayedDataType::Bool, ScalarValue::Boolean(Some(v))) => Some(FilterValue::Bool(*v)),
+        (SplayedDataType::Int8, ScalarValue::Int8(Some(v))) => Some(FilterValue::Int8(*v)),
+        (SplayedDataType::Int16, ScalarValue::Int16(Some(v))) => Some(FilterValue::Int16(*v)),
         (SplayedDataType::Int32, ScalarValue::Int32(Some(v))) => Some(FilterValue::Int32(*v)),
         (SplayedDataType::Int64, ScalarValue::Int64(Some(v))) => Some(FilterValue::Int64(*v)),
+        (SplayedDataType::UInt8, ScalarValue::UInt8(Some(v))) => Some(FilterValue::UInt8(*v)),
+        (SplayedDataType::UInt16, ScalarValue::UInt16(Some(v))) => Some(FilterValue::UInt16(*v)),
+        (SplayedDataType::UInt32, ScalarValue::UInt32(Some(v))) => Some(FilterValue::UInt32(*v)),
+        (SplayedDataType::UInt64, ScalarValue::UInt64(Some(v))) => Some(FilterValue::UInt64(*v)),
         (SplayedDataType::Float32, ScalarValue::Float32(Some(v))) => Some(FilterValue::Float32(*v)),
         (SplayedDataType::Float64, ScalarValue::Float64(Some(v))) => Some(FilterValue::Float64(*v)),
         (SplayedDataType::Date32, ScalarValue::Int32(Some(v))) => Some(FilterValue::Date32(*v)),
         (SplayedDataType::Date32, ScalarValue::Date32(Some(v))) => Some(FilterValue::Date32(*v)),
+        (SplayedDataType::Date64, ScalarValue::Int64(Some(v))) => Some(FilterValue::Date64(*v)),
+        (SplayedDataType::Date64, ScalarValue::Date64(Some(v))) => Some(FilterValue::Date64(*v)),
         (SplayedDataType::TimestampUs, ScalarValue::Int64(Some(v))) => {
             Some(FilterValue::TimestampUs(*v))
         }
@@ -611,5 +619,60 @@ mod tests {
             Box::new(lit(100i32)),
         ));
         assert!(matches!(analyze(&f, &s, &known()), Analysis::NotPushdownable));
+    }
+
+    /// Extended fixed-width types (Phase 2) map to FilterValue correctly.
+    #[test]
+    fn extended_types_value_filters_pushable() {
+        let s = ArrowSchema::new(vec![
+            F::new("time", A::Date32, false),
+            F::new("sym", A::Utf8, false),
+            F::new("i16", A::Int16, true),
+            F::new("u32", A::UInt32, true),
+            F::new("count", A::UInt64, false),
+            F::new("d64", A::Date64, true),
+        ]);
+        let k: HashSet<String> = ["SYM01"].into_iter().map(|s| s.to_string()).collect();
+
+        let p = parse_filters(&[col("i16").gt(lit(7i16))], &s, &k);
+        assert!(matches!(
+            p.value_filters.first(),
+            Some(SplayedFilter::GreaterThan {
+                value: splayed_core::FilterValue::Int16(7),
+                ..
+            })
+        ));
+
+        let p = parse_filters(&[col("u32").gt(lit(20u32))], &s, &k);
+        assert!(matches!(
+            p.value_filters.first(),
+            Some(SplayedFilter::GreaterThan {
+                value: splayed_core::FilterValue::UInt32(20),
+                ..
+            })
+        ));
+
+        let p = parse_filters(&[col("count").lt(lit(1000u64))], &s, &k);
+        assert!(matches!(
+            p.value_filters.first(),
+            Some(SplayedFilter::LessThan {
+                value: splayed_core::FilterValue::UInt64(1000),
+                ..
+            })
+        ));
+
+        let p = parse_filters(&[col("d64").gt(lit(86400000i64))], &s, &k);
+        assert!(matches!(
+            p.value_filters.first(),
+            Some(SplayedFilter::GreaterThan {
+                value: splayed_core::FilterValue::Date64(86400000),
+                ..
+            })
+        ));
+
+        // Classification marks them Exact (scan applies them).
+        let f = col("u32").gt(lit(20u32));
+        let v = classify(&[&f], &s, &k);
+        assert_eq!(v[0], TableProviderFilterPushDown::Exact);
     }
 }

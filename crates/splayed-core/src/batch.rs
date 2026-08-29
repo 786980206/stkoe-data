@@ -296,6 +296,17 @@ impl Bitmap {
         &self.bytes
     }
 
+    /// A sub-bitmap over `[offset, offset+len)` — for row slicing.
+    pub fn slice(&self, offset: usize, len: usize) -> Bitmap {
+        let mut out = Bitmap::with_all_valid(len);
+        for i in 0..len {
+            if !self.is_valid(offset + i) {
+                out.set(i, false);
+            }
+        }
+        out
+    }
+
     /// Hand the raw byte vec over (for Arrow `BooleanBuffer`/`NullBuffer`).
     pub fn into_vec(self) -> Vec<u8> {
         self.bytes
@@ -456,6 +467,69 @@ impl CoreBatch {
 
     pub fn column(&self, i: usize) -> &CoreColumn {
         &self.columns[i]
+    }
+
+    /// A contiguous row window `[offset, offset+len)` of this batch (copies the
+    /// window's bytes / bitmap bits).
+    pub fn slice(&self, offset: usize, len: usize) -> CoreBatch {
+        debug_assert!(offset + len <= self.num_rows);
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| {
+                let nulls = c.nulls.as_ref().map(|bm| bm.slice(offset, len));
+                let kind = match &c.kind {
+                    CoreColumnKind::Primitive { ty, data } => {
+                        let w = ty.byte_width().unwrap_or(0);
+                        let from = offset * w;
+                        let to = (offset + len) * w;
+                        CoreColumnKind::Primitive {
+                            ty: ty.clone(),
+                            data: Buffer::from_vec(data.as_slice()[from..to].to_vec()),
+                        }
+                    }
+                    CoreColumnKind::Varlen { offsets, data } => {
+                        // Offsets may begin before `offset`; copy the payload
+                        // window and re-base the offsets from the first value.
+                        let elem = std::mem::size_of::<i32>();
+                        let offs = offsets.as_slice();
+                        let (start_off, end_off) = (
+                            i32::from_le_bytes(offs[offset * elem..offset * elem + elem].try_into().unwrap())
+                                as usize,
+                            i32::from_le_bytes(offs[(offset + len) * elem..(offset + len) * elem + elem]
+                                .try_into()
+                                .unwrap()) as usize,
+                        );
+                        let payload = data.as_slice()[start_off..end_off].to_vec();
+                        let mut new_offsets = Vec::with_capacity(len + 1);
+                        for i in offset..=offset + len {
+                            let o = i32::from_le_bytes(
+                                offs[i * elem..i * elem + elem].try_into().unwrap(),
+                            ) as usize;
+                            new_offsets.extend_from_slice(&((o - start_off) as i32).to_le_bytes());
+                        }
+                        CoreColumnKind::Varlen {
+                            offsets: Buffer::from_vec(new_offsets),
+                            data: Buffer::from_vec(payload),
+                        }
+                    }
+                    CoreColumnKind::Dictionary { indices, values } => {
+                        let from = offset * 4;
+                        let to = (offset + len) * 4;
+                        CoreColumnKind::Dictionary {
+                            indices: Buffer::from_vec(indices.as_slice()[from..to].to_vec()),
+                            values: Arc::clone(values),
+                        }
+                    }
+                };
+                CoreColumn { kind, nulls }
+            })
+            .collect();
+        CoreBatch {
+            schema: Arc::clone(&self.schema),
+            columns,
+            num_rows: len,
+        }
     }
 
     pub fn into_columns(self) -> Vec<CoreColumn> {
