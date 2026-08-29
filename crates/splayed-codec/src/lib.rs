@@ -10,7 +10,10 @@ pub mod delta;
 pub mod plain;
 pub mod rle;
 
-pub use compact::{compact_field, decompress_field_data, CompactError, DecompressError};
+pub use compact::{
+    compact_field, compact_field_with_encoding, decode_encoding, decompress_field_data,
+    encode_encoding, CompactError, DecompressError,
+};
 pub use plain::PlainCodec;
 
 /// Encoding result type.

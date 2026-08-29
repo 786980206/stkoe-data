@@ -30,9 +30,124 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
-use splayed_format::{Compression, FieldHeader, HEADER_SIZE};
+use splayed_format::field_footer;
+use splayed_format::{Compression, DataType, Encoding, FieldHeader, HEADER_SIZE};
 
 use crate::CodecError;
+
+/// 编码调度：PLAIN=原样；DELTA/RLE/BITPACK → 各模块 encode。
+///
+/// 非 PLAIN 编码的数据区布局：`[u64 原始字节数][编码 payload]`（与压缩的
+/// `[u64 l][payload]` 同构；编码后再压缩时压缩对象是编码 payload）。
+pub fn encode_encoding(
+    encoding: Encoding,
+    data_type: DataType,
+    data: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    let count = data.len() / data_type.size_of();
+    match encoding {
+        Encoding::Plain => Ok(data.to_vec()),
+        Encoding::Delta => crate::delta::encode(data, data_type, count),
+        Encoding::Rle => crate::rle::encode(data, data_type, count),
+        Encoding::Bitpack => crate::bitpack::encode(data, data_type, count),
+    }
+}
+
+/// 编码解码（读侧恢复原始 PLAIN 布局）。
+pub fn decode_encoding(
+    encoding: Encoding,
+    data_type: DataType,
+    encoded: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    match encoding {
+        Encoding::Plain => Ok(encoded.to_vec()),
+        Encoding::Delta => crate::delta::decode(encoded, data_type),
+        Encoding::Rle => crate::rle::decode(encoded, data_type),
+        Encoding::Bitpack => crate::bitpack::decode(encoded, data_type),
+    }
+}
+
+/// 编码（可选）+ 压缩（可选）FIELD：`[u64 原始字节数][编码 payload]`，
+/// 再对 payload 压缩（`compression != NONE` 时）。
+///
+/// 原文件必须为 `compression = NONE`；完成后只读（`update_field` 拒绝）。
+/// 原子提交（`<field>.tmp` → fsync → rename），按原始数据重算统计 footer。
+pub fn compact_field_with_encoding(
+    field_path: impl AsRef<Path>,
+    encoding: Encoding,
+    compression: Compression,
+) -> Result<(), CompactError> {
+    let field_path = field_path.as_ref();
+
+    // PLAIN 编码 = 既有 compact_field 路径（保持历史格式：NONE 无 raw_len 前缀）。
+    if encoding == Encoding::Plain {
+        return compact_field(field_path, compression);
+    }
+
+    // --- 读当前 header + 原始数据 ---
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(field_path)
+        .map_err(CompactError::Io)?;
+
+    let mut header_buf = [0u8; HEADER_SIZE];
+    file.read_exact(&mut header_buf).map_err(CompactError::Io)?;
+    let header: FieldHeader = bytemuck::pod_read_unaligned(&header_buf);
+    header.validate().map_err(CompactError::Format)?;
+
+    let current_comp = header.compression().map_err(CompactError::Format)?;
+    if current_comp != Compression::None {
+        return Err(CompactError::AlreadyCompressed);
+    }
+    let data_type = header.data_type().map_err(CompactError::Format)?;
+
+    let raw_data_len = header.data_length as usize;
+    if header.encoding().map_err(CompactError::Format)? != Encoding::Plain {
+        return Err(CompactError::Format("already encoded"));
+    }
+
+    let mut raw_data = vec![0u8; raw_data_len];
+    file.seek(SeekFrom::Start(HEADER_SIZE as u64))
+        .map_err(CompactError::Io)?;
+    file.read_exact(&mut raw_data).map_err(CompactError::Io)?;
+    drop(file); // Windows：先释放再 rename
+
+    // --- 编码 → (可选)压缩 → [u64 编码后字节数][payload] ---
+    let encoded = encode_encoding(encoding, data_type, &raw_data)?;
+    // 前缀存「编码后、压缩前」长度：压缩时即为解压目标长度，NONE 时即 payload 长。
+    let payload = if compression == Compression::None {
+        encoded.clone()
+    } else {
+        compress(&encoded, compression)?
+    };
+    let encoded_len = encoded.len() as u64;
+
+    let mut new_data = Vec::with_capacity(8 + payload.len());
+    new_data.extend_from_slice(&encoded_len.to_le_bytes());
+    new_data.extend_from_slice(&payload);
+    let new_data_length = new_data.len() as u64;
+
+    // --- 写 tmp → fsync → 原子 rename ---
+    let mut new_header = header;
+    new_header.encoding = encoding as u8;
+    new_header.compression = compression as u8;
+    new_header.data_length = new_data_length;
+
+    let stats = field_footer::compute_stats(data_type, &raw_data);
+    let footer = field_footer::encode_footer(stats);
+
+    let tmp_path = field_path.with_extension("tmp");
+    {
+        let mut tmp = File::create(&tmp_path).map_err(CompactError::Io)?;
+        tmp.write_all(bytemuck::bytes_of(&new_header))
+            .map_err(CompactError::Io)?;
+        tmp.write_all(&new_data).map_err(CompactError::Io)?;
+        tmp.write_all(&footer).map_err(CompactError::Io)?;
+        tmp.sync_all().map_err(CompactError::Io)?;
+    }
+    std::fs::rename(&tmp_path, field_path).map_err(CompactError::Io)?;
+    Ok(())
+}
 
 /// Compress a FIELD file atomically.
 ///

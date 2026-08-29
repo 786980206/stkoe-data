@@ -18,7 +18,7 @@ use std::path::Path;
 use memmap2::Mmap;
 
 use splayed_format::{
-    Compression, DataType, FieldHeader, RawValue, HEADER_SIZE,
+    Compression, DataType, Encoding, FieldHeader, RawValue, HEADER_SIZE,
 };
 use splayed_format::field_footer::{FOOTER_SIZE, parse_footer};
 
@@ -30,14 +30,14 @@ pub struct FieldStats {
 }
 
 /// The data source backing a `FieldReader`.
-/// Either mmap (for PLAIN+NONE) or an owned buffer (for compressed fields).
 enum FieldData {
-    /// Zero-copy mmap path for `compression = NONE`.
+    /// Zero-copy mmap path for `compression = NONE`（PLAIN 编码）。
     /// `data_end` 是数据区的结束下标（footer 之前）。
     Mmap { map: Mmap, data_end: usize },
-    /// Decompressed data buffer for `compression = ZSTD/LZ4`.
-    /// The `Vec<u8>` holds the fully decompressed raw data region.
+    /// Decompressed data buffer for `compression = ZSTD/LZ4`（PLAIN 编码）。
     Decompressed(Vec<u8>),
+    /// 非 PLAIN 编码（DELTA/RLE/BITPACK）解码后恢复的原始 PLAIN 布局缓冲。
+    Decoded(Vec<u8>),
 }
 
 impl FieldData {
@@ -45,6 +45,7 @@ impl FieldData {
         match self {
             FieldData::Mmap { map, data_end } => &map[HEADER_SIZE..*data_end],
             FieldData::Decompressed(v) => v,
+            FieldData::Decoded(v) => v,
         }
     }
 }
@@ -97,12 +98,39 @@ impl FieldReader {
         };
 
         let comp = header.compression().map_err(ReaderError::Format)?;
+        let encoding = header.encoding().map_err(ReaderError::Format)?;
+        let expected =
+            header.row_count as usize * header.data_type().expect("validated").size_of();
+        let dt = header.data_type().map_err(ReaderError::Format)?;
+
+        let decode_payload =
+            |encoded: &[u8]| -> Result<FieldData, ReaderError> {
+                let decoded = splayed_codec::decode_encoding(encoding, dt, encoded)
+                    .map_err(|_| ReaderError::DecodeFailed)?;
+                if decoded.len() != expected {
+                    return Err(ReaderError::DecodeLengthMismatch {
+                        expected,
+                        actual: decoded.len(),
+                    });
+                }
+                Ok(FieldData::Decoded(decoded))
+            };
 
         let data = if comp == Compression::None {
             // Fast path: mmap zero-copy（数据区 = [HEADER_SIZE, payload_end)）。
             let data_end = (HEADER_SIZE as u64 + header.data_length) as usize;
             let data_end = data_end.min(payload_end);
-            FieldData::Mmap { map: mmap, data_end }
+            let mmap_data = FieldData::Mmap { map: mmap, data_end };
+            if encoding == Encoding::Plain {
+                mmap_data
+            } else {
+                // 非 PLAIN：数据区 = [u64 编码后字节数][编码 payload]。
+                let region = mmap_data.data_slice();
+                if region.len() < 8 {
+                    return Err(ReaderError::TooShort);
+                }
+                decode_payload(&region[8..])?
+            }
         } else {
             // Compressed path: decompress into owned buffer.
             // Data region layout: [u64 uncompressed_len][compressed payload]
@@ -126,16 +154,20 @@ impl FieldReader {
                 Compression::None => unreachable!(),
             };
 
-            // Sanity check: decompressed length should match header expectation.
-            let expected = header.row_count as usize * header.data_type().expect("validated").size_of();
-            if decompressed.len() != expected {
-                return Err(ReaderError::DecompressLengthMismatch {
-                    expected,
-                    actual: decompressed.len(),
-                });
+            if encoding == Encoding::Plain {
+                // Sanity check: decompressed length should match header expectation.
+                if decompressed.len() != expected {
+                    return Err(ReaderError::DecompressLengthMismatch {
+                        expected,
+                        actual: decompressed.len(),
+                    });
+                }
+                FieldData::Decompressed(decompressed)
+            } else {
+                // 非 PLAIN：解压后的流即「编码 payload」（前缀已作为解压目标
+                // 长度被解压层消费），直接解码。
+                decode_payload(&decompressed)?
             }
-
-            FieldData::Decompressed(decompressed)
         };
 
         Ok(Self { data, header, stats })
@@ -251,6 +283,8 @@ pub enum ReaderError {
     Format(&'static str),
     DecompressFailed,
     DecompressLengthMismatch { expected: usize, actual: usize },
+    DecodeFailed,
+    DecodeLengthMismatch { expected: usize, actual: usize },
     RowOutOfRange { row: u32, total: u32 },
     RangeOutOfRange { start_row: u32, count: usize, total_rows: u32 },
 }
@@ -263,6 +297,11 @@ impl std::fmt::Display for ReaderError {
             Self::TooShort => write!(f, "field file too short for header"),
             Self::Format(msg) => write!(f, "reader format error: {msg}"),
             Self::DecompressFailed => write!(f, "failed to decompress field data"),
+            Self::DecodeFailed => write!(f, "failed to decode field data"),
+            Self::DecodeLengthMismatch { expected, actual } => write!(
+                f,
+                "decoded field length {actual} != expected {expected}"
+            ),
             Self::DecompressLengthMismatch { expected, actual } => {
                 write!(
                     f,

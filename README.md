@@ -149,6 +149,7 @@ dataset/                        一个 folder = 一个 dataset（≈ Parquet 文
 | 接口 | 说明 |
 |---|---|
 | `compact_field(path, compression)` | NONE→ZSTD/LZ4 压缩（`[u64 len][payload]`），成功后只读；**重算统计 footer**（压缩后统计永久有效） |
+| `compact_field_with_encoding(path, encoding, compression)` | **编码接线**：DELTA/RLE/BITPACK 编码（`[u64 编码长][payload]`）后可选 ZSTD/LZ4；只读；读侧按 header.encoding 自动解码恢复原始布局（统计 footer 保留） |
 | `decompress_field_data(path)` | 压缩字段解压为原始字节 |
 | `PlainCodec` / `delta` / `rle` / `bitpack` 模块 | 编码器（按需暴露） |
 | `CompactError / DecompressError / CodecError` | 错误类型 |
