@@ -16,7 +16,7 @@
 //! Key: `WHERE sym = ...` is NOT a scan-then-filter — it's a direct META → row
 //! range lookup.  This is the performance-critical design.
 
-use splayed_format::{DataType, TimeType};
+use splayed_format::{DataType, RawValue, TimeType};
 
 use std::sync::Arc;
 
@@ -129,6 +129,8 @@ pub struct ScanRequest {
     pub filters: Vec<Filter>,
     pub batch_size: usize,
     pub parallelism: usize,
+    /// 读取期截断：产出前 N 个**通过过滤**的行后停止扫描（`None` = 不限）。
+    pub limit: Option<usize>,
 }
 
 impl ScanRequest {
@@ -141,6 +143,7 @@ impl ScanRequest {
             filters: vec![],
             batch_size: 65536,
             parallelism: 1,
+            limit: None,
         }
     }
 }
@@ -265,6 +268,36 @@ impl<'ds> Scanner<'ds> {
             total_rows += count as usize;
         }
 
+        // 统计剪裁（FIELD footer 的 min/max）：任一 filter 与整列统计不相交
+        // → 整表无匹配行，直接空计划（省去全部 FIELD 读取与解码）。
+        //
+        // 注意：IsNull/IsNotNull 不做计划级剪裁——header 的 null_count 是
+        // 「预分配全 NULL」语义（§5.2.1），写路径不维护，交由行级过滤保证。
+        for f in &request.filters {
+            let name = f.field_name();
+            let path = self.dataset.field_path(name);
+            if !path.exists() {
+                return Err(ScannerError::FieldNotFound(name.to_string())); // 审查期防御
+            }
+            let reader = FieldReader::open(&path)
+                .map_err(|e| ScannerError::ReaderError(name.to_string(), e))?;
+            let pruned = if let Some(st) = reader.stats() {
+                let dt = reader.data_type();
+                let min_v = RawValue::read_le(&st.min, 0, dt);
+                let max_v = RawValue::read_le(&st.max, 0, dt);
+                !matches_range(f, &min_v, &max_v)
+            } else {
+                false
+            };
+            if pruned {
+                return Ok(ScanPlan {
+                    ranges: Vec::new(),
+                    columns: request.columns.clone(),
+                    total_rows: 0,
+                });
+            }
+        }
+
         Ok(ScanPlan {
             ranges,
             columns: request.columns.clone(),
@@ -311,6 +344,8 @@ impl<'ds> Scanner<'ds> {
             readers,
             filters: request.filters.clone(),
             batch_size: request.batch_size,
+            limit: request.limit,
+            emitted: 0,
             current_range_idx: 0,
             current_row_in_range: 0,
             exhausted: false,
@@ -473,6 +508,25 @@ impl<'ds> Scanner<'ds> {
             all_batches.extend(batches?);
         }
 
+        // 读取期截断（限值内切片，超出即停）。
+        if let Some(lim) = request.limit {
+            let mut total = 0usize;
+            let mut out = Vec::new();
+            for b in all_batches {
+                let keep = lim.saturating_sub(total);
+                if keep == 0 {
+                    break;
+                }
+                if b.num_rows() > keep {
+                    out.push(b.slice(0, keep));
+                    break;
+                }
+                total += b.num_rows();
+                out.push(b);
+            }
+            return Ok(out);
+        }
+
         Ok(all_batches)
     }
 }
@@ -596,6 +650,8 @@ pub struct ScanBatches<'ds, 'r> {
     readers: Vec<(String, FieldReader)>,
     filters: Vec<Filter>,
     batch_size: usize,
+    limit: Option<usize>,
+    emitted: usize,
     current_range_idx: usize,
     current_row_in_range: u32,
     exhausted: bool,
@@ -696,14 +752,20 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
             .map(|((name, bytes, ty), hn)| (name, bytes, ty, hn))
             .collect();
 
-        Ok(Some(build_core_batch(
-            &self.schema,
-            &self.sym_dict,
-            self.dataset.meta.time_type(),
-            fields,
-            &sym_indices,
-            &time_values,
-        )))
+        let truncated = truncate_batch(
+            build_core_batch(
+                &self.schema,
+                &self.sym_dict,
+                self.dataset.meta.time_type(),
+                fields,
+                &sym_indices,
+                &time_values,
+            ),
+            &mut self.emitted,
+            self.limit,
+            &mut self.exhausted,
+        )?;
+        Ok(truncated)
     }
 }
 
@@ -722,6 +784,8 @@ pub struct OwnedScanBatches {
     readers: Vec<(String, FieldReader)>,
     filters: Vec<Filter>,
     batch_size: usize,
+    limit: Option<usize>,
+    emitted: usize,
     current_range_idx: usize,
     current_row_in_range: u32,
     exhausted: bool,
@@ -763,6 +827,8 @@ pub fn scan_owned(
         readers,
         filters: request.filters.clone(),
         batch_size: request.batch_size,
+        limit: request.limit,
+        emitted: 0,
         current_range_idx: 0,
         current_row_in_range: 0,
         exhausted: false,
@@ -864,14 +930,20 @@ impl OwnedScanBatches {
             .map(|((name, bytes, ty), hn)| (name, bytes, ty, hn))
             .collect();
 
-        Ok(Some(build_core_batch(
-            &self.schema,
-            &self.sym_dict,
-            self.dataset.meta.time_type(),
-            fields,
-            &sym_indices,
-            &time_values,
-        )))
+        let truncated = truncate_batch(
+            build_core_batch(
+                &self.schema,
+                &self.sym_dict,
+                self.dataset.meta.time_type(),
+                fields,
+                &sym_indices,
+                &time_values,
+            ),
+            &mut self.emitted,
+            self.limit,
+            &mut self.exhausted,
+        )?;
+        Ok(truncated)
     }
 }
 
@@ -955,6 +1027,8 @@ pub fn split_ranges(plan: &ScanPlan, n: usize) -> Vec<Vec<RowRange>> {
 pub struct ParallelScanBatches {
     receivers: Vec<std::sync::mpsc::Receiver<Result<CoreBatch, ScannerError>>>,
     current: usize,
+    limit: Option<usize>,
+    emitted: usize,
 }
 
 /// Create an ordered parallel scan stream ([`ParallelScanBatches`]).
@@ -973,6 +1047,8 @@ pub fn scan_owned_parallel(
         return Ok(ParallelScanBatches {
             receivers: Vec::new(),
             current: 0,
+            limit: request.limit,
+            emitted: 0,
         });
     }
 
@@ -1013,6 +1089,8 @@ pub fn scan_owned_parallel(
     Ok(ParallelScanBatches {
         receivers,
         current: 0,
+        limit: request.limit,
+        emitted: 0,
     })
 }
 
@@ -1024,7 +1102,18 @@ impl ParallelScanBatches {
     pub fn next_batch(&mut self) -> Result<Option<CoreBatch>, ScannerError> {
         while self.current < self.receivers.len() {
             match self.receivers[self.current].recv() {
-                Ok(item) => return item.map(Some),
+                Ok(item) => {
+                    let batch = item?;
+                    // 读取期截断（达到限值后停止拉取后续分组）。
+                    let mut exhausted = false;
+                    let out =
+                        truncate_batch(batch, &mut self.emitted, self.limit, &mut exhausted)?;
+                    if exhausted {
+                        self.current = self.receivers.len(); // 停止继续 drain
+                        return Ok(out);
+                    }
+                    return Ok(out);
+                }
                 Err(_) => self.current += 1, // this group's producer is done
             }
         }
@@ -1194,6 +1283,53 @@ fn simd_batch_filter_i64(data: &[u8], threshold: i64, row_count: usize, filter: 
         Filter::Equal { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v == t),
         Filter::NotEqual { .. } => crate::simd_filter::batch_filter_i64(data, threshold, row_count, |v, t| v != t),
         Filter::IsNull { .. } | Filter::IsNotNull { .. } => unreachable!("null-check is scalar"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Limit 截断 + 统计剪裁辅助
+// ---------------------------------------------------------------------------
+
+/// 读取期截断：按限值对批次切片；达到限值后置 `exhausted`。
+///
+/// 返回 `Ok(None)` 表示已达到限值（未来不再产出）。
+fn truncate_batch(
+    batch: CoreBatch,
+    emitted: &mut usize,
+    limit: Option<usize>,
+    exhausted: &mut bool,
+) -> Result<Option<CoreBatch>, ScannerError> {
+    let Some(lim) = limit else {
+        return Ok(Some(batch));
+    };
+    let keep = lim.saturating_sub(*emitted);
+    if keep == 0 {
+        *exhausted = true;
+        return Ok(None);
+    }
+    if batch.num_rows() > keep {
+        *emitted = lim;
+        *exhausted = true;
+        Ok(Some(batch.slice(0, keep)))
+    } else {
+        *emitted += batch.num_rows();
+        Ok(Some(batch))
+    }
+}
+
+/// 用列统计 `[min, max]`（已排除 NULL 哨兵）判断 filter 是否可能命中。
+///
+/// 边界语义直接复用行级 `filter_passes`：对降序/升序极值做保守判定。
+fn matches_range(filter: &Filter, min_v: &RawValue, max_v: &RawValue) -> bool {
+    match filter {
+        Filter::GreaterThan { .. } | Filter::GreaterOrEqual { .. } => {
+            filter_passes(filter, max_v)
+        }
+        Filter::LessThan { .. } | Filter::LessOrEqual { .. } => filter_passes(filter, min_v),
+        Filter::Equal { .. } => filter_passes(filter, min_v) || filter_passes(filter, max_v),
+        // NotEqual / IsNull / IsNotNull：无法从 min/max 剪裁（IsNull/IsNotNull
+        // 在 plan() 中按 null_count 处理）。
+        _ => true,
     }
 }
 

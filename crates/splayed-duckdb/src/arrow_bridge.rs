@@ -110,6 +110,7 @@ pub fn export_to_arrow_ipc(dataset_dir: &Path, output_path: &Path) -> Result<usi
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let scanner = Scanner::new(&dataset);

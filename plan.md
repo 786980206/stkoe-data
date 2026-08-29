@@ -264,6 +264,44 @@ update_info = [start_row, values[]]
 - `compact_field` 后 FIELD 转为只读，`update_field` 拒绝写入。
 - `generation` 在 `update_field` 成功后递增，保持与 META 校验一致。
 
+### 5.2.2 统计 Footer（min/max）
+
+可选、定长 28 字节、追加在数据区之后（`splayed_format::field_footer`）：
+
+```text
+[0..4)   magic   u32 LE = "SFTF"
+[4)      version u8 = 1
+[5)      flags   u8 = bit0: min/max 有效
+[6..8)   reserved u16
+[8..16)  min     [u8;8]（原始 LE 槽位，宽度 = DataType::size_of()）
+[16..24) max     [u8;8]
+[24..28) total   u32 LE = 28
+```
+
+规则与使用：
+
+- **min/max 计算跳过 NULL 哨兵**（浮点 canonical NaN、INT_MIN、无符号全 1）；
+  全 NULL 列 flags=0（或无 footer）。`FieldReader::stats() -> Option<FieldStats>`。
+- **写入时机**：`create_field_with_data`（含 `create_table`）写值后追加；
+  `compact_field` 按原始数据**重算**（compacted 只读，统计永久有效）；
+  `update_field` 原地写后把 magic 归零使统计失效（不改变文件大小）。
+- **读侧**：`field_length` 仍指纯数据字节；读取按末尾 magic 检测 footer，
+  数据区按 `[header, data)` 界定（压缩文件同理，payload 排除 footer）。
+- **消费**：`Scanner::plan` 用 filter 列的 min/max 做**整数据集剪裁**——任一
+  filter 与统计不相交（如 `close > 204` 而 max=204）→ 空计划，任何 FIELD
+  都不读；DataFusion `statistics()` 对 FIELD 列上报 min/max（`Precision::Exact`）
+  与 TIME 列的 `[time_axis[0], time_axis[-1]]`。
+- **注意**：header 的 `null_count` 是「预分配全 NULL」语义（见 §5.2.1），写
+  路径不维护，**不可用于剪裁判断**（IsNull/IsNotNull 交给行级过滤保证）。
+
+### 5.2.3 读取期限值（LIMIT 下推）
+
+`ScanRequest.limit: Option<usize>`：三个扫描入口（`scan` / `scan_owned` /
+`scan_owned_parallel`）与 `scan_all_parallel` 在**产出通过过滤的第 N 行后停止**
+（末批 `CoreBatch::slice` 截断，不再拉取/解码后续批次）。DataFusion 的
+`scan(limit)` 直接透传（多分区仍由引擎 LIMIT 节点保证全局语义）；Polars 的
+`n_rows` 也映射到该字段。
+
 
 
 | ID | 类型 | 单值大小 | NULL 表示 |

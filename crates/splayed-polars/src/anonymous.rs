@@ -132,6 +132,8 @@ impl AnonymousScan for SplayedScan {
             filters: hint.filters,
             batch_size: 65536,
             parallelism: 1,
+            // n_rows → 读取期截断（core 扫满即停），不再仅靠收集后 slice。
+            limit: args.n_rows,
         };
         let scanner = Scanner::new(&self.dataset);
         let plan = scanner

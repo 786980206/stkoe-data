@@ -217,6 +217,7 @@ pub unsafe extern "C" fn splayed_scan_open(
         filters: Vec::new(),
         batch_size: batch_rows.max(1) as usize,
         parallelism: 1,
+        limit: None,
     };
     let scanner = Scanner::new(ds);
     let plan = match scanner.plan(&req) {

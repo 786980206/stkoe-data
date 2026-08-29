@@ -13,6 +13,7 @@
 //! - [`field`] — FIELD data offset computation, header helpers.
 
 pub mod field;
+pub mod field_footer;
 pub mod header;
 pub mod meta;
 pub mod types;

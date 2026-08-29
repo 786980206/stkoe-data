@@ -66,6 +66,7 @@ fn scan_to_arrow_float64_with_null() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -116,6 +117,7 @@ fn scan_to_arrow_int64_with_null() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -161,6 +163,7 @@ fn scan_to_arrow_bool_with_null() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -206,6 +209,7 @@ fn scan_to_arrow_multi_column() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();

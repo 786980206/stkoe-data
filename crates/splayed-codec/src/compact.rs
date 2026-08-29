@@ -95,12 +95,20 @@ pub fn compact_field(
     new_header.compression = compression as u8;
     new_header.data_length = new_data_length;
 
+    // compacted 文件只读 → 统计永久有效：按原始数据重算 footer 一起写入。
+    let stats = splayed_format::field_footer::compute_stats(
+        header.data_type().map_err(CompactError::Format)?,
+        &raw_data,
+    );
+    let footer = splayed_format::field_footer::encode_footer(stats);
+
     let tmp_path = field_path.with_extension("tmp");
     {
         let mut tmp = File::create(&tmp_path).map_err(CompactError::Io)?;
         tmp.write_all(bytemuck::bytes_of(&new_header))
             .map_err(CompactError::Io)?;
         tmp.write_all(&new_data).map_err(CompactError::Io)?;
+        tmp.write_all(&footer).map_err(CompactError::Io)?;
         tmp.sync_all().map_err(CompactError::Io)?;
     }
 

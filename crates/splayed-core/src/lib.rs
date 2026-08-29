@@ -26,7 +26,7 @@ pub use field_writer::{
     create_field, create_field_with_data, delete_field, update_field, CreateFieldError,
     DeleteFieldError, UpdateError, UpdateItem,
 };
-pub use reader::{FieldReader, ReaderError};
+pub use reader::{FieldReader, FieldStats, ReaderError};
 pub use scanner::{
     Filter, FilterValue, OwnedScanBatches, ParallelScanBatches, ScanBatches, ScanPlan,
     ScanRequest, Scanner, ScannerError, SymbolSelection, TimeRange, scan_owned,

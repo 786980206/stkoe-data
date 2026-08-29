@@ -108,6 +108,7 @@ fn scan_projection_and_sym_filter() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -147,6 +148,7 @@ fn scan_time_range_filter() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -185,6 +187,7 @@ fn scan_sym_and_time_combined() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -232,6 +235,7 @@ fn scan_with_value_filter() {
         }],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -271,6 +275,7 @@ fn scan_batch_iteration() {
         filters: vec![],
         batch_size: 3,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -307,6 +312,7 @@ fn scan_empty_result() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req);
@@ -320,6 +326,7 @@ fn scan_empty_result() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -355,6 +362,7 @@ fn scan_compressed_field_zstd() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -402,6 +410,7 @@ fn scan_compressed_field_lz4_with_filter() {
         }],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
 
     let plan = scanner.plan(&req).unwrap();
@@ -439,6 +448,7 @@ fn scan_parallel_matches_sequential() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 1,
+        limit: None,
     };
     let plan_seq = scanner.plan(&req_seq).unwrap();
     let mut seq_batches = scanner.scan(&plan_seq, &req_seq).unwrap();
@@ -456,6 +466,7 @@ fn scan_parallel_matches_sequential() {
         filters: vec![],
         batch_size: 65536,
         parallelism: 3,
+        limit: None,
     };
     let plan_par = scanner.plan(&req_par).unwrap();
     let par_batches = scanner.scan_all_parallel(&plan_par, &req_par).unwrap();

@@ -259,6 +259,13 @@ dataset/
 | 28 | `null_count` | u32 |
 | 40 | `data_length` | u64 |
 
+### Stats Footer (28 bytes, optional)
+
+追加在数据区之后：`magic "SFTF" + version + flags + min[8] + max[8] + total`.
+min/max **跳过 NULL 哨兵**；`create_field_with_data`/`compact_field` 写入，
+`update_field` 使失效。扫描端用它做**整数据集剪裁**（filter 与列统计不相交
+→ 空扫描，任何 FIELD 都不读），DataFusion `statistics()` 上报 min/max。
+
 ### Data Types
 
 | ID | Type | Size | NULL pattern |
@@ -296,6 +303,7 @@ dataset/
 | 12 | ✅ Done | 并行能力：`scan_owned_parallel` 有序流式 + DataFusion 单数据集多分区 |
 | 13 | ✅ Done | 适配层组件化（umbrella features）：adbc（上层 ADBC，内部 DataFusion）、duckdb C ABI、polars 惰性扫描 |
 | 14 | ✅ Done | Polars AnonymousScan：谓词下推 + 列裁剪 + C data interface 转换 |
+| 15 | ✅ Done | FIELD 统计 footer（min/max）→ 扫描期整数据集剪裁 + DataFusion 统计上报；ScanRequest.limit 读取期截断 |
 
 ---
 

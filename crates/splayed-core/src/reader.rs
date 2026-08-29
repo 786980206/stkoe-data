@@ -17,13 +17,24 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use splayed_format::{Compression, DataType, FieldHeader, RawValue, HEADER_SIZE};
+use splayed_format::{
+    Compression, DataType, FieldHeader, RawValue, HEADER_SIZE,
+};
+use splayed_format::field_footer::{FOOTER_SIZE, parse_footer};
+
+/// 列级统计（来自 FIELD footer；min/max 为原始 LE 槽位，宽度按 `data_type`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldStats {
+    pub min: [u8; 8],
+    pub max: [u8; 8],
+}
 
 /// The data source backing a `FieldReader`.
 /// Either mmap (for PLAIN+NONE) or an owned buffer (for compressed fields).
 enum FieldData {
     /// Zero-copy mmap path for `compression = NONE`.
-    Mmap(Mmap),
+    /// `data_end` 是数据区的结束下标（footer 之前）。
+    Mmap { map: Mmap, data_end: usize },
     /// Decompressed data buffer for `compression = ZSTD/LZ4`.
     /// The `Vec<u8>` holds the fully decompressed raw data region.
     Decompressed(Vec<u8>),
@@ -32,7 +43,7 @@ enum FieldData {
 impl FieldData {
     fn data_slice(&self) -> &[u8] {
         match self {
-            FieldData::Mmap(m) => &m[HEADER_SIZE..],
+            FieldData::Mmap { map, data_end } => &map[HEADER_SIZE..*data_end],
             FieldData::Decompressed(v) => v,
         }
     }
@@ -46,6 +57,7 @@ impl FieldData {
 pub struct FieldReader {
     data: FieldData,
     header: FieldHeader,
+    stats: Option<FieldStats>,
 }
 
 impl FieldReader {
@@ -53,6 +65,9 @@ impl FieldReader {
     ///
     /// For `compression = NONE`: mmaps the file for zero-copy reads.
     /// For `compression = ZSTD/LZ4`: reads and decompresses the full data region.
+    ///
+    /// Detects an optional stats footer at the file tail (see
+    /// [`splayed_format::field_footer`]) and excludes it from the data region.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ReaderError> {
         let file = File::open(path.as_ref()).map_err(ReaderError::Io)?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(ReaderError::Mmap)?;
@@ -64,15 +79,34 @@ impl FieldReader {
         header_ref.validate().map_err(ReaderError::Format)?;
         let header = *header_ref;
 
+        // 尾部 footer 检测（统计信息；无 footer 的旧文件不受影响）。
+        let (stats, payload_end) = if mmap.len() >= HEADER_SIZE + FOOTER_SIZE {
+            let tail = &mmap[mmap.len() - FOOTER_SIZE..];
+            match parse_footer(tail) {
+                // footer 必须不与数据区重叠（data_length 是纯数据字节数）。
+                Some((valid, mn, mx)) if HEADER_SIZE as u64 + header.data_length as u64
+                    <= mmap.len() as u64 - FOOTER_SIZE as u64 =>
+                {
+                    let st = valid.then_some(FieldStats { min: mn, max: mx });
+                    (st, mmap.len() - FOOTER_SIZE)
+                }
+                _ => (None, mmap.len()),
+            }
+        } else {
+            (None, mmap.len())
+        };
+
         let comp = header.compression().map_err(ReaderError::Format)?;
 
         let data = if comp == Compression::None {
-            // Fast path: mmap zero-copy.
-            FieldData::Mmap(mmap)
+            // Fast path: mmap zero-copy（数据区 = [HEADER_SIZE, payload_end)）。
+            let data_end = (HEADER_SIZE as u64 + header.data_length) as usize;
+            let data_end = data_end.min(payload_end);
+            FieldData::Mmap { map: mmap, data_end }
         } else {
             // Compressed path: decompress into owned buffer.
             // Data region layout: [u64 uncompressed_len][compressed payload]
-            let data_region = &mmap[HEADER_SIZE..];
+            let data_region = &mmap[HEADER_SIZE..payload_end];
             if data_region.len() < 8 {
                 return Err(ReaderError::TooShort);
             }
@@ -104,7 +138,12 @@ impl FieldReader {
             FieldData::Decompressed(decompressed)
         };
 
-        Ok(Self { data, header })
+        Ok(Self { data, header, stats })
+    }
+
+    /// 统计（min/max），来自文件尾部 footer；无 footer 或已失效 → `None`。
+    pub fn stats(&self) -> Option<FieldStats> {
+        self.stats
     }
 
     pub fn header(&self) -> &FieldHeader {

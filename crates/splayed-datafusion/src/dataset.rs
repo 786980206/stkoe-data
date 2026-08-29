@@ -21,7 +21,10 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::catalog::TableProvider;
 
-use splayed_core::{open_dataset, Dataset, FieldReader, ScanRequest, Scanner, SymbolSelection, TimeRange};
+use splayed_core::{
+    open_dataset, Dataset, FieldReader, FieldStats, ScanRequest, Scanner, SymbolSelection,
+    TimeRange,
+};
 use splayed_format::{MetaFile, TimeType};
 
 use crate::exec::SplayedScanExec;
@@ -54,7 +57,8 @@ impl SplayedDatasetProvider {
             .list_fields()
             .map_err(|e| DataFusionError::Execution(format!("list_fields failed: {e}")))?;
 
-        let mut fields: Vec<(String, ArrowDataType, u32, u64)> = Vec::with_capacity(field_names.len());
+        let mut fields: Vec<(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)> =
+            Vec::with_capacity(field_names.len());
         for name in &field_names {
             let path = dataset.field_path(name);
             let reader = FieldReader::open(&path).map_err(|e| {
@@ -67,7 +71,11 @@ impl SplayedDatasetProvider {
                     DataFusionError::Execution(format!("stat field '{name}' failed: {e}"))
                 })?
                 .len();
-            fields.push((name.clone(), arrow_ty, null_count, size));
+            // FIELD footer 的 min/max 统计（无 footer 或已失效 → None）。
+            let stats_pair = reader
+                .stats()
+                .and_then(|st| field_stats_scalars(&arrow_ty, &st));
+            fields.push((name.clone(), arrow_ty, null_count, size, stats_pair));
         }
 
         let schema = Arc::new(build_schema(meta, &fields));
@@ -112,7 +120,10 @@ impl SplayedDatasetProvider {
     }
 }
 
-fn build_schema(meta: &MetaFile, fields: &[(String, ArrowDataType, u32, u64)]) -> ArrowSchema {
+fn build_schema(
+    meta: &MetaFile,
+    fields: &[(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)],
+) -> ArrowSchema {
     let time_arrow = match meta.time_type() {
         TimeType::Date32 => ArrowDataType::Date32,
         TimeType::TimestampUs => ArrowDataType::Timestamp(ArrowTimeUnit::Microsecond, None),
@@ -121,15 +132,77 @@ fn build_schema(meta: &MetaFile, fields: &[(String, ArrowDataType, u32, u64)]) -
         ArrowField::new("time", time_arrow, false),
         ArrowField::new("sym", ArrowDataType::Utf8, false),
     ];
-    for (name, ty, _, _) in fields {
+    for (name, ty, _, _, _) in fields {
         cols.push(ArrowField::new(name, ty.clone(), true));
     }
     ArrowSchema::new(cols)
 }
 
+/// FIELD footer 的原始槽位 → DataFusion `ScalarValue`（宽度按类型）。
+fn field_stats_scalars(aty: &ArrowDataType, st: &FieldStats) -> Option<(ScalarValue, ScalarValue)> {
+    let w = match aty {
+        ArrowDataType::Boolean | ArrowDataType::Int8 | ArrowDataType::UInt8 => 1,
+        ArrowDataType::Int16 | ArrowDataType::UInt16 => 2,
+        ArrowDataType::Int32
+        | ArrowDataType::UInt32
+        | ArrowDataType::Float32
+        | ArrowDataType::Date32 => 4,
+        ArrowDataType::Int64
+        | ArrowDataType::UInt64
+        | ArrowDataType::Float64
+        | ArrowDataType::Date64
+        | ArrowDataType::Timestamp(_, _) => 8,
+        _ => return None,
+    };
+    let one = |b: &[u8]| -> ScalarValue {
+        match aty {
+            ArrowDataType::Boolean => ScalarValue::Boolean(Some(b[0] != 0)),
+            ArrowDataType::Int8 => ScalarValue::Int8(Some(i8::from_le_bytes([b[0]]))),
+            ArrowDataType::Int16 => {
+                ScalarValue::Int16(Some(i16::from_le_bytes(b[..2].try_into().unwrap())))
+            }
+            ArrowDataType::Int32 => {
+                ScalarValue::Int32(Some(i32::from_le_bytes(b[..4].try_into().unwrap())))
+            }
+            ArrowDataType::Int64 => {
+                ScalarValue::Int64(Some(i64::from_le_bytes(b[..8].try_into().unwrap())))
+            }
+            ArrowDataType::UInt8 => ScalarValue::UInt8(Some(b[0])),
+            ArrowDataType::UInt16 => {
+                ScalarValue::UInt16(Some(u16::from_le_bytes(b[..2].try_into().unwrap())))
+            }
+            ArrowDataType::UInt32 => {
+                ScalarValue::UInt32(Some(u32::from_le_bytes(b[..4].try_into().unwrap())))
+            }
+            ArrowDataType::UInt64 => {
+                ScalarValue::UInt64(Some(u64::from_le_bytes(b[..8].try_into().unwrap())))
+            }
+            ArrowDataType::Float32 => {
+                ScalarValue::Float32(Some(f32::from_le_bytes(b[..4].try_into().unwrap())))
+            }
+            ArrowDataType::Float64 => {
+                ScalarValue::Float64(Some(f64::from_le_bytes(b[..8].try_into().unwrap())))
+            }
+            ArrowDataType::Date32 => {
+                ScalarValue::Date32(Some(i32::from_le_bytes(b[..4].try_into().unwrap())))
+            }
+            ArrowDataType::Date64 => {
+                ScalarValue::Date64(Some(i64::from_le_bytes(b[..8].try_into().unwrap())))
+            }
+            ArrowDataType::Timestamp(_, _) => ScalarValue::TimestampMicrosecond(
+                Some(i64::from_le_bytes(b[..8].try_into().unwrap())),
+                None,
+            ),
+            _ => unreachable!(),
+        }
+    };
+    let w = w.min(8);
+    Some((one(&st.min[..w]), one(&st.max[..w])))
+}
+
 fn compute_statistics(
     meta: &MetaFile,
-    fields: &[(String, ArrowDataType, u32, u64)],
+    fields: &[(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)],
 ) -> Statistics {
     let total_rows = meta.total_rows() as usize;
     let time_elem = meta.time_elem_size() as usize;
@@ -167,19 +240,25 @@ fn compute_statistics(
     });
 
     // FIELD columns (fixed-width only per plan §5.3)
-    for (_, ty, null_count, _) in fields {
+    for (_, ty, null_count, _, stats_pair) in fields {
         let byte_size = fixed_width_bytes(ty).map(|w| Precision::Exact(total_rows * w));
         column_statistics.push(ColumnStatistics {
             null_count: Precision::Exact(*null_count as usize),
-            max_value: Precision::Absent,
-            min_value: Precision::Absent,
+            max_value: stats_pair
+                .as_ref()
+                .map(|(_, mx)| Precision::Exact(mx.clone()))
+                .unwrap_or(Precision::Absent),
+            min_value: stats_pair
+                .as_ref()
+                .map(|(mn, _)| Precision::Exact(mn.clone()))
+                .unwrap_or(Precision::Absent),
             sum_value: Precision::Absent,
             distinct_count: Precision::Absent,
             byte_size: byte_size.unwrap_or(Precision::Absent),
         });
     }
 
-    let field_bytes: u64 = fields.iter().map(|(_, _, _, s)| *s).sum();
+    let field_bytes: u64 = fields.iter().map(|(_, _, _, s, _)| *s).sum();
     Statistics {
         num_rows: Precision::Exact(total_rows),
         total_byte_size: Precision::Exact(field_bytes as usize),
@@ -272,6 +351,7 @@ impl TableProvider for SplayedDatasetProvider {
             filters: pd.value_filters,
             batch_size,
             parallelism: 1,
+            limit,
         };
 
         let fields: Vec<ArrowField> = projected_indices

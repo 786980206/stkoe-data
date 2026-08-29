@@ -3,9 +3,12 @@
 //! See `plan.md` §5.2.1 (pre-allocation & in-place update) and §8.4.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use splayed_format::field_footer::{
+    FOOTER_MAGIC, FOOTER_SIZE, compute_stats, encode_footer,
+};
 use splayed_format::{fill_null, DataType, FieldHeader, HEADER_SIZE, META_FILE_NAME};
 
 /// One update entry: write `values` starting at absolute row `start_row`.
@@ -109,6 +112,10 @@ pub fn create_field_with_data(
         .map_err(CreateFieldError::Io)?;
     file.write_all(values).map_err(CreateFieldError::Io)?;
 
+    // 追加统计 footer（min/max；全 NULL 时 flags=0，仍保留 28 字节定长）。
+    let stats = compute_stats(data_type, values);
+    file.write_all(&encode_footer(stats)).map_err(CreateFieldError::Io)?;
+
     file.sync_all().map_err(CreateFieldError::Io)?;
     Ok(())
 }
@@ -131,7 +138,6 @@ pub fn update_field(
         .map_err(UpdateError::Io)?;
 
     let mut header_buf = [0u8; HEADER_SIZE];
-    use std::io::Read;
     file.read_exact(&mut header_buf).map_err(UpdateError::Io)?;
     let header: &FieldHeader = bytemuck::from_bytes(&header_buf);
     header.validate().map_err(UpdateError::Format)?;
@@ -184,6 +190,21 @@ pub fn update_field(
     file.seek(SeekFrom::Start(0)).map_err(UpdateError::Io)?;
     file.write_all(bytemuck::bytes_of(&new_header))
         .map_err(UpdateError::Io)?;
+
+    // 原地写后统计失效：若存在 footer，把 magic 归零（不改变文件大小）。
+    let file_len = file.metadata().map_err(UpdateError::Io)?.len();
+    if file_len >= (HEADER_SIZE + FOOTER_SIZE) as u64 {
+        let mut tail_magic = [0u8; 4];
+        file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
+            .map_err(UpdateError::Io)?;
+        file.read_exact(&mut tail_magic).map_err(UpdateError::Io)?;
+        if u32::from_le_bytes(tail_magic) == FOOTER_MAGIC {
+            file.seek(SeekFrom::End(-(FOOTER_SIZE as i64)))
+                .map_err(UpdateError::Io)?;
+            file.write_all(&0u32.to_le_bytes())
+                .map_err(UpdateError::Io)?;
+        }
+    }
 
     file.sync_all().map_err(UpdateError::Io)?;
     Ok(())

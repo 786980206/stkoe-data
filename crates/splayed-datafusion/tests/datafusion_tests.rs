@@ -481,3 +481,86 @@ async fn identity_cast_filter() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// LIMIT 下推到扫描/执行：只返回前 N 行（读取期截断）。
+#[tokio::test]
+async fn limit_pushdown_rows() {
+    let dir = temp_dir("limit_pd");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let batches = run_query(&dir, "SELECT close FROM splayed LIMIT 3").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+    let batch = &batches[0];
+    let close = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..close.len()).map(|i| close.value(i)).collect::<Vec<_>>(),
+        vec![100.0, 101.0, 102.0]
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// FIELD footer 统计（min/max）上报到 DataFusion `statistics()`。
+#[tokio::test]
+async fn statistics_exposes_min_max() {
+    use datafusion::common::stats::Precision;
+    use datafusion::catalog::TableProvider;
+
+    let dir = temp_dir("stats_df");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    let provider = SplayedTableProvider::new(&dir).unwrap();
+    let stats = provider.statistics().expect("statistics");
+    assert_eq!(stats.num_rows, Precision::Exact(10));
+    // column_statistics: [time, sym, close, volume]
+    let close_stats = &stats.column_statistics[2];
+    assert_eq!(
+        close_stats.min_value,
+        Precision::Exact(datafusion::common::ScalarValue::Float64(Some(100.0)))
+    );
+    assert_eq!(
+        close_stats.max_value,
+        Precision::Exact(datafusion::common::ScalarValue::Float64(Some(204.0)))
+    );
+    let vol_stats = &stats.column_statistics[3];
+    assert_eq!(
+        vol_stats.min_value,
+        Precision::Exact(datafusion::common::ScalarValue::Int64(Some(1000)))
+    );
+    assert_eq!(
+        vol_stats.max_value,
+        Precision::Exact(datafusion::common::ScalarValue::Int64(Some(6000)))
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// 扫描期统计剪裁：filter 与列 min/max 不相交 → 空结果（正确性端到端）。
+#[tokio::test]
+async fn stats_pruned_filter_empty() {
+    let dir = temp_dir("prune_df");
+    create_table(&dir, &make_batch(), true).unwrap();
+
+    for sql in [
+        "SELECT close FROM splayed WHERE close > 300",
+        "SELECT close FROM splayed WHERE close > 204",
+        "SELECT close FROM splayed WHERE close < 100",
+        "SELECT close FROM splayed WHERE volume > 100000",
+    ] {
+        let batches = run_query(&dir, sql).await;
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 0, "sql: {sql}");
+    }
+
+    // 有命中时不误剪。
+    let batches = run_query(&dir, "SELECT close FROM splayed WHERE close >= 200").await;
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total_rows, 5);
+
+    fs::remove_dir_all(&dir).ok();
+}

@@ -106,3 +106,6 @@ cargo test         # all tests must pass
 - Phase 7: **Complete** (Arrow conversion, NULL/NaN semantics, type mapping).
 - Phase 8: **Complete** (DataFusion TableProvider, ExecutionPlan, pushdown).
 - Phase 9: **Complete** (DuckDB Arrow IPC bridge: Splayed→Arrow→DuckDB).
+- CoreBatch + 零拷贝 + 磁盘类型扩展 + 并行流式：**Complete**。
+- 适配层组件化（umbrella）/ DuckDB C ABI / Polars AnonymousScan：**Complete**。
+- FIELD 统计 footer（min/max，§5.2.2）+ 扫描期剪裁 + ScanRequest.limit：**Complete**。

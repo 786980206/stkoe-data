@@ -55,6 +55,7 @@ fn scan_to_chunks_feeds_corebatches() {
         }],
         batch_size: 2, // 强制多批
         parallelism: 1,
+        limit: None,
     };
 
     let mut batches = Vec::new();
