@@ -62,7 +62,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub(crate) fn require_write(&self, api: &str) -> Result<(), CoreError> {
+    pub fn require_write(&self, api: &str) -> Result<(), CoreError> {
         match self {
             Mode::Write => Ok(()),
             Mode::Read => Err(CoreError::InvalidState(format!(

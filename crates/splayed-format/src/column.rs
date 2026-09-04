@@ -176,6 +176,57 @@ impl<'a> ColumnView<'a> {
         }
         None
     }
+
+    /// 行区间切片：跨段时返回多段视图，零拷贝（validity 位级切分）。
+    pub fn slice_rows(&self, offset: usize, length: usize) -> Result<Self, FormatError> {
+        if offset + length > self.length {
+            return Err(FormatError::InvalidLayout(format!(
+                "slice [{offset}, {}) out of range (len={})",
+                offset,
+                offset + length,
+            )));
+        }
+        let size = self.data_type.size_of();
+        let mut segments = Vec::new();
+        let mut seg_start = 0usize; // 当前 segment 的起始行（view 全局坐标）
+        let mut pos = offset;
+        let end = offset + length;
+        for seg in &self.segments {
+            if pos >= end {
+                break;
+            }
+            let seg_end = seg_start + seg.rows();
+            let lo = pos.max(seg_start);
+            let hi = end.min(seg_end);
+            if hi > lo {
+                let local_lo = lo - seg_start;
+                let n = hi - lo;
+                let validity = seg
+                    .validity()
+                    .map(|b| BitmapView::new(BufferView::new(b.as_raw()), local_lo, n))
+                    .transpose()?;
+                match &seg.values {
+                    ColumnValues::Fixed(v) => {
+                        let bytes = BufferView::new(&v.as_slice()[local_lo * size..(local_lo + n) * size]);
+                        segments.push(ColumnSegment::new(self.data_type, bytes, validity, n)?);
+                    }
+                    ColumnValues::Dict { keys, dict_offsets, dict_strings } => {
+                        let kb = BufferView::new(&keys.as_slice()[local_lo * 4..(local_lo + n) * 4]);
+                        segments.push(ColumnSegment::new_dict(
+                            kb,
+                            *dict_offsets,
+                            *dict_strings,
+                            validity,
+                            n,
+                        )?);
+                    }
+                }
+                pos = hi;
+            }
+            seg_start = seg_end;
+        }
+        ColumnView::new(self.data_type, segments)
+    }
 }
 
 /// 拥有型字典缓冲（Utf8 列的 offsets + strings）。

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -82,7 +83,8 @@ pub struct DatasetHandle {
     /// [sym Utf8, time] + 各 Field（按名称排序）
     schema: Schema,
     mode: Mode,
-    fields: HashMap<String, Box<FieldHandle>>,
+    /// Field Handle 缓存（Box 稳定地址；只增不删，构造后仅共享访问）。
+    fields: RefCell<HashMap<String, Box<FieldHandle>>>,
 }
 
 impl DatasetHandle {
@@ -107,28 +109,37 @@ impl DatasetHandle {
         self.schema.clone()
     }
 
+    /// META 时间类型（Table 层构造分区边界用）。
+    pub fn peek_time_type(&self) -> TimeType {
+        self.meta.time_type()
+    }
+
+
     fn ensure_field(
-        fields: &mut HashMap<String, Box<FieldHandle>>,
+        fields: &RefCell<HashMap<String, Box<FieldHandle>>>,
         root: &Path,
         mode: Mode,
         name: &str,
     ) -> Result<(), CoreError> {
-        if !fields.contains_key(name) {
+        if !fields.borrow().contains_key(name) {
             let path = root.join(name);
             let handle = Box::new(open_field_file(&path, mode)?);
-            fields.insert(name.to_string(), handle);
+            fields.borrow_mut().insert(name.to_string(), handle);
         }
         Ok(())
     }
 
     fn field_handle<'a>(
-        fields: &'a HashMap<String, Box<FieldHandle>>,
+        fields: &'a RefCell<HashMap<String, Box<FieldHandle>>>,
         name: &str,
     ) -> Result<&'a FieldHandle, CoreError> {
-        fields
-            .get(name)
-            .map(|b| &**b)
-            .ok_or_else(|| CoreError::NotFound(PathBuf::from(name)))
+        let borrow = fields.borrow();
+        let ptr: *const FieldHandle = match borrow.get(name) {
+            Some(b) => &**b as *const FieldHandle,
+            None => return Err(CoreError::NotFound(PathBuf::from(name))),
+        };
+        // 安全性：Box 目标地址稳定；条目只增不删；push 后不再有 &mut 访问（写经 RefMut 就地完成）
+        Ok(unsafe { &*ptr })
     }
 
     /// 读取 Dataset 级统计（来自 META，不扫描 Field 数据；`row_count` = 容量网格逻辑行数）。
@@ -163,7 +174,7 @@ impl DatasetHandle {
     /// sym/time 来自 META（time 列按 sym 区间零拷贝切片，sym keys 物化进 scratch）；
     /// 各 Field 按需打开，零拷贝优先。
     pub fn read_dataset(
-        &mut self,
+        &self,
         offset: u64,
         length: u64,
         columns: Option<&[&str]>,
@@ -201,7 +212,7 @@ impl DatasetHandle {
             }
         }
         for name in &needed {
-            DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, name)?;
+            DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
         }
         // sym + time 来自 META（mut 借用 meta scratch）
         let base = self.meta.read_index_handle(offset, length)?;
@@ -218,7 +229,7 @@ impl DatasetHandle {
     }
 
     /// 对已有逻辑行做 positional overwrite（projection write；不保证跨 Field 原子性）。
-    pub fn write_dataset(&mut self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
+    pub fn write_dataset(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
         self.mode.require_write("write_dataset")?;
         let l = self.logical_length();
         if offset + data.length() as u64 > l {
@@ -247,9 +258,12 @@ impl DatasetHandle {
         }
         for field in &data.schema.fields {
             let col = data.column(&field.name).expect("schema iteration guarantees");
-            DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, &field.name)?;
-            let handle = self.fields.get_mut(field.name.as_ref()).expect("just ensured");
-            handle.write_field_handle(offset, col)?;
+            DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, &field.name)?;
+            let mut handle = self.fields.borrow_mut();
+            handle
+                .get_mut(field.name.as_ref())
+                .expect("just ensured")
+                .write_field_handle(offset, col)?;
         }
         Ok(())
     }
@@ -258,7 +272,7 @@ impl DatasetHandle {
     ///
     /// 多 predicate 的执行顺序：META（sym/time）先行，Field 谓词按名称序逐步收窄；
     /// 跨字段的 OR / NOT 组合不支持（返回 Invalid），行级过滤兜底由上层完成。
-    pub fn scan_dataset(&mut self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+    pub fn scan_dataset(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
         let l = self.logical_length();
         let mut current = clamp_ranges(&request.ranges, l);
         if let Some(pred) = &request.predicate {
@@ -291,7 +305,7 @@ impl DatasetHandle {
                 };
                 let mut narrowed = Vec::new();
                 {
-                    DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, &name)?;
+                    DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, &name)?;
                     let handle = DatasetHandle::field_handle(&self.fields, &name)?;
                     let mut scanner = handle.scan_field_handle(&field_req)?;
                     while let Some(r) = scanner.next()? {
@@ -350,7 +364,7 @@ impl DatasetHandle {
         if self.schema.position(name).is_none() {
             return Err(CoreError::NotFound(self.field_path(name)));
         }
-        self.fields.remove(name);
+        self.fields.borrow_mut().remove(name);
         delete_field_file(&self.field_path(name))?;
         self.reload_schema();
         Ok(())
@@ -365,7 +379,7 @@ impl DatasetHandle {
         if self.schema.position(new_name).is_some() {
             return Err(CoreError::AlreadyExists(self.field_path(new_name)));
         }
-        self.fields.remove(name);
+        self.fields.borrow_mut().remove(name);
         rename_field_file(&self.field_path(name), new_name)?;
         self.reload_schema();
         Ok(())
@@ -377,7 +391,7 @@ impl DatasetHandle {
         if self.schema.position(name).is_none() {
             return Err(CoreError::NotFound(self.field_path(name)));
         }
-        self.fields.remove(name);
+        self.fields.borrow_mut().remove(name);
         cast_field_file(&self.field_path(name), target_type)?;
         self.reload_schema();
         Ok(())
@@ -388,7 +402,7 @@ impl DatasetHandle {
         if self.schema.position(name).is_none() {
             return Err(CoreError::NotFound(self.field_path(name)));
         }
-        self.fields.remove(name);
+        self.fields.borrow_mut().remove(name);
         let offsets = self.sym_aligned_offsets(8, 64 * 1024);
         compress_field_file(&self.field_path(name), Some(offsets))?;
         Ok(())
@@ -399,7 +413,7 @@ impl DatasetHandle {
         if self.schema.position(name).is_none() {
             return Err(CoreError::NotFound(self.field_path(name)));
         }
-        self.fields.remove(name);
+        self.fields.borrow_mut().remove(name);
         decompress_field_file(&self.field_path(name))?;
         Ok(())
     }
@@ -446,11 +460,9 @@ impl DatasetHandle {
 
     /// 关闭 Dataset：释放 META Handle 与全部 Field Handle（compressed write 收尾在此触发）。
     pub fn close_dataset(mut self) -> Result<(), CoreError> {
-        let names: Vec<String> = self.fields.keys().cloned().collect();
-        for name in names {
-            if let Some(handle) = self.fields.remove(&name) {
-                close_field_handle(*handle)?;
-            }
+        let fields = self.fields.get_mut();
+        for (_, handle) in fields.drain() {
+            close_field_handle(*handle)?;
         }
         self.meta.close()
     }
@@ -692,7 +704,7 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
         meta,
         schema,
         mode,
-        fields: HashMap::new(),
+        fields: RefCell::new(HashMap::new()),
     })
 }
 

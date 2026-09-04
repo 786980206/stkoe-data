@@ -158,7 +158,9 @@ dependencies = [
 name = "splayed-table"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "splayed-core",
+ "splayed-format",
 ]
 
 [[package]]

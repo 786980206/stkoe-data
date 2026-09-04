@@ -3,6 +3,7 @@
 //! 权威设计见 `docs/splayed-core.md`；磁盘格式见 `docs/splayed-format.md`。
 //! 逻辑行空间 = 容量网格：三层 API 的 offset / length 含义一致，无需换算。
 
+pub mod arena;
 pub mod dataset;
 pub mod error;
 pub mod field_file;

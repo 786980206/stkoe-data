@@ -9,3 +9,7 @@ description = "Splayed V2.0 table layer: Table / Partition organization, pruning
 
 [dependencies]
 splayed-core = { path = "../splayed-core" }
+splayed-format = { path = "../splayed-format" }
+
+[dev-dependencies]
+bytemuck = "1"

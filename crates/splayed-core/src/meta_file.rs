@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -218,8 +219,8 @@ pub struct MetaHandle {
     path: PathBuf,
     mmap: Mmap,
     header: MetaHeader,
-    /// scratch：read_index 组装视图时物化的 keys 缓冲（逐次累积，随 Handle 存活）。
-    scratch: Vec<Buffer>,
+    /// scratch：read_index 组装视图时物化的 keys 缓冲（Box 稳定地址，逐次累积，随 Handle 存活）。
+    scratch: RefCell<Vec<Box<Buffer>>>,
 }
 
 impl MetaHandle {
@@ -234,7 +235,7 @@ impl MetaHandle {
                 header.file_size
             )));
         }
-        Ok(MetaHandle { path: path.to_path_buf(), mmap, header, scratch: Vec::new() })
+        Ok(MetaHandle { path: path.to_path_buf(), mmap, header, scratch: RefCell::new(Vec::new()) })
     }
 
     pub fn path(&self) -> &Path {
@@ -368,7 +369,7 @@ impl MetaHandle {
     /// time 列按 sym 区间切成多段（TIME AXIS 零拷贝切片）；sym 列的字典 keys 需物化
     /// （缓存进 Handle 的 scratch，生命周期随 Handle）。
     pub fn read_index_handle(
-        &mut self,
+        &self,
         offset: u64,
         length: u64,
     ) -> Result<DataView<'_>, CoreError> {
@@ -400,8 +401,7 @@ impl MetaHandle {
             }
             sym_id += 1;
         }
-        self.scratch.push(Buffer::from_vec(keys));
-        let keys_buf = self.scratch.last().unwrap();
+        let keys_buf = crate::arena::push(&self.scratch, Buffer::from_vec(keys));
         let schema = Schema::new(vec![
             FieldSchema::new("sym", DataType::Utf8),
             FieldSchema::new("time", time_type.data_type()),
