@@ -1,178 +1,80 @@
-//! DELTA encoding: store differences between consecutive elements.
-//!
-//! See `plan.md` §5.5 (Encoding ID=1).
-//!
-//! DELTA is most effective for monotonically increasing sequences like
-//! timestamps or dates. The first value is stored as-is, and each
-//! subsequent value stores the difference from the previous one.
-//!
-//! On-disk layout:
-//! ```text
-//! [u32 count]              ← number of elements (4 bytes)
-//! [u32 value_size]         ← size of each value in bytes (4 bytes)
-//! [u64 first_value]        ← first raw value (always stored full-width)
-//! [delta values...]       ← consecutive deltas, each `value_size` bytes
-//! ```
-//!
-//! DELTA is designed to be combined with a compression algorithm
-//! (ZSTD/LZ4) for maximum benefit — the deltas are small and compress well.
-
+use crate::error::CodecError;
 use splayed_format::DataType;
 
-use crate::CodecError;
+/// 读取宽度 `s`（1/2/4/8）的 LE 字，零扩展到 u64。
+fn read_word(buf: &[u8], index: usize, s: usize) -> u64 {
+    let mut word = [0u8; 8];
+    word[..s].copy_from_slice(&buf[index * s..index * s + s]);
+    u64::from_le_bytes(word)
+}
 
-/// DELTA-encode a raw data buffer.
+/// DELTA：首值原样存储，其余存相邻差分（native 位宽 wrapping 减法，LE）。
 ///
-/// `data` must be a PLAIN-encoded buffer of `count` elements of `data_type`.
-/// Returns the DELTA-encoded buffer.
-pub fn encode(data: &[u8], data_type: DataType, count: usize) -> Result<Vec<u8>, CodecError> {
-    let sz = data_type.size_of();
-    if data.len() < count * sz {
-        return Err(CodecError::InvalidInput);
+/// 位级可逆：对任意 bit 型（含 NULL 未定义位）成立——截断与 wrapping 加减可交换。
+pub fn encode(data_type: DataType, values: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let s = data_type.size_of();
+    debug_assert_eq!(values.len() % s, 0);
+    let n = values.len() / s;
+    let mut out = Vec::with_capacity(values.len());
+    for i in 0..n {
+        let word = if i == 0 {
+            read_word(values, 0, s)
+        } else {
+            read_word(values, i, s).wrapping_sub(read_word(values, i - 1, s))
+        };
+        out.extend_from_slice(&word.to_le_bytes()[..s]);
     }
-
-    let mut out = Vec::with_capacity(8 + 8 + count * sz);
-
-    // Header: count + value_size
-    out.extend_from_slice(&(count as u32).to_le_bytes());
-    out.extend_from_slice(&(sz as u32).to_le_bytes());
-
-    // First value: stored as-is (up to 8 bytes, little-endian)
-    let first_val = read_u64_le(data, 0, sz);
-    out.extend_from_slice(&first_val.to_le_bytes());
-
-    // Delta values
-    let mut prev = first_val;
-    for i in 1..count {
-        let cur = read_u64_le(data, i * sz, sz);
-        let delta = (cur as i64).wrapping_sub(prev as i64) as u64;
-        write_u64_le(&mut out, delta, sz);
-        prev = cur;
-    }
-
     Ok(out)
 }
 
-/// DELTA-decode a buffer back to raw PLAIN data.
-///
-/// Returns the decoded PLAIN buffer of `count × sz` bytes.
-pub fn decode(encoded: &[u8], data_type: DataType) -> Result<Vec<u8>, CodecError> {
-    let sz = data_type.size_of();
-
-    if encoded.len() < 12 {
-        return Err(CodecError::InvalidInput);
+pub fn decode(data_type: DataType, payload: &[u8], rows: usize) -> Result<Vec<u8>, CodecError> {
+    let s = data_type.size_of();
+    let expected = rows * s;
+    if payload.len() != expected {
+        return Err(CodecError::RowCountMismatch { expected, found: payload.len() });
     }
-
-    let count = u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize;
-    let val_size = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
-
-    if val_size != sz {
-        return Err(CodecError::InvalidInput);
+    let mut out = vec![0u8; expected];
+    let mut prev = 0u64;
+    for i in 0..rows {
+        let delta = read_word(payload, i, s);
+        let value = if i == 0 { delta } else { prev.wrapping_add(delta) };
+        out[i * s..i * s + s].copy_from_slice(&value.to_le_bytes()[..s]);
+        prev = value;
     }
-
-    if encoded.len() < 8 + 8 + (count.saturating_sub(1)) * sz {
-        return Err(CodecError::InvalidInput);
-    }
-
-    let mut out = Vec::with_capacity(count * sz);
-
-    // First value
-    let first_val = u64::from_le_bytes(encoded[8..16].try_into().unwrap());
-    write_u64_le(&mut out, first_val, sz);
-
-    // Reconstruct from deltas
-    let mut prev = first_val;
-    let mut offset = 16;
-    for _ in 1..count {
-        let delta = read_u64_le(encoded, offset, sz);
-        let val = (prev as i64).wrapping_add(delta as i64) as u64;
-        write_u64_le(&mut out, val, sz);
-        prev = val;
-        offset += sz;
-    }
-
     Ok(out)
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn read_u64_le(buf: &[u8], offset: usize, sz: usize) -> u64 {
-    let slice = &buf[offset..offset + sz];
-    match sz {
-        1 => slice[0] as u64,
-        2 => u16::from_le_bytes(slice.try_into().unwrap()) as u64,
-        4 => u32::from_le_bytes(slice.try_into().unwrap()) as u64,
-        8 => u64::from_le_bytes(slice.try_into().unwrap()),
-        _ => 0,
-    }
-}
-
-fn write_u64_le(out: &mut Vec<u8>, val: u64, sz: usize) {
-    let le = val.to_le_bytes();
-    out.extend_from_slice(&le[..sz]);
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CodecError;
 
-    #[test]
-    fn delta_roundtrip_int64() {
-        // Values: 1000, 1001, 1002, 1005, 1010
-        let values: Vec<i64> = vec![1000, 1001, 1002, 1005, 1010];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int64, 5).unwrap();
-        let decoded = decode(&encoded, DataType::Int64).unwrap();
-
+    fn roundtrip(dt: DataType, raw: &[u8]) {
+        let rows = raw.len() / dt.size_of();
+        let encoded = encode(dt, raw).unwrap();
+        let decoded = decode(dt, &encoded, rows).unwrap();
         assert_eq!(decoded, raw);
     }
 
     #[test]
-    fn delta_roundtrip_int32() {
-        // Values: 10, 20, 30, 25, 15
-        let values: Vec<i32> = vec![10, 20, 30, 25, 15];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int32, 5).unwrap();
-        let decoded = decode(&encoded, DataType::Int32).unwrap();
-
-        assert_eq!(decoded, raw);
+    fn bit_exact_on_ordered_and_garbage() {
+        // 有序时间列
+        let times: Vec<u64> = (0..1000).map(|i| 1_700_000_000_000 + i * 60_000_000).collect();
+        roundtrip(DataType::TimestampUs, bytemuck::cast_slice(&times));
+        // 含负数 / MIN 边界的有符号列
+        let ints: Vec<i32> = [i32::MIN, -1, 0, 1, i32::MAX, -12345].to_vec();
+        roundtrip(DataType::Int32, bytemuck::cast_slice(&ints));
+        // NULL 未定义位（随机 bit 型）
+        let garbage: Vec<u8> = (0..64 * 8).map(|i| (i * 91 + 13) as u8).collect();
+        roundtrip(DataType::Float64, &garbage);
     }
 
     #[test]
-    fn delta_single_element() {
-        let values: Vec<i64> = vec![42];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int64, 1).unwrap();
-        let decoded = decode(&encoded, DataType::Int64).unwrap();
-
-        assert_eq!(decoded, raw);
-    }
-
-    #[test]
-    fn delta_reduces_size_for_monotonic() {
-        // Monotonically increasing i64 values — deltas are small.
-        let values: Vec<i64> = (0..1000).map(|i| 1_000_000 + i).collect();
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int64, 1000).unwrap();
-
-        // Raw = 1000 * 8 = 8000 bytes.
-        // Encoded = 8 (header) + 8 (first val) + 999 * 8 (deltas) = 8008.
-        // DELTA alone doesn't shrink; it helps when combined with compression.
-        // But the deltas are all 1 (0x01), so they compress extremely well.
-        assert_eq!(encoded.len(), 8 + 8 + 999 * 8);
-
-        // Verify correctness
-        let decoded = decode(&encoded, DataType::Int64).unwrap();
-        assert_eq!(decoded, raw);
+    fn rejects_bad_length() {
+        let payload = vec![0u8; 10];
+        assert!(matches!(
+            decode(DataType::Int64, &payload, 2),
+            Err(CodecError::RowCountMismatch { expected: 16, found: 10 })
+        ));
     }
 }

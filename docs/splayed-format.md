@@ -6,7 +6,7 @@ splayed 磁盘数据格式定义。只定义物理布局与二进制语义；API
 
 | 文件 | magic | 职责 |
 | --- | --- | --- |
-| `.meta` | `SPLAYMETA` | 元数据 + Index：SYM / TIME → FIELD row range；只读 |
+| `.meta` | `SPLAYMTA` | 元数据 + Index：SYM / TIME → FIELD row range；只读 |
 | `field` | `SPLAYFLD` | 单字段数据文件：values + validity |
 | `.sub.xxx` | `SPLAYSUB` | 子数据 / 辅助数据（API 后续单独定义） |
 
@@ -93,7 +93,7 @@ DataView      { schema, columns: ColumnView[], length }
 
 | Offset | 长度 | 字段 | 类型 | 说明 |
 | ---: | ---: | --- | --- | --- |
-| 0 | 8 | `magic` | uint64 | `SPLAYMETA` |
+| 0 | 8 | `magic` | uint64 | `SPLAYMTA` |
 | 8 | 2 | `version` | uint16 | META 格式版本 |
 | 10 | 2 | `flags` | uint16 | 预留 |
 | 12 | 1 | `time_type` | uint8 | 0 = `DATE32`，1 = `TIMESTAMP_US` |

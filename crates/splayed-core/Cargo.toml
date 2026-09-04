@@ -4,12 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Core read/write engine for Splayed V1 (reader, field_writer, dataset, scanner)"
+authors.workspace = true
+description = "Splayed V2.0 core: Field / META / Dataset APIs (per docs/splayed-core.md)"
 
 [dependencies]
-splayed-format.workspace = true
-splayed-codec.workspace = true
+splayed-format = { path = "../splayed-format" }
+splayed-codec = { path = "../splayed-codec" }
 memmap2 = "0.9"
 bytemuck = "1"
-zstd = "0.13"
-lz4_flex = "0.11"

@@ -1,159 +1,83 @@
-//! RLE (Run-Length Encoding): compress runs of repeated values.
-//!
-//! See `plan.md` §5.5 (Encoding ID=2).
-//!
-//! RLE is most effective for columns with long runs of the same value
-//! (e.g. sparse data, categorical columns with many NULLs).
-//!
-//! On-disk layout:
-//! ```text
-//! [u32 count]              ← total number of logical elements (4 bytes)
-//! [u32 value_size]         ← size of each value in bytes (4 bytes)
-//! [u32 run_count]          ← number of runs (4 bytes)
-//! [run entries...]         ← each: [u32 run_length][value_bytes]
-//! ```
-//!
-//! Each run entry stores the length of the run and the repeated value.
-
+use crate::error::CodecError;
 use splayed_format::DataType;
 
-use crate::CodecError;
-
-/// RLE-encode a raw data buffer.
-///
-/// `data` must be a PLAIN-encoded buffer of `count` elements of `data_type`.
-/// Returns the RLE-encoded buffer.
-pub fn encode(data: &[u8], data_type: DataType, count: usize) -> Result<Vec<u8>, CodecError> {
-    let sz = data_type.size_of();
-    if data.len() < count * sz {
-        return Err(CodecError::InvalidInput);
-    }
-
-    // Collect runs.
-    let mut runs: Vec<(u32, Vec<u8>)> = Vec::new();
-    let mut i = 0;
-    while i < count {
-        let current = &data[i * sz..(i + 1) * sz];
-        let mut run_len = 1u32;
-        while (i + run_len as usize) < count {
-            let next = &data[(i + run_len as usize) * sz..(i + run_len as usize + 1) * sz];
-            if next == current {
-                run_len += 1;
-            } else {
-                break;
-            }
+/// RLE：`(run_length u32 LE, value)` 序列，重复值列友好（docs/splayed-codec.md §5）。
+pub fn encode(data_type: DataType, values: &[u8]) -> Result<Vec<u8>, CodecError> {
+    let s = data_type.size_of();
+    debug_assert_eq!(values.len() % s, 0);
+    let n = values.len() / s;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let start = i * s;
+        let mut run = 1usize;
+        while i + run < n && values[(i + run) * s..(i + run) * s + s] == values[start..start + s] {
+            run += 1;
         }
-        runs.push((run_len, current.to_vec()));
-        i += run_len as usize;
+        out.extend_from_slice(&(run as u32).to_le_bytes());
+        out.extend_from_slice(&values[start..start + s]);
+        i += run;
     }
-
-    let mut out = Vec::with_capacity(12 + runs.len() * (4 + sz));
-
-    // Header: count + value_size + run_count
-    out.extend_from_slice(&(count as u32).to_le_bytes());
-    out.extend_from_slice(&(sz as u32).to_le_bytes());
-    out.extend_from_slice(&(runs.len() as u32).to_le_bytes());
-
-    // Run entries
-    for (run_len, value) in &runs {
-        out.extend_from_slice(&run_len.to_le_bytes());
-        out.extend_from_slice(value);
-    }
-
     Ok(out)
 }
 
-/// RLE-decode a buffer back to raw PLAIN data.
-pub fn decode(encoded: &[u8], data_type: DataType) -> Result<Vec<u8>, CodecError> {
-    let sz = data_type.size_of();
-
-    if encoded.len() < 12 {
-        return Err(CodecError::InvalidInput);
-    }
-
-    let count = u32::from_le_bytes(encoded[..4].try_into().unwrap()) as usize;
-    let val_size = u32::from_le_bytes(encoded[4..8].try_into().unwrap()) as usize;
-    let run_count = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
-
-    if val_size != sz {
-        return Err(CodecError::InvalidInput);
-    }
-
-    let mut out = Vec::with_capacity(count * sz);
-    let mut offset = 12;
-    for _ in 0..run_count {
-        if offset + 4 + sz > encoded.len() {
-            return Err(CodecError::InvalidInput);
+pub fn decode(data_type: DataType, payload: &[u8], rows: usize) -> Result<Vec<u8>, CodecError> {
+    let s = data_type.size_of();
+    let mut out: Vec<u8> = Vec::with_capacity(rows * s);
+    let mut got = 0usize;
+    let mut pos = 0usize;
+    while got < rows {
+        if pos + 4 + s > payload.len() {
+            return Err(CodecError::Truncated { needed: pos + 4 + s, found: payload.len() });
         }
-        let run_len = u32::from_le_bytes(encoded[offset..offset + 4].try_into().unwrap());
-        let value = &encoded[offset + 4..offset + 4 + sz];
-        for _ in 0..run_len {
+        let run = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        let value = &payload[pos + 4..pos + 4 + s];
+        pos += 4 + s;
+        got += run;
+        if got > rows {
+            return Err(CodecError::RowCountMismatch { expected: rows, found: got });
+        }
+        for _ in 0..run {
             out.extend_from_slice(value);
         }
-        offset += 4 + sz;
     }
-
+    if pos != payload.len() {
+        return Err(CodecError::Corrupt("trailing bytes after final run"));
+    }
     Ok(out)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CodecError;
 
     #[test]
-    fn rle_roundtrip_with_runs() {
-        // Values: 5, 5, 5, 10, 10, 5
-        let values: Vec<i32> = vec![5, 5, 5, 10, 10, 5];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int32, 6).unwrap();
-        let decoded = decode(&encoded, DataType::Int32).unwrap();
-
-        assert_eq!(decoded, raw);
+    fn run_length_roundtrip() {
+        // 前 5 个相同 + 后续变化
+        let mut raw: Vec<u64> = vec![7; 5];
+        raw.extend((0..100).map(|i| i * 31));
+        raw.push(u64::MAX);
+        raw.push(u64::MAX);
+        let encoded = encode(DataType::UInt64, bytemuck::cast_slice(&raw)).unwrap();
+        let decoded = decode(DataType::UInt64, &encoded, raw.len()).unwrap();
+        assert_eq!(bytemuck::cast_slice::<u8, u64>(&decoded), raw.as_slice());
+        // 纯重复列压缩收益
+        let flat = vec![1u8; 8 * 1000];
+        let encoded = encode(DataType::Int64, &flat).unwrap();
+        assert_eq!(encoded.len(), 4 + 8);
     }
 
     #[test]
-    fn rle_all_same() {
-        // 100 identical values — RLE should produce a single run.
-        let values: Vec<i64> = vec![42i64; 100];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int64, 100).unwrap();
-
-        // Header (12) + 1 run entry (4 + 8) = 24 bytes vs 800 raw.
-        assert_eq!(encoded.len(), 12 + 4 + 8);
-        assert!(encoded.len() < raw.len());
-
-        let decoded = decode(&encoded, DataType::Int64).unwrap();
-        assert_eq!(decoded, raw);
-    }
-
-    #[test]
-    fn rle_no_repeats() {
-        // All distinct values — RLE won't help, but must still roundtrip.
-        let values: Vec<i32> = (0..10).collect();
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int32, 10).unwrap();
-        let decoded = decode(&encoded, DataType::Int32).unwrap();
-
-        assert_eq!(decoded, raw);
-        // 10 runs × (4 + 4) + 12 header = 92, vs 40 raw — RLE is larger.
-        assert_eq!(encoded.len(), 12 + 10 * (4 + 4));
-    }
-
-    #[test]
-    fn rle_single_element() {
-        let values: Vec<i64> = vec![77];
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-
-        let encoded = encode(&raw, DataType::Int64, 1).unwrap();
-        let decoded = decode(&encoded, DataType::Int64).unwrap();
-
-        assert_eq!(decoded, raw);
+    fn rejects_row_overflow_and_trailing_bytes() {
+        let dt = DataType::UInt8;
+        let encoded = encode(dt, &[9, 9, 9]).unwrap();
+        assert!(matches!(
+            decode(dt, &encoded, 2),
+            Err(CodecError::RowCountMismatch { expected: 2, found: 3 })
+        ));
+        let mut extra = encoded.clone();
+        extra.push(0);
+        assert!(matches!(decode(dt, &extra, 3), Err(CodecError::Corrupt(_))));
     }
 }

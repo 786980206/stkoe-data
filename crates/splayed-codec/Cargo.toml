@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Encoding (PLAIN/DELTA/RLE/BITPACK) and compression (NONE/ZSTD/LZ4) for Splayed V1"
+authors.workspace = true
+description = "Splayed V2.0 encoding (PLAIN/DELTA/RLE/BITPACK), compression (NONE/ZSTD/LZ4) and compressed FIELD chunk layout"
 
 [dependencies]
-splayed-format.workspace = true
+splayed-format = { path = "../splayed-format" }
 zstd = "0.13"
 lz4_flex = "0.11"
 bytemuck = "1"

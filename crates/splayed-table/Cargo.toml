@@ -1,0 +1,11 @@
+[package]
+name = "splayed-table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Splayed V2.0 table layer: Table / Partition organization, pruning, scan-read scheduling (per docs/splayed-table.md)"
+
+[dependencies]
+splayed-core = { path = "../splayed-core" }

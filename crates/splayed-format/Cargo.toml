@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Binary format definitions for Splayed V1 (META + FIELD headers, types, NULL encoding)"
+authors.workspace = true
+description = "Splayed V2.0 binary format definitions and zero-dep in-memory data model (Buffer / ColumnView / DataView)"
 
 [dependencies]
-bytemuck = "1"
+bytemuck = { version = "1", features = ["derive"] }
