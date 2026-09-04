@@ -73,6 +73,10 @@ pub fn to_polars_arrow_dtype(
 ///
 /// 数据缓冲所有权转移到 polars（本函数消费一次）；结构体布局等价于
 /// polars-arrow 的 `ffi::ArrowArray`（C data interface 规范），逐字段相同。
+///
+/// # Safety
+/// `arr` 的类型必须是 `to_polars_dtype` 支持的类型之一；对非 `Utf8` 类型会
+/// 构造 C data interface 结构体并转移缓冲所有权（调用方不得再使用该数组）。
 pub unsafe fn arrow_array_to_series(
     name: &str,
     arr: ArrayRef,

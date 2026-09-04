@@ -98,8 +98,8 @@ fn binary_col_literal(
     let l = col_or_literal(bin.left.as_ref(), schema)?;
     let r = col_or_literal(bin.right.as_ref(), schema)?;
     match (l, r) {
-        (Ok(col), Err(v)) => Some((col, v, false, bin.op.clone())),
-        (Err(v), Ok(col)) => Some((col, v, true, bin.op.clone())),
+        (Ok(col), Err(v)) => Some((col, v, false, bin.op)),
+        (Err(v), Ok(col)) => Some((col, v, true, bin.op)),
         _ => None,
     }
 }
@@ -301,7 +301,7 @@ fn invert_op(op: &Operator) -> Operator {
         Operator::GtEq => Operator::LtEq,
         Operator::Lt => Operator::Gt,
         Operator::LtEq => Operator::GtEq,
-        other => other.clone(),
+        other => *other,
     }
 }
 

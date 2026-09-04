@@ -27,7 +27,7 @@ fn temp_dir(suffix: &str) -> std::path::PathBuf {
 fn le<T: Copy>(vals: &[T]) -> Vec<u8> {
     // Only used for fixed-size Copy types; byte width comes from size_of.
     unsafe {
-        std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * std::mem::size_of::<T>())
+        std::slice::from_raw_parts(vals.as_ptr() as *const u8, std::mem::size_of_val(vals))
             .to_vec()
     }
 }

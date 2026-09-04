@@ -164,7 +164,7 @@ fn scan_time_range_filter() {
     // Verify time values are in range.
     for i in 0..batch.num_rows() {
         let t = time_at(&batch, i);
-        assert!(t >= 2 && t < 4, "time {t} not in [2,4)");
+        assert!((2..4).contains(&t), "time {t} not in [2,4)");
     }
 
     fs::remove_dir_all(&dir).ok();

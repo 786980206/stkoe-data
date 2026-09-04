@@ -1,0 +1,32 @@
+name: CI
+
+# Rust 工作区持续集成：零警告构建 + 全量测试。
+# 测试关闭 debuginfo（profile.test.debug=false）以规避 Windows MSVC PDB 抖动（LNK1318）。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (workspace)
+        run: cargo build --workspace --locked
+
+      - name: Test (workspace)
+        run: cargo test --workspace --locked --config "profile.test.debug=false"

@@ -365,7 +365,7 @@ async fn main() {
 }
 
 /// Export the dataset to Arrow IPC format (Phase 9: Splayed → Arrow → DuckDB).
-fn cmd_export_arrow(dir: &PathBuf, output: &PathBuf) {
+fn cmd_export_arrow(dir: &std::path::Path, output: &std::path::Path) {
     let rows = splayed_duckdb::export_to_arrow_ipc(dir, output).unwrap_or_else(|e| {
         eprintln!("✗ Export failed: {e}");
         std::process::exit(1);

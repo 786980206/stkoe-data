@@ -15,8 +15,8 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::prelude::SessionContext;
 use splayed_arrow::create_table;
 use splayed_datafusion::{
-    SplayedDatasetProvider, SplayedTableFactory, SplayedTableFunction, SplayedTableProvider,
-    register_splayed_table,
+    SplayedDatasetProvider, SplayedSubsetFunction, SplayedTableFactory, SplayedTableFunction,
+    SplayedTableProvider, register_splayed_table,
 };
 
 /// Global sequence so concurrently-running tests never share a temp dir.
@@ -54,8 +54,8 @@ fn make_batch(days: &[i32], base: f64) -> RecordBatch {
 /// `2025/` (days 100-104, close 200-204), each its own `.meta` dataset.
 fn make_table_dir() -> PathBuf {
     let root = temp_dir("part_table");
-    create_table(&root.join("2024"), &make_batch(&[0, 1, 2, 3, 4], 100.0), true).unwrap();
-    create_table(&root.join("2025"), &make_batch(&[100, 101, 102, 103, 104], 200.0), true).unwrap();
+    create_table(root.join("2024"), &make_batch(&[0, 1, 2, 3, 4], 100.0), true).unwrap();
+    create_table(root.join("2025"), &make_batch(&[100, 101, 102, 103, 104], 200.0), true).unwrap();
     root
 }
 
@@ -147,8 +147,8 @@ async fn sym_in_one_partition() {
         )
         .unwrap()
     };
-    create_table(&root.join("2024"), &mk("SYM01", &[0, 1, 2], 100.0), true).unwrap();
-    create_table(&root.join("2025"), &mk("SYM02", &[0, 1, 2], 200.0), true).unwrap();
+    create_table(root.join("2024"), &mk("SYM01", &[0, 1, 2], 100.0), true).unwrap();
+    create_table(root.join("2025"), &mk("SYM02", &[0, 1, 2], 200.0), true).unwrap();
 
     // sym = SYM02 must return exactly SYM02's rows — 2024 must not leak SYM01 rows.
     let batches = register_and_query(&root, "SELECT sym, close FROM t WHERE sym = 'SYM02'").await;
@@ -188,7 +188,7 @@ async fn single_meta_dir_is_single_partition() {
 async fn schema_mismatch_rejected() {
     let root = temp_dir("mismatch");
     // 2024: close; 2025: volume — different field sets.
-    create_table(&root.join("2024"), &make_batch(&[0, 1], 100.0), true).unwrap();
+    create_table(root.join("2024"), &make_batch(&[0, 1], 100.0), true).unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("time", ArrowDT::Date32, false),
         Field::new("sym", ArrowDT::Utf8, false),
@@ -203,7 +203,7 @@ async fn schema_mismatch_rejected() {
         ],
     )
     .unwrap();
-    create_table(&root.join("2025"), &rb, true).unwrap();
+    create_table(root.join("2025"), &rb, true).unwrap();
 
     assert!(SplayedTableProvider::new(&root).is_err());
 
@@ -350,5 +350,81 @@ async fn create_external_table_factory() {
 
     let batches = run_query(&ctx, "SELECT COUNT(*) AS c FROM t").await;
     assert_eq!(count_value(&batches), 10);
+    fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn table_function_read_splayed_subset() {
+    let root = temp_dir("subset");
+    // 2 SYM × 2 天：SYM01 close 100,101；SYM02 close 200,201（父全局行序）。
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("time", ArrowDT::Date32, false),
+        Field::new("sym", ArrowDT::Utf8, false),
+        Field::new("close", ArrowDT::Float64, true),
+    ]));
+    let rb = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(vec![0, 1, 0, 1])),
+            Arc::new(StringArray::from(vec!["SYM01", "SYM01", "SYM02", "SYM02"])),
+            Arc::new(Float64Array::from(vec![100.0, 101.0, 200.0, 201.0])),
+        ],
+    )
+    .unwrap();
+    create_table(&root, &rb, true).unwrap();
+
+    // 子集：SYM01 两天 {0,1} + SYM02 只取 day0。
+    splayed_core::create_subset(
+        &root,
+        "hs300",
+        &[
+            splayed_core::SubsetInput::new("SYM01", vec![(0i64, 2u32)]),
+            splayed_core::SubsetInput::new("SYM02", vec![(0i64, 1u32)]),
+        ],
+    )
+    .unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_udtf("read_splayed_subset", Arc::new(SplayedSubsetFunction));
+
+    let path = root.display().to_string().replace('\\', "/");
+    let batches = run_query(
+        &ctx,
+        &format!(
+            "SELECT COUNT(*) AS c, SUM(close) AS s FROM read_splayed_subset('{path}', 'hs300')"
+        ),
+    )
+    .await;
+    assert_eq!(batches[0].num_rows(), 1); // 聚合单行
+    assert_eq!(count_value(&batches), 3); // COUNT(*) = 子集行数
+    let sum = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(sum, 100.0 + 101.0 + 200.0); // 父全局行序
+
+    // 直接 SELECT 子集行。
+    let batches = run_query(
+        &ctx,
+        &format!("SELECT sym, close FROM read_splayed_subset('{path}', 'hs300') ORDER BY close"),
+    )
+    .await;
+    let closes: Vec<f64> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(closes, vec![100.0, 101.0, 200.0]);
+
     fs::remove_dir_all(&root).ok();
 }

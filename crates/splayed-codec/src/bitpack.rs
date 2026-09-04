@@ -75,11 +75,11 @@ pub fn encode(data: &[u8], data_type: DataType, count: usize) -> Result<Vec<u8>,
     } else {
         64 - range.leading_zeros() as u8
     };
-    let bit_width = bit_width.max(1).min(32);
+    let bit_width = bit_width.clamp(1, 32);
 
     // Pack values: subtract min, pack into bit_width bits.
     let total_bits = count as u64 * bit_width as u64;
-    let packed_byte_len = ((total_bits + 7) / 8) as usize;
+    let packed_byte_len = total_bits.div_ceil(8) as usize;
     let mut packed = vec![0u8; packed_byte_len];
 
     let mut bit_offset = 0usize;

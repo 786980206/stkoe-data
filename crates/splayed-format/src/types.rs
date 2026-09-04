@@ -431,9 +431,9 @@ mod tests {
         let nan = RawValue::from_f64(f64::from_bits(nan_bits));
         assert!(!nan.is_null());
 
-        let v = RawValue::from_f64(3.14);
+        let v = RawValue::from_f64(3.5);
         assert!(!v.is_null());
-        assert_eq!(v.as_f64(), Some(3.14));
+        assert_eq!(v.as_f64(), Some(3.5));
     }
 
     #[test]

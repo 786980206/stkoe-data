@@ -132,8 +132,8 @@ fn null_values_preserved() {
 fn partitioned_table_open() {
     let root = temp_dir("parts");
     // 两个 dataset 目录做分区表（自动探测）。
-    create_table(&root.join("2024"), &make_batch(), true).unwrap();
-    create_table(&root.join("2025"), &make_batch(), true).unwrap();
+    create_table(root.join("2024"), &make_batch(), true).unwrap();
+    create_table(root.join("2025"), &make_batch(), true).unwrap();
 
     let conn = Connection::open(&root).unwrap();
     let rows = conn.execute("SELECT close FROM splayed").unwrap();

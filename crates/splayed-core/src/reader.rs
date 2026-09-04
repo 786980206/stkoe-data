@@ -241,18 +241,6 @@ impl FieldReader {
         Ok(&data[start_byte..end_byte])
     }
 
-    /// Read a range of rows into a `Vec<RawValue>` (copy).
-    pub fn read_range(&self, start_row: u32, count: usize) -> Result<Vec<RawValue>, ReaderError> {
-        let dt = self.data_type();
-        let raw = self.read_range_raw(start_row, count)?;
-        let mut out = Vec::with_capacity(count);
-        let sz = dt.size_of();
-        for i in 0..count {
-            out.push(RawValue::read_le(raw, i * sz, dt));
-        }
-        Ok(out)
-    }
-
     /// Get a zero-copy `ColumnView` over the entire FIELD data region.
     ///
     /// For `compression = NONE` this borrows from the mmap.

@@ -20,7 +20,10 @@ use crate::scanner::{
     Filter, ParallelScanBatches, ScanRequest, Scanner, SymbolSelection, TimeRange,
     scan_owned_parallel,
 };
-use crate::table_writer::{TableColumn, create_table, update_meta, update_table};
+use crate::table_writer::{
+    FieldWriteOptions, TableColumn, create_table_with_options, update_meta,
+    update_table_with_options,
+};
 
 /// 分区表错误。
 #[derive(Debug)]
@@ -468,7 +471,7 @@ impl PartitionedTable {
             let sub = ScanRequest {
                 columns: request.columns.clone(),
                 symbols: task.symbols.clone(),
-                time_range: request.time_range.clone(),
+                time_range: request.time_range,
                 filters: request.filters.clone(),
                 batch_size: request.batch_size,
                 parallelism: 1,
@@ -540,6 +543,22 @@ pub fn create_partitioned_table(
     time_type: TimeType,
     inputs: &[PartitionWriteInput],
 ) -> Result<(), PartitionError> {
+    create_partitioned_table_with_options(
+        root,
+        time_type,
+        inputs,
+        FieldWriteOptions::default(),
+    )
+}
+
+/// [`create_partitioned_table`] + 新字段写选项（`opts` 非默认时各分区的新
+/// FIELD 直接以编码/压缩形式落盘，写后只读）。
+pub fn create_partitioned_table_with_options(
+    root: impl AsRef<Path>,
+    time_type: TimeType,
+    inputs: &[PartitionWriteInput],
+    opts: FieldWriteOptions,
+) -> Result<(), PartitionError> {
     let root = root.as_ref();
     if inputs.is_empty() {
         return Err(PartitionError::NoPartition {
@@ -573,13 +592,14 @@ pub fn create_partitioned_table(
                 .iter()
                 .map(|inp| {
                     s.spawn(move || {
-                        create_table(
+                        create_table_with_options(
                             root.join(&inp.name),
                             time_type,
                             &inp.sym,
                             &inp.time,
                             &inp.columns,
                             inp.sorted,
+                            opts,
                         )
                         .map(|_| ())
                         .map_err(PartitionError::Table)
@@ -596,6 +616,16 @@ pub fn create_partitioned_table(
 pub fn append_partition(
     root: impl AsRef<Path>,
     input: &PartitionWriteInput,
+) -> Result<(), PartitionError> {
+    append_partition_with_options(root, input, FieldWriteOptions::default())
+}
+
+/// [`append_partition`] + 新字段写选项（`opts` 非默认时新分区字段直接以
+/// 编码/压缩形式落盘，写后只读）。
+pub fn append_partition_with_options(
+    root: impl AsRef<Path>,
+    input: &PartitionWriteInput,
+    opts: FieldWriteOptions,
 ) -> Result<(), PartitionError> {
     let root = root.as_ref();
     let table = PartitionedTable::open(root)?;
@@ -636,13 +666,14 @@ pub fn append_partition(
             }
         }
     }
-    create_table(
+    create_table_with_options(
         root.join(&input.name),
         table.schema().time_type,
         &input.sym,
         &input.time,
         &input.columns,
         input.sorted,
+        opts,
     )
     .map_err(PartitionError::Table)
     .map(|_| ())
@@ -669,7 +700,6 @@ pub fn drop_partition(root: impl AsRef<Path>, name: &str) -> Result<(), Partitio
 ///   没有任何分区包含 → `SymTimeNotFound`。
 ///
 /// 路由后按分区分组，逐个委托单 dataset 的 `update_table`。
-#[allow(clippy::too_many_arguments)]
 pub fn update_partition_table(
     root: impl AsRef<Path>,
     sym: &[String],
@@ -677,6 +707,29 @@ pub fn update_partition_table(
     columns: &[TableColumn],
     create_missing_fields: bool,
     target_partition: Option<&str>,
+) -> Result<(), PartitionError> {
+    update_partition_table_with_options(
+        root,
+        sym,
+        time,
+        columns,
+        create_missing_fields,
+        target_partition,
+        FieldWriteOptions::default(),
+    )
+}
+
+/// [`update_partition_table`] + 新字段写选项（`opts` 非默认时**新创建**的
+/// 字段直接以编码/压缩形式落盘，写后只读；已存在字段仍原地更新）。
+#[allow(clippy::too_many_arguments)]
+pub fn update_partition_table_with_options(
+    root: impl AsRef<Path>,
+    sym: &[String],
+    time: &[i64],
+    columns: &[TableColumn],
+    create_missing_fields: bool,
+    target_partition: Option<&str>,
+    opts: FieldWriteOptions,
 ) -> Result<(), PartitionError> {
     let root = root.as_ref();
     if sym.len() != time.len() {
@@ -743,12 +796,13 @@ pub fn update_partition_table(
                 }
             })
             .collect();
-        update_table(
+        update_table_with_options(
             root.join(&name),
             &sub_sym,
             &sub_time,
             &sub_columns,
             create_missing_fields,
+            opts,
         )
         .map_err(PartitionError::Table)?;
     }
@@ -761,6 +815,17 @@ pub fn update_partition_table(
 pub fn update_partition_meta(
     root: impl AsRef<Path>,
     inputs: &[PartitionWriteInput],
+) -> Result<(), PartitionError> {
+    update_partition_meta_with_options(root, inputs, FieldWriteOptions::default())
+}
+
+/// [`update_partition_meta`] + 新字段写选项（`opts` 非默认时**新增分区**的
+/// 字段直接以编码/压缩形式落盘，写后只读；既有分区走 `update_meta` 重写为
+/// PLAIN+NONE 可写）。
+pub fn update_partition_meta_with_options(
+    root: impl AsRef<Path>,
+    inputs: &[PartitionWriteInput],
+    opts: FieldWriteOptions,
 ) -> Result<(), PartitionError> {
     let root = root.as_ref();
     let table = PartitionedTable::open(root)?;
@@ -815,13 +880,14 @@ pub fn update_partition_meta(
                         .map(|_| ())
                         .map_err(PartitionError::Table)
                     } else {
-                        create_table(
+                        create_table_with_options(
                             root.join(&inp.name),
                             inp.time_type,
                             &inp.sym,
                             &inp.time,
                             &inp.columns,
                             inp.sorted,
+                            opts,
                         )
                         .map(|_| ())
                         .map_err(PartitionError::Table)
@@ -968,7 +1034,7 @@ fn partition_filter_passes(f: &Filter, value: &str) -> bool {
 }
 
 /// 发现分区目录：`dir/.meta` 存在 → 单分区（`[dir]`）；否则子目录中含 `.meta`
-/// 者（按名升序）。
+/// 者（按名升序）。以 `.` 开头的隐藏目录（如 `.hidden/.meta`）不作为分区。
 fn discover_partitions(dir: &Path) -> Result<Vec<PathBuf>, PartitionError> {
     if dir.join(META_FILE_NAME).exists() {
         return Ok(vec![dir.to_path_buf()]);
@@ -977,7 +1043,11 @@ fn discover_partitions(dir: &Path) -> Result<Vec<PathBuf>, PartitionError> {
     for entry in fs::read_dir(dir).map_err(PartitionError::Io)? {
         let entry = entry.map_err(PartitionError::Io)?;
         let p = entry.path();
-        if p.is_dir() && p.join(META_FILE_NAME).exists() {
+        let hidden = p
+            .file_name()
+            .map(|s| s.to_string_lossy().starts_with('.'))
+            .unwrap_or(false);
+        if !hidden && p.is_dir() && p.join(META_FILE_NAME).exists() {
             out.push(p);
         }
     }
@@ -991,12 +1061,15 @@ fn discover_partitions(dir: &Path) -> Result<Vec<PathBuf>, PartitionError> {
 }
 
 /// 分区字段列表（名 + 类型，按名升序）：只读各 FIELD 头部 64 字节。
+///
+/// 规则：以 `.` 开头（`.meta` 及隐藏文件）、非文件、`*.new` / `*.tmp` 临时文件、
+/// header 校验失败的条目一律忽略；字段名中间可含 `.`（如 `close.bid`）。
 fn list_field_schema(dir: &Path) -> Result<Vec<(String, DataType)>, PartitionError> {
     let mut fields = Vec::new();
     for entry in fs::read_dir(dir).map_err(PartitionError::Io)? {
         let entry = entry.map_err(PartitionError::Io)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == META_FILE_NAME || entry.path().file_name().is_none() {
+        if name.starts_with('.') || entry.path().file_name().is_none() {
             continue;
         }
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {

@@ -228,7 +228,7 @@ impl<'ds> Scanner<'ds> {
 
             // Find the first time axis index >= request.time_range.start
             // that falls within [interval_start, interval_end).
-            let range_start_idx = if request.time_range.start <= i64::MIN {
+            let range_start_idx = if request.time_range.start == i64::MIN {
                 interval_start
             } else {
                 // Binary search in time_axis for start
@@ -245,7 +245,7 @@ impl<'ds> Scanner<'ds> {
             };
 
             // Find the last time axis index < request.time_range.end
-            let range_end_idx = if request.time_range.end >= i64::MAX {
+            let range_end_idx = if request.time_range.end == i64::MAX {
                 interval_end
             } else {
                 match meta.time_axis.binary_search(&request.time_range.end) {
@@ -380,7 +380,7 @@ impl<'ds> Scanner<'ds> {
 
         // Partition ranges across threads (clone to make them 'static/Send).
         let n_threads = request.parallelism.min(plan.ranges.len());
-        let chunk_size = (plan.ranges.len() + n_threads - 1) / n_threads;
+        let chunk_size = plan.ranges.len().div_ceil(n_threads);
         let range_chunks: Vec<Vec<RowRange>> = plan
             .ranges
             .chunks(chunk_size)
@@ -724,7 +724,7 @@ impl<'ds, 'r> ScanBatches<'ds, 'r> {
         let col_data: Vec<(String, Vec<u8>, DataType)> = self
             .readers
             .iter()
-            .zip(col_bufs.into_iter())
+            .zip(col_bufs)
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
             .collect();
         let has_nulls: Vec<bool> = self
@@ -904,7 +904,7 @@ impl OwnedScanBatches {
         let col_data: Vec<(String, Vec<u8>, DataType)> = self
             .readers
             .iter()
-            .zip(col_bufs.into_iter())
+            .zip(col_bufs)
             .map(|((name, reader), buf)| (name.clone(), buf, reader.data_type()))
             .collect();
         let has_nulls: Vec<bool> = self
@@ -989,7 +989,7 @@ pub fn split_ranges(plan: &ScanPlan, n: usize) -> Vec<Vec<RowRange>> {
         return vec![plan.ranges.clone()];
     }
     let total: u64 = plan.ranges.iter().map(|r| r.count as u64).sum();
-    let target = ((total + n as u64 - 1) / n as u64).max(1) as u32;
+    let target = total.div_ceil(n as u64).max(1) as u32;
 
     // Split oversized ranges first so a huge symbol doesn't starve the other
     // partitions (skewed-symbol friendly).
@@ -1142,18 +1142,21 @@ impl Filter {
     }
 }
 
+/// 一个投影列的缓冲：`(字段名, 原始字节, 数据类型)`。
+pub(crate) type ColData = (String, Vec<u8>, DataType);
+
 /// Apply a conjunction of value filters to a batch's column data, compacting
 /// to only the rows that pass **all** of them (AND semantics).
 ///
 /// Shared between `ScanBatches::next_batch`, `scan_all_parallel`, and
 /// `OwnedScanBatches::next_batch` so every path behaves identically.
 fn apply_filters(
-    mut col_data: Vec<(String, Vec<u8>, DataType)>,
+    mut col_data: Vec<ColData>,
     sym_indices: &mut Vec<usize>,
     time_values: &mut Vec<i64>,
     filters: &[Filter],
     mut row_count: usize,
-) -> Result<(Vec<(String, Vec<u8>, DataType)>, usize), ScannerError> {
+) -> Result<(Vec<ColData>, usize), ScannerError> {
     for filter in filters {
         let filter_field = filter.field_name();
         let idx = col_data
@@ -1347,12 +1350,12 @@ fn filter_passes(filter: &Filter, val: &splayed_format::RawValue) -> bool {
                 return false;
             }
             match filter {
-                Filter::GreaterThan { value, .. } => compare(val, value).map_or(false, |c| c > 0),
-                Filter::GreaterOrEqual { value, .. } => compare(val, value).map_or(false, |c| c >= 0),
-                Filter::LessThan { value, .. } => compare(val, value).map_or(false, |c| c < 0),
-                Filter::LessOrEqual { value, .. } => compare(val, value).map_or(false, |c| c <= 0),
-                Filter::Equal { value, .. } => compare(val, value).map_or(false, |c| c == 0),
-                Filter::NotEqual { value, .. } => compare(val, value).map_or(false, |c| c != 0),
+                Filter::GreaterThan { value, .. } => compare(val, value).is_some_and(|c| c > 0),
+                Filter::GreaterOrEqual { value, .. } => compare(val, value).is_some_and(|c| c >= 0),
+                Filter::LessThan { value, .. } => compare(val, value).is_some_and(|c| c < 0),
+                Filter::LessOrEqual { value, .. } => compare(val, value).is_some_and(|c| c <= 0),
+                Filter::Equal { value, .. } => compare(val, value).is_some_and(|c| c == 0),
+                Filter::NotEqual { value, .. } => compare(val, value).is_some_and(|c| c != 0),
                 Filter::IsNull { .. } | Filter::IsNotNull { .. } => unreachable!("handled above"),
             }
         }
@@ -1465,7 +1468,7 @@ mod tests {
 
     #[test]
     fn filter_comparison_float() {
-        let val = RawValue::from_f64(3.14);
+        let val = RawValue::from_f64(3.25);
         assert!(filter_passes(
             &Filter::GreaterThan { field: "x".into(), value: FilterValue::Float64(3.0) },
             &val

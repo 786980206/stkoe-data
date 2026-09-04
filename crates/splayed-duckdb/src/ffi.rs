@@ -84,7 +84,7 @@ thread_local! {
 
 fn set_err(msg: impl AsRef<str>) {
     let msg = msg.as_ref();
-    let _ = LAST_ERR.with(|c| {
+    LAST_ERR.with(|c| {
         *c.borrow_mut() = Some(CString::new(msg).unwrap_or_default());
     });
 }
@@ -105,6 +105,10 @@ pub extern "C" fn splayed_last_error() -> *const c_char {
 type DatasetHandle = Arc<Dataset>;
 
 /// 打开一个 dataset（`dir` 必须直接含 `.meta`）。
+///
+/// # Safety
+/// `dir` 必须指向 `dir_len` 字节的合法可读内存（UTF-8 路径字节）；返回句柄
+/// 所有权归调用方，须经 `splayed_dataset_close` 释放。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_dataset_open(dir: *const c_char, dir_len: u32) -> *mut c_void {
     let path = unsafe { c_bytes_to_string(dir, dir_len) };
@@ -118,6 +122,9 @@ pub unsafe extern "C" fn splayed_dataset_open(dir: *const c_char, dir_len: u32) 
 }
 
 /// 关闭数据集句柄。
+///
+/// # Safety
+/// `handle` 必须来自 `splayed_dataset_open`，且只能关闭一次（之后不得再使用）。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_dataset_close(handle: *mut c_void) {
     if !handle.is_null() {
@@ -126,6 +133,9 @@ pub unsafe extern "C" fn splayed_dataset_close(handle: *mut c_void) {
 }
 
 /// 列数（time + sym + fields）。
+///
+/// # Safety
+/// `handle` 必须为 `splayed_dataset_open` 返回且尚未关闭的有效句柄。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_dataset_schema_count(handle: *mut c_void) -> i32 {
     let ds = unsafe { &*(handle as *const DatasetHandle) };
@@ -134,6 +144,10 @@ pub unsafe extern "C" fn splayed_dataset_schema_count(handle: *mut c_void) -> i3
 }
 
 /// 第 i 个列的元数据（name / type_id / nullable）。
+///
+/// # Safety
+/// `handle` 须为有效数据集句柄；`name_out/name_len_out/type_out/nullable_out`
+/// 须指向可写的合法内存。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_dataset_schema_field(
     handle: *mut c_void,
@@ -194,6 +208,10 @@ struct ScanState {
 /// 打开一次扫描：`cols`/`col_lens` 为要读取的 FIELD 列名（长度数组）。
 ///
 /// 返回扫描句柄；失败返回 NULL（`splayed_last_error`）。
+///
+/// # Safety
+/// `dataset` 须为有效数据集句柄；`cols`/`col_lens` 须各指向 `col_count` 个
+/// 元素的合法数组；返回句柄所有权归调用方，须经 `splayed_scan_close` 释放。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_scan_open(
     dataset: *mut c_void,
@@ -244,6 +262,9 @@ pub unsafe extern "C" fn splayed_scan_open(
 }
 
 /// 取下一批：返回 1 = 有批（`*out` 填好），0 = 结束，负值 = 错误。
+///
+/// # Safety
+/// `scan` 须为 `splayed_scan_open` 返回且未关闭的有效句柄；`out` 须指向可写内存。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_scan_next(
     scan: *mut c_void,
@@ -276,6 +297,10 @@ pub unsafe extern "C" fn splayed_scan_next(
 }
 
 /// 取字典列（SYM）第 `idx` 个字符串（Rust 持有，至下一次调用前有效）。
+///
+/// # Safety
+/// `scan` 须为有效扫描句柄且最近一次 `splayed_scan_next` 返回 1；
+/// `out_ptr/out_len` 须指向可写内存。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_scan_dict_value(
     scan: *mut c_void,
@@ -314,6 +339,9 @@ pub unsafe extern "C" fn splayed_scan_dict_value(
 }
 
 /// 关闭扫描句柄。
+///
+/// # Safety
+/// `scan` 须为 `splayed_scan_open` 返回且未关闭的有效句柄；只可关闭一次。
 #[no_mangle]
 pub unsafe extern "C" fn splayed_scan_close(scan: *mut c_void) {
     if !scan.is_null() {

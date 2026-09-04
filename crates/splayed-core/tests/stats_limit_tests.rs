@@ -57,8 +57,8 @@ fn build_dataset(dir: &PathBuf) {
 
     let mut close = f64_col(&[100.0, 101.0, 102.0, 103.0, 104.0]);
     close.extend_from_slice(&f64_col(&[200.0, 201.0, 202.0, 203.0, 204.0]));
-    let mut vol = i64_col(&[Some(1); 5].as_slice());
-    vol.extend_from_slice(&i64_col(&[None, Some(2), Some(3), Some(4), Some(5)].as_slice()));
+    let mut vol = i64_col(&[Some(1); 5]);
+    vol.extend_from_slice(&i64_col(&[None, Some(2), Some(3), Some(4), Some(5)]));
 
     // create_table 自带 create_meta，并要求目录为空（勿先调 create_meta）。
     create_table(
@@ -158,8 +158,7 @@ fn update_field_incremental_stats_and_null_count() {
     // null_count 精确增量：vol 基底 null_count=1（SYM01 首行起 5 个值里…见
     // build_dataset：前 5 个值 [1,1,1,1,1] 后 5 个 [None,2,3,4,5] → 1 个 NULL）。
     let nulls = ST::Int64.null_bytes();
-    let mut items3 = Vec::new();
-    items3.push(UpdateItem::new(0, nulls.to_vec()));
+    let items3 = vec![UpdateItem::new(0, nulls.to_vec())];
     update_field(dir.join("vol"), &items3).unwrap();
     let vr = FieldReader::open(dir.join("vol")).unwrap();
     assert_eq!(vr.header().null_count, 2); // 值 1 → NULL +1

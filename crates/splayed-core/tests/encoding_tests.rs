@@ -52,7 +52,7 @@ fn build_dataset(dir: &PathBuf) {
     .unwrap();
 }
 
-fn read_all(dir: &PathBuf, field: &str) -> Vec<i64> {
+fn read_all(dir: &std::path::Path, field: &str) -> Vec<i64> {
     let r = FieldReader::open(dir.join(field)).unwrap();
     (0..r.row_count())
         .map(|i| r.read_row(i).unwrap().as_i64().unwrap())

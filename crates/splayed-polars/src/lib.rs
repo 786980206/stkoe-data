@@ -15,5 +15,6 @@ pub mod arrowconv;
 pub mod predicate;
 
 pub use anonymous::{
-    SplayedScan, SplayedTableScan, splayed_lazyframe, splayed_lazyframe_table,
+    SplayedScan, SplayedTableScan, splayed_lazyframe, splayed_lazyframe_subset,
+    splayed_lazyframe_table,
 };

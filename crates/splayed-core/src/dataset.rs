@@ -26,13 +26,16 @@ impl Dataset {
         self.dir.join(field_name)
     }
 
-    /// List the FIELD files present in this dataset (excluding `.meta`).
+    /// List the FIELD files present in this dataset.
+    ///
+    /// 规则：字段文件名**可以包含 `.`**（如 `close.bid`、`price.usd`），但
+    /// **以 `.` 开头**的文件（`.meta` 及任意隐藏/元数据文件）一律忽略、不作为字段。
     pub fn list_fields(&self) -> std::io::Result<Vec<String>> {
         let mut fields = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
-            if name != META_FILE_NAME && entry.file_type()?.is_file() {
+            if !name.starts_with('.') && entry.file_type()?.is_file() {
                 fields.push(name);
             }
         }

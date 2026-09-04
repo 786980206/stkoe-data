@@ -78,8 +78,7 @@ impl SplayedStatsAggRule {
             .map(|s| Expr::Literal(s.clone(), None))
             .collect::<Vec<_>>()];
         let values = LogicalPlanBuilder::values(rows).ok()?;
-        let projected = LogicalPlanBuilder::from(values)
-            .project(
+        let projected = values.project(
                 scalars
                     .iter()
                     .enumerate()

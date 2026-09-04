@@ -68,7 +68,7 @@ fn build_dataset(dir: &PathBuf) {
     .unwrap();
 }
 
-fn close_reader(dir: &PathBuf) -> Vec<f64> {
+fn close_reader(dir: &std::path::Path) -> Vec<f64> {
     // 直接按文件行序读出 close（全局行序）。
     let r = FieldReader::open(dir.join("close")).unwrap();
     let n = r.row_count() as usize;

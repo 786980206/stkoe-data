@@ -1,0 +1,87 @@
+site_name: Splayed V1
+site_description: 面向金融时序数据 SYM × TIME × FIELD 的专用列式存储引擎 —— O(1) 行定位、mmap/零拷贝读取、全预分配写入
+site_author: Splayed V1
+
+# 如配置了 GitHub 远端，可在此填写仓库地址（用于页脚编辑链接与仓库链接）：
+# repo_url: https://github.com/<owner>/<repo>
+# edit_uri: blob/main/docs/
+
+theme:
+  name: material
+  language: zh
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - 首页: index.md
+  - 快速上手: getting-started.md
+  - 架构设计:
+      - 架构总览: architecture.md
+      - CoreBatch 内存模型: corebatch.md
+      - 分区策略: partitioning.md
+  - 磁盘格式规范:
+      - 格式总览: format/index.md
+      - META 格式: format/meta-format.md
+      - FIELD 格式: format/field-format.md
+      - SUBSET 格式（.sub.xxx）: format/subset-format.md
+      - 类型与 NULL 编码: format/types-null.md
+      - 编码与压缩: format/codec.md
+      - Generation 与原子提交: format/generation.md
+  - Crate 参考:
+      - Crate 一览: crates/index.md
+      - splayed-core: crates/core.md
+      - splayed-format: crates/format.md
+      - splayed-codec: crates/codec.md
+      - splayed-arrow: crates/arrow.md
+      - splayed-datafusion: crates/datafusion.md
+      - splayed-duckdb: crates/duckdb.md
+      - splayed-duckdb-extension: crates/duckdb-extension.md
+      - splayed-polars: crates/polars.md
+      - splayed-python: crates/python.md
+      - splayed-adbc: crates/adbc.md
+      - splayed-cli: crates/cli.md
+      - splayed（umbrella）: crates/umbrella.md
+  - 集成指南:
+      - DataFusion: integrations/datafusion.md
+      - DuckDB: integrations/duckdb.md
+      - Polars: integrations/polars.md
+      - ADBC: integrations/adbc.md
+      - Python 示例: integrations/examples.md
+  - 开发指南:
+      - 构建与测试: development/build-test.md
+      - 开发流程: development/contributing.md
+      - 阶段状态: development/phases.md
+      - 未实现 / Roadmap: development/roadmap.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true

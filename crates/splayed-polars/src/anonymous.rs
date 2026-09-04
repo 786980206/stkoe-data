@@ -123,7 +123,7 @@ impl AnonymousScan for SplayedScan {
             .collect();
 
         // 2) 谓词 → 核心裁剪（尽力；未翻译部分由物理评估兜底）。
-        let dtype_of = |name: &str| self.schema.get(name).map(|d| d.clone());
+        let dtype_of = |name: &str| self.schema.get(name).cloned();
         let hint = predicate::translate(
             args.predicate.as_ref(),
             &dtype_of,
@@ -353,7 +353,7 @@ impl AnonymousScan for SplayedTableScan {
             .cloned()
             .collect();
 
-        let dtype_of = |name: &str| self.schema.get(name).map(|d| d.clone());
+        let dtype_of = |name: &str| self.schema.get(name).cloned();
         let hint = predicate::translate(
             args.predicate.as_ref(),
             &dtype_of,
@@ -384,7 +384,7 @@ impl AnonymousScan for SplayedTableScan {
             let req = ScanRequest {
                 columns: field_names.clone(),
                 symbols: task.symbols.clone(),
-                time_range: preq.time_range.clone(),
+                time_range: preq.time_range,
                 filters: preq.filters.clone(),
                 batch_size: preq.batch_size,
                 parallelism: 1,
@@ -487,4 +487,25 @@ pub fn splayed_lazyframe_table(dir: impl AsRef<Path>) -> PolarsResult<LazyFrame>
         ..Default::default()
     };
     LazyFrame::anonymous_scan(Arc::new(scan), args)
+}
+
+// ---------------------------------------------------------------------------
+// 子集（`.sub.xxx`）→ 惰性帧（物化视图）
+// ---------------------------------------------------------------------------
+
+/// 子集 `.sub.{sub_name}`（父 dataset 目录）注册为 Polars 惰性帧。
+///
+/// 子集是父 `.meta` 网格的视图：直接经 `splayed_arrow::read_subset` 物化
+/// （父全局行序，列 = time/sym/全部字段）后转 polars，适合「父表 + 成分股
+/// 子集」这类读取。大表全量扫描请用 [`splayed_lazyframe`]（下推扫描，
+/// 子集侧无谓词下推——先物化再过滤）。
+pub fn splayed_lazyframe_subset(
+    dir: impl AsRef<Path>,
+    sub_name: &str,
+) -> PolarsResult<LazyFrame> {
+    let rb = splayed_arrow::read_subset(dir, sub_name, &[])
+        .map_err(|e| polars_err!(ComputeError: "read subset {sub_name}: {e}"))?;
+    let names: Vec<String> = rb.schema().fields().iter().map(|f| f.name().clone()).collect();
+    let df = record_batch_to_dataframe(&rb, &names)?;
+    Ok(df.lazy())
 }

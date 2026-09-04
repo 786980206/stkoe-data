@@ -43,7 +43,7 @@ fn syms_of(v: &[&str]) -> Vec<String> {
 }
 
 /// Read a single row's value back through the reader.
-fn read_row(dir: &PathBuf, field: &str, row: u32) -> RawValue {
+fn read_row(dir: &std::path::Path, field: &str, row: u32) -> RawValue {
     let reader = FieldReader::open(dir.join(field)).unwrap();
     reader.read_row(row).unwrap()
 }

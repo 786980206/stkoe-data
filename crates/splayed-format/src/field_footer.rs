@@ -70,7 +70,7 @@ pub fn compute_stats(data_type: DataType, data: &[u8]) -> Option<([u8; 8], [u8; 
                 f_max = Some(f_max.map_or(v, |m| m.max(v)));
             }
             Bool => {
-                let v = chunk[0] as u8;
+                let v = chunk[0];
                 u_min = Some(u_min.map_or(v as u128, |m| m.min(v as u128)));
                 u_max = Some(u_max.map_or(v as u128, |m| m.max(v as u128)));
             }
@@ -111,13 +111,10 @@ pub fn encode_footer(stats: Option<([u8; 8], [u8; 8])>) -> [u8; FOOTER_SIZE] {
     let mut f = [0u8; FOOTER_SIZE];
     f[..4].copy_from_slice(&FOOTER_MAGIC.to_le_bytes());
     f[4] = 1; // version
-    match stats {
-        Some((mn, mx)) => {
-            f[5] = FOOTER_FLAG_STATS_VALID;
-            f[8..16].copy_from_slice(&mn);
-            f[16..24].copy_from_slice(&mx);
-        }
-        None => {}
+    if let Some((mn, mx)) = stats {
+        f[5] = FOOTER_FLAG_STATS_VALID;
+        f[8..16].copy_from_slice(&mn);
+        f[16..24].copy_from_slice(&mx);
     }
     f[24..28].copy_from_slice(&(FOOTER_SIZE as u32).to_le_bytes());
     f
@@ -210,10 +207,10 @@ mod tests {
         use DataType::*;
         // Int32：[MIN(哨兵), 5, 3, MAX(哨兵), 7] → [3, 7]
         let mut data = Vec::new();
-        data.extend_from_slice(&Int32.null_bytes());
+        data.extend_from_slice(Int32.null_bytes());
         data.extend_from_slice(&5i32.to_le_bytes());
         data.extend_from_slice(&3i32.to_le_bytes());
-        data.extend_from_slice(&Int32.null_bytes());
+        data.extend_from_slice(Int32.null_bytes());
         data.extend_from_slice(&7i32.to_le_bytes());
         let (mn, mx) = compute_stats(Int32, &data).unwrap();
         assert_eq!(mn, slot(3));
@@ -243,7 +240,6 @@ mod tests {
     #[test]
     fn compute_stats_all_null_is_none() {
         use DataType::*;
-        let data = vec![0u8; 8 * 4]; // 任意 4 行
         // Float64 全到底是什么取决于内容；直接用 Int32 全 NULL
         let nulls = Int32.null_bytes();
         let mut d = Vec::new();
@@ -251,15 +247,12 @@ mod tests {
             d.extend_from_slice(nulls);
         }
         assert!(compute_stats(Int32, &d).is_none());
-        let _ = data.len();
     }
 
     #[test]
     fn compute_stats_narrow_types() {
         use DataType::*;
-        let mut d = Vec::new();
-        d.push((-5i8) as u8);
-        d.push(3i8 as u8);
+        let d = vec![(-5i8) as u8, 3i8 as u8];
         let (mn, mx) = compute_stats(Int8, &d).unwrap();
         assert_eq!(mn, slot(-5i8 as i64 as u64));
         assert_eq!(mx, slot(3));

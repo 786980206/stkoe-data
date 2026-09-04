@@ -341,10 +341,13 @@ impl MetaBuilder {
         time_axis.dedup();
         let time_count = time_axis.len() as u32;
 
-        // Build time → index lookup.
-        let time_index = |t: i64| -> usize {
-            time_axis.binary_search(&t).expect("time must exist after dedup")
-        };
+        // Build time → index lookup (O(1) amortized vs per-pair binary search).
+        let time_index: std::collections::HashMap<i64, usize> = time_axis
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(i, t)| (t, i))
+            .collect();
 
         // 2. SYM: deduplicated ascending.
         let mut symbols: Vec<String> = self.pairs.iter().map(|(s, _)| s.clone()).collect();
@@ -366,7 +369,7 @@ impl MetaBuilder {
             let mut last_ti: usize = 0;
             while pair_idx < self.pairs.len() && self.pairs[pair_idx].0 == *sym {
                 let t = self.pairs[pair_idx].1;
-                let ti = time_index(t);
+                let ti = time_index[&t];
                 if first_ti.is_none() {
                     first_ti = Some(ti);
                 }

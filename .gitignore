@@ -13,3 +13,9 @@ Thumbs.db
 
 # Temp test dirs (from integration tests)
 /splayed_test_*
+
+# splayed-python 扩展产物（build_pyd.ps1 生成）
+*.pyd
+
+# MkDocs build output
+/site/

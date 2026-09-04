@@ -45,8 +45,8 @@ fn scan_table_to_chunks_merges_partitions() {
 
     let root = std::env::temp_dir().join(format!("splayed_duck_tbl_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    create_table(&root.join("2024"), &make_batch(), true).unwrap();
-    create_table(&root.join("2025"), &make_batch(), true).unwrap();
+    create_table(root.join("2024"), &make_batch(), true).unwrap();
+    create_table(root.join("2025"), &make_batch(), true).unwrap();
 
     let mut values = Vec::new();
     let total = scan_table_to_chunks(

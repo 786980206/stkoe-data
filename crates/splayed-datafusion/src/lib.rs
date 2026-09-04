@@ -35,7 +35,8 @@ pub mod table;
 
 pub use dataset::SplayedDatasetProvider;
 pub use register::{
-    auto_provider, register_splayed_table, SplayedTableFactory, SplayedTableFunction,
+    auto_provider, register_splayed_table, SplayedSubsetFunction, SplayedTableFactory,
+    SplayedTableFunction,
 };
 pub use stats_agg_rule::{SplayedStatsAggRule, with_splayed_optimizer_rules};
 pub use table::SplayedTableProvider;

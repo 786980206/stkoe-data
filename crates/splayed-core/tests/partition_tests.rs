@@ -73,7 +73,7 @@ fn discover_and_merge_schema() {
     assert_eq!(table.symbols(), &["SYM01", "SYM02", "SYM03"]);
 
     // 单 dataset 目录 → 单分区（名 "."）。
-    let single = PartitionedTable::open(&root.join("2024")).unwrap();
+    let single = PartitionedTable::open(root.join("2024")).unwrap();
     assert_eq!(single.partition_count(), 1);
     assert_eq!(single.partitions()[0].name, ".");
 

@@ -11,9 +11,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use splayed_format::{DataType, MetaBuilder, MetaFile, TimeType, META_FILE_NAME};
+use splayed_format::{Compression, DataType, Encoding, MetaBuilder, MetaFile, TimeType, META_FILE_NAME};
 
-use crate::field_writer::{create_field_with_data, update_field, UpdateItem};
+use crate::field_writer::{
+    create_field_with_data, create_field_with_data_encoded, update_field, UpdateItem,
+};
 use crate::{CreateFieldError, DatasetError, FieldReader, UpdateError, open_dataset};
 
 /// One FIELD column in **input-row order**: raw little-endian values.
@@ -25,6 +27,50 @@ pub struct TableColumn {
     pub name: String,
     pub data_type: DataType,
     pub values: Vec<u8>,
+}
+
+/// 新建 FIELD 的编码 + 压缩选项（作用于 `create_table_with_options` /
+/// `update_table_with_options` 中**新创建**的字段；已存在字段不受影响）。
+///
+/// 默认 `PLAIN + NONE`（可写，mmap 零拷贝）——与既有行为一致。设为非默认值时，
+/// 新字段直接以编码/压缩形式落盘（写后**只读**），适合"一次写入、多次读取"的
+/// 稀疏因子列（如 90%~99% NULL 的 `RLE + ZSTD`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldWriteOptions {
+    pub encoding: Encoding,
+    pub compression: Compression,
+}
+
+impl Default for FieldWriteOptions {
+    fn default() -> Self {
+        Self {
+            encoding: Encoding::Plain,
+            compression: Compression::None,
+        }
+    }
+}
+
+/// 写一个新字段：默认选项走 `create_field_with_data`，非默认走
+/// `create_field_with_data_encoded`（两者在默认选项下输出字节一致）。
+fn write_new_field(
+    dir: &Path,
+    col: &TableColumn,
+    global: &[u8],
+    opts: FieldWriteOptions,
+) -> Result<(), TableError> {
+    if opts.encoding == Encoding::Plain && opts.compression == Compression::None {
+        create_field_with_data(dir.join(&col.name), col.data_type, global)
+            .map_err(TableError::CreateField)
+    } else {
+        create_field_with_data_encoded(
+            dir.join(&col.name),
+            col.data_type,
+            global,
+            opts.encoding,
+            opts.compression,
+        )
+        .map_err(TableError::CreateField)
+    }
 }
 
 /// Build + atomically write `.meta` from (SYM, TIME) pairs.
@@ -86,14 +132,37 @@ pub fn create_table(
     columns: &[TableColumn],
     sorted: bool,
 ) -> Result<MetaFile, TableError> {
+    create_table_with_options(
+        dir,
+        time_type,
+        sym,
+        time,
+        columns,
+        sorted,
+        FieldWriteOptions::default(),
+    )
+}
+
+/// [`create_table`] + 新字段写选项：`opts` 非默认时，全部新 FIELD 直接以
+/// 编码/压缩形式落盘（写后只读）。
+pub fn create_table_with_options(
+    dir: impl AsRef<Path>,
+    time_type: TimeType,
+    sym: &[String],
+    time: &[i64],
+    columns: &[TableColumn],
+    sorted: bool,
+    opts: FieldWriteOptions,
+) -> Result<MetaFile, TableError> {
     let dir = dir.as_ref();
 
     // Directory must be empty or not exist (plan §8.4 create_table constraint).
+    // 以 `.` 开头的条目（`.gitkeep`、`.DS_Store` 等隐藏/元数据文件）不视为非空。
     if dir.exists() {
         let non_empty = fs::read_dir(dir)
             .map_err(TableError::Io)?
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name() != ".gitkeep");
+            .any(|e| !e.file_name().to_string_lossy().starts_with('.'));
         if non_empty {
             return Err(TableError::DirNotEmpty);
         }
@@ -122,8 +191,7 @@ pub fn create_table(
         } else {
             scatter_to_global(&meta, sym, time, col)?
         };
-        create_field_with_data(dir.join(&col.name), col.data_type, &global)
-            .map_err(TableError::CreateField)?;
+        write_new_field(dir, col, &global, opts)?;
     }
 
     Ok(meta)
@@ -139,6 +207,24 @@ fn is_sorted_by_sym_time(sym: &[String], time: &[i64]) -> bool {
     true
 }
 
+/// 由 `(sym, time)` 解析父全局行号：符号经 `sym_map`（O(1)），时间只在
+/// 该 SYM 的连续块子区间内二分。未知符号 / 时间不在块内 → `None`。
+///
+/// `create_table`（非排序路径）与 `update_table` 共用，避免逐行字符串二分。
+fn resolve_global_row(
+    meta: &MetaFile,
+    sym_map: &std::collections::HashMap<&str, usize>,
+    sym: &str,
+    time: i64,
+) -> Option<u32> {
+    let si = *sym_map.get(sym)?;
+    let rec = &meta.sym_index[si];
+    let block = &meta.time_axis
+        [rec.time_start as usize..(rec.time_start + rec.time_count) as usize];
+    let pos = block.binary_search(&time).ok()?;
+    Some(rec.row_start + pos as u32)
+}
+
 /// Scatter an input-row-order column into global-row order.
 ///
 /// The buffer spans the FULL global row space — input rows may be sparse
@@ -152,10 +238,15 @@ fn scatter_to_global(
     let elem_sz = col.data_type.size_of();
     let mut global = vec![0u8; meta.total_rows() as usize * elem_sz];
     splayed_format::fill_null(&mut global, col.data_type);
+    let sym_map: std::collections::HashMap<&str, usize> = meta
+        .symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
     for i in 0..sym.len() {
-        let gr = meta
-            .global_row(&sym[i], time[i])
-            .ok_or_else(|| TableError::SymTimeNotFound { row: i })? as usize;
+        let gr = resolve_global_row(meta, &sym_map, &sym[i], time[i])
+            .ok_or(TableError::SymTimeNotFound { row: i })? as usize;
         let src = &col.values[i * elem_sz..(i + 1) * elem_sz];
         global[gr * elem_sz..(gr + 1) * elem_sz].copy_from_slice(src);
     }
@@ -189,7 +280,7 @@ fn scatter_to_global_sorted(
         let t = time[i];
 
         // Advance to a new symbol once per group.
-        if sym_idx.map_or(true, |si| meta.symbols[si] != *s) {
+        if sym_idx.is_none_or(|si| meta.symbols[si] != *s) {
             let si = meta
                 .symbols
                 .binary_search_by(|x| x.as_str().cmp(s.as_str()))
@@ -228,9 +319,38 @@ pub fn update_table(
     columns: &[TableColumn],
     create_missing_fields: bool,
 ) -> Result<(), TableError> {
+    update_table_with_options(
+        dir,
+        sym,
+        time,
+        columns,
+        create_missing_fields,
+        FieldWriteOptions::default(),
+    )
+}
+
+/// [`update_table`] + 新字段写选项：`opts` 非默认时，**新创建**的字段（
+/// `create_missing_fields` 路径）直接以编码/压缩形式落盘（写后只读）；
+/// 已存在字段仍原地更新（仅可写 PLAIN）。
+pub fn update_table_with_options(
+    dir: impl AsRef<Path>,
+    sym: &[String],
+    time: &[i64],
+    columns: &[TableColumn],
+    create_missing_fields: bool,
+    opts: FieldWriteOptions,
+) -> Result<(), TableError> {
     let dir = dir.as_ref();
     let dataset = open_dataset(dir).map_err(TableError::Dataset)?;
     let meta = &dataset.meta;
+
+    // 符号→下标映射一次建立（更新路径逐行定位用，免每行字符串二分）。
+    let sym_map: std::collections::HashMap<&str, usize> = meta
+        .symbols
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
 
     let existing: HashSet<String> = dataset
         .list_fields()
@@ -246,8 +366,7 @@ pub fn update_table(
             }
             // New column: NULL history + this input's values (one-pass write).
             let global = scatter_to_global(meta, sym, time, col)?;
-            create_field_with_data(dir.join(&col.name), col.data_type, &global)
-                .map_err(TableError::CreateField)?;
+            write_new_field(dir, col, &global, opts)?;
             continue;
         }
         let expected = n * col.data_type.size_of();
@@ -263,11 +382,12 @@ pub fn update_table(
         {
             // Verify the incoming type matches the FIELD's stored type, then
             // drop the reader before writing (Windows mmap safety).
-            let reader = FieldReader::open(&field_path)
-                .map_err(|e| TableError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("open field '{}' for type check: {e}", col.name),
-                )))?;
+            let reader = FieldReader::open(&field_path).map_err(|e| {
+                TableError::Io(std::io::Error::other(format!(
+                    "open field '{}' for type check: {e}",
+                    col.name
+                )))
+            })?;
             let field_dt = reader.data_type();
             if field_dt != col.data_type {
                 return Err(TableError::TypeMismatch {
@@ -287,9 +407,8 @@ pub fn update_table(
         let mut items: Vec<UpdateItem> = Vec::new();
 
         for i in 0..n {
-            let global_row = meta
-                .global_row(&sym[i], time[i])
-                .ok_or_else(|| TableError::SymTimeNotFound { row: i })?;
+            let global_row = resolve_global_row(meta, &sym_map, &sym[i], time[i])
+                .ok_or(TableError::SymTimeNotFound { row: i })?;
 
             if let Some(prev) = prev_row {
                 if global_row == prev + 1 {
@@ -397,13 +516,16 @@ pub fn update_meta(
     Ok(new_meta)
 }
 
-/// 目录下非 `.meta`（且非临时文件）的文件名 = 现有 FIELD 名。
+/// 目录下非隐藏/非临时文件的文件名 = 现有 FIELD 名。
+///
+/// 规则：以 `.` 开头（`.meta` 及隐藏/元数据文件）、`*.new` / `*.tmp` 临时文件
+/// 一律忽略；字段名中间可含 `.`（如 `close.bid`）。
 fn list_field_names(dir: &Path) -> Result<Vec<String>, TableError> {
     let mut names = Vec::new();
     for entry in fs::read_dir(dir).map_err(TableError::Io)? {
         let entry = entry.map_err(TableError::Io)?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == META_FILE_NAME || name.ends_with(".new") || name.ends_with(".tmp") {
+        if name.starts_with('.') || name.ends_with(".new") || name.ends_with(".tmp") {
             continue;
         }
         names.push(name);
@@ -429,11 +551,11 @@ fn build_gather_map(old: &MetaFile, new: &MetaFile) -> Vec<Option<u32>> {
         let sym = new.symbols[si].as_str();
         let lo = rec.time_start as usize;
         // 该 SYM 的新 time 点序列。
-        let old_row = old_sym_idx.get(sym).and_then(|&osi| {
+        let old_row = old_sym_idx.get(sym).map(|&osi| {
             let orec = &old.sym_index[osi];
             let olo = orec.time_start as usize;
             let ohi = olo + orec.time_count as usize;
-            Some((orec, olo, ohi))
+            (orec, olo, ohi)
         });
         for local in 0..rec.time_count as usize {
             let t = new.time_axis[lo + local];

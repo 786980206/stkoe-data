@@ -10,12 +10,14 @@
 //! - [`types`] — `DataType`, NULL bit patterns, `RawValue`.
 //! - [`header`] — 64-byte META/FIELD headers, magic, encoding/compression enums.
 //! - [`meta`] — `MetaFile`, `MetaBuilder`, `SymIndexRecord`.
+//! - [`subset`] — `.sub.xxx` subset files（父 `.meta` 网格子集，每 SYM 多区间）.
 //! - [`field`] — FIELD data offset computation, header helpers.
 
 pub mod field;
 pub mod field_footer;
 pub mod header;
 pub mod meta;
+pub mod subset;
 pub mod types;
 
 pub use field::{
@@ -26,4 +28,5 @@ pub use header::{
     FORMAT_VERSION, HEADER_SIZE, META_FILE_NAME, META_MAGIC,
 };
 pub use meta::{MetaBuilder, MetaError, MetaFile, SymIndexRecord};
+pub use subset::{SubsetBuilder, SubsetError, SubsetFile, SubsetHeader, SUBSET_MAGIC, SUBSET_PREFIX};
 pub use types::{fill_null, DataType, RawValue};

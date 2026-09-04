@@ -67,6 +67,36 @@ pub fn decode_encoding(
     }
 }
 
+/// 编码（可选）+ 压缩（可选），产出 FIELD **数据区**（一步到位）。
+///
+/// 布局与 `compact_field_with_encoding` 完全一致：
+/// - `PLAIN + NONE` → 原样原始数据（无前缀，零拷贝 mmap 快路径）；
+/// - 其它 → `[u64 编码后字节数][payload]`，其中 payload = 编码结果
+///   （`compression != NONE` 时再压缩该编码结果）。
+///
+/// 供 `create_field_with_data_encoded` 等「直接写成压缩字段」的入口复用，
+/// 保证磁盘布局与既有的压缩/编码路径唯一。
+pub fn encode_compress_data(
+    encoding: Encoding,
+    compression: Compression,
+    data_type: DataType,
+    data: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    if encoding == Encoding::Plain && compression == Compression::None {
+        return Ok(data.to_vec());
+    }
+    let encoded = encode_encoding(encoding, data_type, data)?;
+    let payload = if compression == Compression::None {
+        encoded.clone()
+    } else {
+        compress(&encoded, compression)?
+    };
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
 /// 编码（可选）+ 压缩（可选）FIELD：`[u64 原始字节数][编码 payload]`，
 /// 再对 payload 压缩（`compression != NONE` 时）。
 ///
@@ -113,18 +143,7 @@ pub fn compact_field_with_encoding(
     drop(file); // Windows：先释放再 rename
 
     // --- 编码 → (可选)压缩 → [u64 编码后字节数][payload] ---
-    let encoded = encode_encoding(encoding, data_type, &raw_data)?;
-    // 前缀存「编码后、压缩前」长度：压缩时即为解压目标长度，NONE 时即 payload 长。
-    let payload = if compression == Compression::None {
-        encoded.clone()
-    } else {
-        compress(&encoded, compression)?
-    };
-    let encoded_len = encoded.len() as u64;
-
-    let mut new_data = Vec::with_capacity(8 + payload.len());
-    new_data.extend_from_slice(&encoded_len.to_le_bytes());
-    new_data.extend_from_slice(&payload);
+    let new_data = encode_compress_data(encoding, compression, data_type, &raw_data)?;
     let new_data_length = new_data.len() as u64;
 
     // --- 写 tmp → fsync → 原子 rename ---

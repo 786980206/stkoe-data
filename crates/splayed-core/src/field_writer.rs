@@ -7,7 +7,10 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use splayed_format::field_footer::{FOOTER_SIZE, compute_stats, encode_footer, parse_footer};
-use splayed_format::{fill_null, DataType, FieldHeader, RawValue, HEADER_SIZE, META_FILE_NAME};
+use splayed_format::{
+    fill_null, Compression, DataType, Encoding, FieldHeader, RawValue, HEADER_SIZE,
+    META_FILE_NAME,
+};
 
 /// One update entry: write `values` starting at absolute row `start_row`.
 #[derive(Debug, Clone)]
@@ -22,12 +25,25 @@ impl UpdateItem {
     }
 }
 
+/// 拒绝以 `.` 开头的字段文件名（`.meta` 及隐藏/元数据命名）——避免建出
+/// 一个会被 `list_fields` 忽略、"看不见"的字段文件。字段名中间含 `.`（如
+/// `close.bid`）不受影响。
+fn reject_hidden_name(field_path: &Path) -> Result<(), CreateFieldError> {
+    if let Some(name) = field_path.file_name().and_then(|s| s.to_str()) {
+        if name.starts_with('.') {
+            return Err(CreateFieldError::HiddenFileName(name.to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// Create a pre-allocated FIELD file (all NULL).
 ///
 /// Reads `.meta` from the same directory, computes `total_rows = sum(time_count)`,
 /// and writes the FIELD header + NULL-filled data region.
 pub fn create_field(field_path: impl AsRef<Path>, data_type: DataType) -> Result<(), CreateFieldError> {
     let field_path = field_path.as_ref();
+    reject_hidden_name(field_path)?;
     let dir = field_path.parent().ok_or(CreateFieldError::NoParentDir)?;
 
     // Read .meta from same directory.
@@ -83,6 +99,7 @@ pub fn create_field_with_data(
     values: &[u8],
 ) -> Result<(), CreateFieldError> {
     let field_path = field_path.as_ref();
+    reject_hidden_name(field_path)?;
     let dir = field_path.parent().ok_or(CreateFieldError::NoParentDir)?;
 
     // Read .meta from same directory (authoritative row count + generation).
@@ -123,7 +140,77 @@ pub fn create_field_with_data(
     Ok(())
 }
 
-/// Update a FIELD file in-place with one or more update items.
+/// Create a FIELD file **directly in encoded/compressed form** — one pass,
+/// no separate NULL pre-allocation, no separate `compact_field` step.
+///
+/// Same contract as [`create_field_with_data`] (reads `.meta` from the same
+/// directory, `values` must cover exactly `total_rows` elements) but the data
+/// region is encoded (DELTA/RLE/BITPACK) and/or compressed (ZSTD/LZ4) at write
+/// time. `encoding = PLAIN, compression = NONE` produces the identical on-disk
+/// layout as [`create_field_with_data`].
+///
+/// The resulting FIELD is **read-only** (`update_field` rejects writes), so
+/// this suits "write once, read many" columns — e.g. 90%~99% NULL factor data
+/// written directly as `RLE + ZSTD` without the extra compact pass.
+pub fn create_field_with_data_encoded(
+    field_path: impl AsRef<Path>,
+    data_type: DataType,
+    values: &[u8],
+    encoding: Encoding,
+    compression: Compression,
+) -> Result<(), CreateFieldError> {
+    let field_path = field_path.as_ref();
+    reject_hidden_name(field_path)?;
+    let dir = field_path.parent().ok_or(CreateFieldError::NoParentDir)?;
+
+    // Read .meta from same directory (authoritative row count + generation).
+    let meta_path = dir.join(META_FILE_NAME);
+    let meta_bytes = fs::read(&meta_path).map_err(CreateFieldError::Io)?;
+    let meta = splayed_format::MetaFile::deserialize(&meta_bytes)
+        .map_err(CreateFieldError::Meta)?;
+
+    let total_rows = meta.total_rows();
+    let elem_sz = data_type.size_of();
+    let data_length = (total_rows as usize) * elem_sz;
+    if values.len() != data_length {
+        return Err(CreateFieldError::LengthMismatch {
+            expected: data_length,
+            got: values.len(),
+        });
+    }
+
+    // 编码（可选）+ 压缩（可选）→ 数据区（与 compact_field_with_encoding 布局一致）。
+    let data_region = splayed_codec::encode_compress_data(encoding, compression, data_type, values)
+        .map_err(CreateFieldError::Codec)?;
+
+    let mut header = FieldHeader::new(
+        data_type,
+        encoding,
+        compression,
+        meta.header.generation,
+        total_rows,
+        data_region.len() as u64,
+    );
+    // 真实 NULL 计数（从原始值统计；压缩字段只读，永久有效）。
+    header.null_count = values
+        .chunks(elem_sz)
+        .filter(|c| *c == data_type.null_bytes())
+        .count() as u32;
+
+    let mut file = File::create(field_path).map_err(CreateFieldError::Io)?;
+
+    // Write header (64 bytes) + encoded/compressed data region in one pass.
+    file.write_all(bytemuck::bytes_of(&header))
+        .map_err(CreateFieldError::Io)?;
+    file.write_all(&data_region).map_err(CreateFieldError::Io)?;
+
+    // 统计 footer（按原始值重算，永久有效——压缩字段只读）。
+    let stats = compute_stats(data_type, values);
+    file.write_all(&encode_footer(stats)).map_err(CreateFieldError::Io)?;
+
+    file.sync_all().map_err(CreateFieldError::Io)?;
+    Ok(())
+}
 ///
 /// Each item writes raw bytes starting at `start_row × sizeof(type)` offset.
 /// The FIELD must be `compression = NONE` (writable).
@@ -350,6 +437,10 @@ pub enum CreateFieldError {
     Meta(splayed_format::MetaError),
     /// `create_field_with_data`: values length ≠ total_rows × element size.
     LengthMismatch { expected: usize, got: usize },
+    /// 字段文件名以 `.` 开头（`.meta` 等隐藏/元数据命名，会被 `list_fields` 忽略）。
+    HiddenFileName(String),
+    /// `create_field_with_data_encoded`: 编码/压缩失败。
+    Codec(splayed_codec::CodecError),
 }
 
 impl std::fmt::Display for CreateFieldError {
@@ -362,6 +453,11 @@ impl std::fmt::Display for CreateFieldError {
                 f,
                 "create_field_with_data: values length {got} != expected {expected} (total_rows × element size)"
             ),
+            Self::HiddenFileName(name) => write!(
+                f,
+                "field file name '{name}' starts with '.' — leading-dot (hidden) field names are not allowed"
+            ),
+            Self::Codec(e) => write!(f, "create_field_with_data_encoded codec error: {e}"),
         }
     }
 }

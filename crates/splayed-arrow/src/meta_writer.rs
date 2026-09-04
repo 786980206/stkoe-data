@@ -73,10 +73,9 @@ fn map_core_error(e: splayed_core::TableError) -> CreateMetaError {
     match e {
         splayed_core::TableError::Io(e) => CreateMetaError::Io(e),
         splayed_core::TableError::Meta(e) => CreateMetaError::MetaBuild(e),
-        other => CreateMetaError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("create_meta failed: {other}"),
-        )),
+        other => CreateMetaError::Io(std::io::Error::other(format!(
+            "create_meta failed: {other}"
+        ))),
     }
 }
 

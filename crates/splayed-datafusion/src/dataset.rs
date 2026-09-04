@@ -27,6 +27,12 @@ use splayed_core::{
 };
 use splayed_format::{MetaFile, TimeType};
 
+/// 单字段统计：`(字段名, Arrow 类型, null_count, 文件大小, 可选 min/max)`。
+type FieldStat = (String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>);
+
+/// `init()` 返回：`(Dataset, ArrowSchema, 字段集合, 统计, 错误字符串)`。
+type InitState = (Arc<Dataset>, ArrowSchemaRef, HashSet<String>, Option<Statistics>, String);
+
 use crate::exec::SplayedScanExec;
 use crate::filter::{classify, parse_filters};
 
@@ -79,13 +85,7 @@ impl SplayedDatasetProvider {
     /// 打开目录并构建 provider 状态（new / reload 共用）。
     fn init(
         dir: &std::path::Path,
-    ) -> DFResult<(
-        Arc<Dataset>,
-        ArrowSchemaRef,
-        HashSet<String>,
-        Option<Statistics>,
-        String,
-    )> {
+    ) -> DFResult<InitState> {
         let dataset = Arc::new(open_dataset(dir).map_err(|e| {
             DataFusionError::Execution(format!("failed to open splayed dataset: {e}"))
         })?);
@@ -96,8 +96,7 @@ impl SplayedDatasetProvider {
             .list_fields()
             .map_err(|e| DataFusionError::Execution(format!("list_fields failed: {e}")))?;
 
-        let mut fields: Vec<(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)> =
-            Vec::with_capacity(field_names.len());
+        let mut fields: Vec<FieldStat> = Vec::with_capacity(field_names.len());
         for name in &field_names {
             let path = dataset.field_path(name);
             let reader = FieldReader::open(&path).map_err(|e| {
@@ -154,7 +153,7 @@ impl SplayedDatasetProvider {
 
 fn build_schema(
     meta: &MetaFile,
-    fields: &[(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)],
+    fields: &[FieldStat],
 ) -> ArrowSchema {
     let time_arrow = match meta.time_type() {
         TimeType::Date32 => ArrowDataType::Date32,
@@ -234,10 +233,10 @@ fn field_stats_scalars(aty: &ArrowDataType, st: &FieldStats) -> Option<(ScalarVa
 
 fn compute_statistics(
     meta: &MetaFile,
-    fields: &[(String, ArrowDataType, u32, u64, Option<(ScalarValue, ScalarValue)>)],
+    fields: &[FieldStat],
 ) -> Statistics {
     let total_rows = meta.total_rows() as usize;
-    let time_elem = meta.time_elem_size() as usize;
+    let time_elem = meta.time_elem_size();
     let (tmin, tmax) = match (meta.time_axis.first(), meta.time_axis.last()) {
         (Some(&a), Some(&b)) => {
             let mk = |v: i64| match meta.time_type() {

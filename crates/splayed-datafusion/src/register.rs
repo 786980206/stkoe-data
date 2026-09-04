@@ -13,6 +13,7 @@ use datafusion::catalog::{
     Session, TableFunctionArgs, TableFunctionImpl, TableProvider, TableProviderFactory,
 };
 use datafusion::common::{DataFusionError, Result as DFResult, ScalarValue};
+use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{CreateExternalTable, Expr};
 
@@ -85,5 +86,41 @@ impl TableFunctionImpl for SplayedTableFunction {
             ));
         };
         auto_provider(PathBuf::from(path))
+    }
+}
+
+/// `read_splayed_subset('/path/to/dir', 'hs300')` table function。
+///
+/// 把父 dataset 目录下的子集 `.sub.hs300` 物化成内存表（`MemTable`）——
+/// 子集本身是父网格的视图，SQL 里按需查询「成分股 × 字段」；适合中小体积
+/// 子集（大表全量请用 `read_splayed`，下推扫描）。
+///
+/// Register with `ctx.register_udtf("read_splayed_subset", Arc::new(SplayedSubsetFunction))`.
+#[derive(Debug, Default)]
+pub struct SplayedSubsetFunction;
+
+impl TableFunctionImpl for SplayedSubsetFunction {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DFResult<Arc<dyn TableProvider>> {
+        let exprs = args.exprs();
+        if exprs.len() != 2 {
+            return Err(DataFusionError::Execution(
+                "read_splayed_subset requires two string arguments: read_splayed_subset('/dir', 'hs300')"
+                    .to_string(),
+            ));
+        }
+        let lit = |e: &Expr| match e {
+            Expr::Literal(ScalarValue::Utf8(Some(s)), _) => Ok(s.clone()),
+            _ => Err(DataFusionError::Execution(
+                "read_splayed_subset args must be string literals".to_string(),
+            )),
+        };
+        let path = lit(&exprs[0])?;
+        let sub = lit(&exprs[1])?;
+        let rb = splayed_arrow::read_subset(PathBuf::from(&path), &sub, &[]).map_err(|e| {
+            DataFusionError::Execution(format!("read_splayed_subset '{sub}': {e}"))
+        })?;
+        let schema = rb.schema();
+        let mem = MemTable::try_new(schema, vec![vec![rb]])?;
+        Ok(Arc::new(mem))
     }
 }

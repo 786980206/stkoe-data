@@ -619,8 +619,8 @@ async fn update_meta_reload_reflects() {
 #[tokio::test]
 async fn partition_column_sql() {
     let root = temp_dir("kv_df");
-    create_table(&root.join("year=2024"), &make_batch(), true).unwrap(); // 10 行
-    create_table(&root.join("year=2025"), &make_batch(), true).unwrap();
+    create_table(root.join("year=2024"), &make_batch(), true).unwrap(); // 10 行
+    create_table(root.join("year=2025"), &make_batch(), true).unwrap();
 
     // 等值 → 只扫 2024 分区；year 投影为常量列。
     let batches = run_query(&root, "SELECT close, year FROM splayed WHERE year = 2024").await;
@@ -684,8 +684,8 @@ async fn partition_symbol_prune_passes_override() {
     }
 
     let root = temp_dir("sym_prune");
-    create_table(&root.join("2024"), &one_sym_batch("SYM01", 100.0), true).unwrap();
-    create_table(&root.join("2025"), &one_sym_batch("SYM02", 200.0), true).unwrap();
+    create_table(root.join("2024"), &one_sym_batch("SYM01", 100.0), true).unwrap();
+    create_table(root.join("2025"), &one_sym_batch("SYM02", 200.0), true).unwrap();
 
     // SYM02 只在 2025：2024 被剪掉，返回值 = 2025 的 3 行。
     let batches = run_query(&root, "SELECT close FROM splayed WHERE sym = 'SYM02'").await;

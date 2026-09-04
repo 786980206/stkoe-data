@@ -171,8 +171,8 @@ fn lazy_table_scan_partition_columns() {
 
     let root = std::env::temp_dir().join(format!("splayed_pl_tbl_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    create_table(&root.join("year=2024"), &make_batch(), true).unwrap(); // 6 行
-    create_table(&root.join("year=2025"), &make_batch(), true).unwrap();
+    create_table(root.join("year=2024"), &make_batch(), true).unwrap(); // 6 行
+    create_table(root.join("year=2025"), &make_batch(), true).unwrap();
 
     let lf = splayed_lazyframe_table(&root).unwrap();
 
@@ -190,8 +190,8 @@ fn lazy_table_scan_partition_columns() {
     // 字符串字面量同样剪裁（year = '2025'）由 core 层完成；此处用 String 分区列验证。
     let root2 = std::env::temp_dir().join(format!("splayed_pl_tbl2_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root2);
-    create_table(&root2.join("env=prod"), &make_batch(), true).unwrap();
-    create_table(&root2.join("env=test"), &make_batch(), true).unwrap();
+    create_table(root2.join("env=prod"), &make_batch(), true).unwrap();
+    create_table(root2.join("env=test"), &make_batch(), true).unwrap();
     let lf2 = splayed_lazyframe_table(&root2).unwrap();
     let df2 = lf2
         .filter(col("env").eq(lit("prod")))
@@ -221,4 +221,29 @@ fn lazy_table_scan_partition_columns() {
     assert_eq!(df3.shape(), (2, 2));
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn lazy_scan_subset() {
+    let dir = temp_dir("subset");
+    create_table(&dir, &make_batch(), true).unwrap();
+    // SYM01 day {0,1} + SYM02 day {0}（多符号、多区间形态）。
+    splayed_core::create_subset(
+        &dir,
+        "hs300",
+        &[
+            splayed_core::SubsetInput::new("SYM01", vec![(0i64, 2u32)]),
+            splayed_core::SubsetInput::new("SYM02", vec![(0i64, 1u32)]),
+        ],
+    )
+    .unwrap();
+    let lf = splayed_polars::splayed_lazyframe_subset(&dir, "hs300").unwrap();
+    let df = lf
+        .select([col("time"), col("sym"), col("close")])
+        .collect()
+        .unwrap();
+    assert_eq!(df.shape(), (3, 3));
+    // 父全局行序：SYM01(0,1) 在前，SYM02(0) 在后。
+    assert_eq!(values_f64(&df), vec![100.0, 101.0, 200.0]);
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -2,6 +2,9 @@
 
 > 目标：**针对 SYM × TIME 的金融时序数据，优先做到极低 I/O、O(1) 定位、mmap/零拷贝读取、高吞吐追加写入，并通过 Arrow 连接 DataFusion / DuckDB。**
 
+> **读者指引**：本文件是**权威设计文档**（源码注释按 §号引用）。用户文档见 MkDocs 站点 `docs/`（快速上手/架构/格式规范/Crate 参考/集成指南，构建方式见 `docs/development/build-test.md`）。
+> **状态标注约定**：文中带 ⚠ 的段落表示「未实现 / 预留 / 规划」，其余均指**当前已实现**状态；实现进度以 `docs/development/phases.md` 为准。
+
 ---
 
 # 1. 概述与设计目标
@@ -96,6 +99,7 @@ Splayed V1 是一个针对 **SYM × TIME × FIELD** 金融时序数据的专用�
 ## 4.1 布局原则
 
 - 一个 FIELD 一个文件（`close`、`open`、`high`、`low`、`volume`…）。
+- **字段文件名规则**：字段名**可以包含 `.`**（如 `close.bid`、`price.usd`）；但**以 `.` 开头的文件/目录一律忽略**——`list_fields` / `update_meta` 字段枚举 / 分区 schema 发现都跳过，创建侧（`create_field` / `create_field_with_data` / `create_table` / `update_table`）拒绝以 `.` 开头的字段名（`.meta` 及隐藏/元数据文件，如 `.DS_Store`，不属于字段）。
 - 一个 SYM 的数据在 FIELD 文件中**连续排列**（`row_start` + `time_count`）。
 - META 是唯一索引，指向每个 SYM 的 row range 与 time range。
 - FIELD 文件采用**全量预分配**：`create_field` 时按 `sum(time_count)` 预写全 NULL 占位数据，后续通过 `update_field` 原地填入实际值。全量预声明模型下 `time_count` 既是「该 SYM 在全局 TIME AXIS 中占据的连续区间长度」，也是「该 SYM 在 FIELD 中预分配的行容量」，二者恒等，无需单独的 `row_capacity` 字段。
@@ -307,7 +311,7 @@ update_info = [start_row, values[]]
 `scan(limit)` 直接透传（多分区仍由引擎 LIMIT 节点保证全局语义）；Polars 的
 `n_rows` 也映射到该字段。
 
-
+## 5.3 数据类型
 
 | ID | 类型 | 单值大小 | NULL 表示 |
 | --: | --- | ---: | --- |
@@ -398,6 +402,95 @@ offset = 64 + row × sizeof(type)
 ```
 
 而非随机单点查询。
+
+---
+
+# 5.7 SUBSET 文件（`.sub.xxx`）
+
+## 5.7.1 定位
+
+`.sub.xxx` 与 `.meta` 同目录，是**父 `.meta` 的 `SYM × TIME` 网格子集**的索引文件：
+记录选中 `(SYM, TIME)` 对应的**父全局行空间区间**，指向 FIELD 文件的 data 区。
+典型场景："全市场 A 股"为 `.meta`，`".sub.hs300"` 为沪深300 成分的时序子集。
+**文件本身不存值**，只有索引（同 `.meta` 的"只记录索引"语义）。
+
+文件名：`name` 如 `hs300` → `.sub.hs300`（`SUBSET_PREFIX = ".sub."`）。以 `.` 开头
+→ 天然被 `Dataset::list_fields` / `update_meta::list_field_names` 忽略，**不会被当
+成 FIELD**；`create_field*` 也拒绝点文件名。
+
+## 5.7.2 与 META 的相同/不同
+
+**相同**（"相似接口"）：
+
+- 64B header + 同款 SYM 字典编码（`(sym_count+1) × 8` 偏移表 + 字符串数据）；
+- 区间记录**复用 12B `SymIndexRecord`**（`time_start(4) + time_count(4) + row_start(4)`），
+  且 `time_start`/`time_count` 索引**父 `.meta` 的全局 TIME AXIS**、`row_start` 为
+  **父全局行空间**（即父 SYM INDEX 的 `row = sym_row_start + (time_idx - time_start)`）。
+
+**不同**（用户点名的差异）：
+
+- META `sym_index`：每 SYM **一条**连续区间（一个 `time_start`+`time_count`）；
+- SUBSET：每 SYM **可多条不连续区间**（股票进出指数多次，各自成段）。
+
+## 5.7.3 二进制布局
+
+```text
+[Header 64B]
+[SYM DICT INDEX: (sym_count + 1) × 8 bytes]   ← u64 offsets into STRING DATA
+[SYM STRING DATA: variable]
+[RANGE INDEX: sym_count × (u32 count + count × 12B SymIndexRecord)]
+```
+
+### Header（64B，magic `SPLAYSUB`，version 1）
+
+| 偏移 | 大小 | 字段 | 说明 |
+| --- | --- | --- | --- |
+| 0 | 8 | `magic` | `SPLAYSUB`（LE u64） |
+| 8 | 2 | `version` | 1 |
+| 10 | 2 | `flags` | 0 |
+| 12 | 1 | `time_type` | 必须与父 `.meta` 一致 |
+| 13 | 3 | `reserved` | 0 |
+| 16 | 8 | `generation` | 子集自身代数（重写时递增） |
+| 24 | 8 | `parent_generation` | **父 `.meta` 的 generation**（失效检测） |
+| 32 | 4 | `sym_count` | 子集内符号数 |
+| 36 | 4 | `range_count` | 全符号区间总数 |
+| 40 | 4 | `total_rows` | 子集覆盖行数 = Σ 区间 `time_count` |
+| 44 | 20 | `reserved2` | 0 |
+
+### RANGE INDEX（每符号）
+
+```
+[count: u32] 后跟 count × SymIndexRecord{time_start, time_count, row_start}
+```
+
+相邻/重叠段在建文件时已合并；每符号区间按 `time_start` 升序；符号按字典序。
+
+## 5.7.4 写入与校验（`create_subset(dir, name, inputs)`）
+
+输入：`inputs: Vec<SubsetInput{sym, segments: Vec<(time_value, count)>}>`，时间值为父
+`time_type` 域（Date32=天数 / TimestampUs=µs）。对每个段：
+
+1. `sym` 须在父 `.meta`（否则 `SymNotFound`）；
+2. `time_value` 须在父 TIME AXIS（否则 `TimeNotFound`）；
+3. 段须落在该 SYM 的 `[time_start, time_start + time_count)` 连续块内（否则
+   `SegmentOutOfRange`）；
+4. 解析 `row_start = sym.row_start + (time_idx - sym.time_start)`，喂给 `SubsetBuilder`
+   （同 SYM 相邻/重叠段自动合并）；
+5. 序列化后**原子落盘**（`.sub.{name}.tmp` → fsync → rename），header 记
+   `parent_generation = 父 generation`。
+
+## 5.7.5 读取（`SubsetReader`）
+
+- `open(dir, name)`：仅解析文件；
+- `open_with_parent(dir, name, &MetaFile)`：另校验 `parent_generation == 父
+  generation`、`time_type` 一致——父被 `update_meta` 重排后 generation 递增 →
+  **`StaleParent`**，须重建 `.sub.xxx`（重排会改变行布局，旧索引失效）；
+- `symbols() / contains(sym) / ranges(sym) / total_rows()`；
+- `iter_ranges()`：按**父全局行序**产出 `(sym_idx, &SymIndexRecord)`；
+- `iter_entries(&MetaFile)`：按父全局行序产出 `(sym, time_value, global_row)`；
+- `read_field_values(&FieldReader)`：把某字段在子集内的值按父全局行序拼接
+  （每区间 `read_range_raw` 行段读取，NONE 零拷贝；压缩字段自动解压）——
+  长度 = `total_rows × sizeof(type)`。
 
 ---
 
@@ -531,6 +624,8 @@ atomic rename
 
 ## 8.3 Crash recovery
 
+> ✅ **现状**：机制已实现——以 META 的 `generation` + `file_size` 为一致性锚点，Reader 拒绝 generation 不匹配的 FIELD（§6 屏障）；`update_meta` 的原子提交（`.meta.new`→fsync→rename）保证崩溃后重跑幂等；`compact_field` 用「写新文件再 rename」保证崩溃后原文件完好。⚠ 尚无专门的故障注入 / 崩溃恢复测试套件。
+
 V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景。以 META 的 `generation` + `file_size` 为一致性锚点，启动时校验 FIELD 的 generation 与数据长度，拒绝不匹配部分。
 
 ## 8.4 函数接口规范
@@ -640,6 +735,80 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 
 **约束：** 值必须覆盖全部 `total_rows`；稀疏/部分填充走 `create_field` + `update_field`。
 
+### create_field_with_data_encoded(field_path, data_type, values, encoding, compression)
+
+**所在 crate：** `splayed-core`
+
+**语义：** 与 `create_field_with_data` 同契约（读同级 `.meta` 取权威
+`total_rows`/`generation`、`values` 须覆盖全部 `total_rows`），但数据区在**写入
+时直接编码/压缩**（一步到位，无需先写 PLAIN 再 `compact_field`）。
+
+**输入：** 在 `create_field_with_data` 基础上增加：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `encoding` | uint8 | PLAIN / DELTA / RLE / BITPACK（§5.2 header） |
+| `compression` | uint8 | NONE / ZSTD / LZ4（§5.2 header） |
+
+**数据区布局（与 `compact_field_with_encoding` 完全一致）：**
+
+- `PLAIN + NONE` → 原样原始数据（无前缀，mmap 零拷贝快路径；与
+  `create_field_with_data` 输出**字节一致**）；
+- 其它 → `[u64 编码后字节数][payload]`，payload = 编码结果，`compression !=
+  NONE` 时再压缩该编码结果。
+
+**写后只读：** `compression != NONE`（或编码非 PLAIN）的字段 `update_field`
+拒绝写入。适合"一次写入、多次读取"的稀疏因子列（90%~99% NULL 直接写
+`RLE + ZSTD`），header `null_count` 与统计 footer 均按原始值计算（永久有效）。
+
+**字段文件名规则：** 与 `create_field_with_data` 相同——以 `.` 开头的字段名
+拒绝（`HiddenFileName`）。
+
+### FieldWriteOptions（表级新字段写选项）
+
+**所在 crate：** `splayed-core`（`splayed-arrow` 重导出）
+
+```text
+FieldWriteOptions { encoding: Encoding, compression: Compression }
+// Default = { Plain, None }（可写，mmap 零拷贝，与既有行为一致）
+```
+
+作用于 `create_table_with_options` / `update_table_with_options` 及分区写
+`_with_options` 变体中**新创建**的字段（已存在字段不受影响，仍可写 PLAIN 原地
+更新）。非默认选项时新字段直接以编码/压缩形式落盘（写后只读）。
+
+### create_subset(dir, name, inputs) / SubsetReader
+
+**所在 crate：** `splayed-core`（格式定义在 `splayed-format` §5.7）
+
+创建 `.sub.{name}`：父 `.meta` 网格的**行区间子集索引**（每 SYM 可多条不连续
+区间）。格式与 `.meta` 相似（64B header、同款 SYM 字典、12B `SymIndexRecord`），
+差异仅在 `sym_index` 一条区间 → RANGE INDEX 每 SYM 多条。
+
+```text
+create_subset(dir, name, inputs: &[SubsetInput]) -> Result<(), SubsetError>
+SubsetInput { sym: String, segments: Vec<(i64, u32)> }   // 时间值(父 time_type 域)+连续段
+SubsetReader::open(dir, name) -> Result<Self, SubsetError>
+SubsetReader::open_with_parent(dir, name, &MetaFile)      // + parent_generation/time_type 校验
+  symbols() / contains(sym) / ranges(sym) / total_rows()
+  iter_ranges()   -> (sym_idx, &SymIndexRecord)   // 父全局行序
+  iter_entries(&MetaFile) -> (sym, time_value, global_row)
+  read_field_values(&FieldReader) -> Vec<u8>      // 字段在子集内的值（父行序拼接）
+```
+
+父被 `update_meta` 重排后 generation 递增 → `open_with_parent` 报 `StaleParent`
+（须重建 `.sub.xxx`）；`.sub.*` 以点开头，`list_fields` / `update_meta` 均忽略，
+不会被当成 FIELD。
+
+**下游消费（读侧，已实现）：**
+- `splayed-arrow::read_subset(dir, sub_name, &[String]) -> RecordBatch`：物化
+  `[time, sym, ...columns]`（父全局行序；`columns` 空 = 全部字段；`StaleParent` 检测）。
+- `splayed-polars::splayed_lazyframe_subset(dir, sub_name) -> LazyFrame`：物化视图转惰性帧。
+- `splayed-datafusion::SplayedSubsetFunction`：`read_splayed_subset('dir', 'hs300')` 表函数
+  （`MemTable` 物化，`register_udtf`）。
+- `splayed-python`（pyo3 扩展 `splayed`）：`create_subset(dir, name, [SubsetInput])` /
+  `read_subset(dir, name) -> pyarrow.RecordBatch`（pyarrow 交换层，见 `docs/crates/python.md`）。
+
 ### 原生表写接口（`splayed-core`）——交换层直写，无 Arrow
 
 上述 Arrow 函数（`create_meta` / `create_table` / `update_table`）只是转换器：
@@ -648,17 +817,24 @@ V1 需要覆盖：FIELD 原地更新未完成、META 原子替换失败等场景
 ```text
 create_meta(dir, time_type, sym: Vec<String>, time: Vec<i64>) -> MetaFile
 create_table(dir, time_type, sym, time, columns: Vec<TableColumn>, sorted: bool) -> MetaFile
+create_table_with_options(dir, time_type, sym, time, columns, sorted, opts: FieldWriteOptions) -> MetaFile
 update_table(dir, sym, time, columns: Vec<TableColumn>, create_missing_fields: bool) -> ()
+update_table_with_options(dir, sym, time, columns, create_missing_fields, opts: FieldWriteOptions) -> ()
 update_meta(dir, time_type, sym, time) -> MetaFile
 TableColumn { name, data_type, values: Vec<u8> }   // 输入行序原始小端字节
 ```
 
-- `create_table`：建 `.meta` 后，每个 FIELD 先在**全局行序**缓冲（缺失时间点保留 NULL 哨兵），再 `create_field_with_data` 一次写入；
+- `create_table`：建 `.meta` 后，每个 FIELD 先在**全局行序**缓冲（缺失时间点保留 NULL 哨兵），再 `create_field_with_data` 一次写入；`create_table_with_options` 在 `opts` 非默认时改用 `create_field_with_data_encoded`（新字段直接编码/压缩、写后只读）；
 - `sorted`（**性能提示**）：输入已按 (SYM, TIME) 升序时走快速路径——`MetaBuilder`
   跳过重复排序，FIELD 散列改为按符号分组 + TIME AXIS 窗口游标（每行均摊
   O(1)，免去每行的两次二分查找）。传入前会做 O(n) 顺序校验：若实际乱序
   自动回退普通路径，结果始终正确；
-- `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；`create_missing_fields=true` 时自动创建缺失 FIELD（新列历史全 NULL）；
+- `update_table`：仅更新 META 中已存在的 (SYM, TIME)，未知位置 / 缺失 FIELD / 类型不匹配均报错；`create_missing_fields=true` 时自动创建缺失 FIELD（新列历史全 NULL）；`update_table_with_options` 在 `opts` 非默认时，**新创建**的 FIELD 用 `create_field_with_data_encoded` 直接编码/压缩落盘（写后只读），已存在 FIELD 仍原地更新；
+- 分区写 `_with_options` 变体：`create_partitioned_table_with_options` /
+  `append_partition_with_options` / `update_partition_table_with_options` /
+  `update_partition_meta_with_options` ——语义与同名非 `_with_options` 函数一致，
+  仅将 `opts` 透传给新分区/新字段的写入（非默认时新字段直接编码/压缩、写后
+  只读）；既有分区经 `update_partition_meta` 重写时仍为 PLAIN+NONE 可写；
 - `update_meta`：**以新 (SYM, TIME) 布局重建 `.meta` 并把全部现有 FIELD
   并发重散布到新布局**（区别于 `update_table` 的「格子内更新」）：
   - 参数与 `create_meta` 一致（`sym`/`time` 为逐行数组）；
@@ -871,6 +1047,8 @@ META pruning -> 读取 close -> close > 100
 
 ## 9.4 GROUP BY / Aggregate 预留
 
+> ⚠ **现状**：core 层聚合**未实现**（仍为预留）。当前聚合在**上层**执行——DataFusion 经 `SplayedStatsAggRule` 优化规则对**无过滤**的 MIN/MAX/COUNT 直接命中列统计（footer min/max + null_count）返回单行常量，其余聚合由 DataFusion/Polars 的物理计划完成；`GROUP BY sym` 的 per-SYM local aggregate → merge 尚未下沉 core。
+
 V1 不把 SQL 执行引擎塞进 Core，但预留：COUNT / SUM / MIN / MAX / AVG。
 
 尤其 `GROUP BY sym` 非常适合本布局：
@@ -961,6 +1139,8 @@ canonical NaN    ->  Arrow validity bitmap = 0（NULL）
 这样语义不会丢失。
 
 ## 10.2 Native ColumnView（核心接口）
+
+> ⚠ **定位更新**：本节的 ColumnView 是**遗留路径**——当前引擎无关的主内存模型已由 **CoreBatch**（`splayed-core::batch`，见 §10.1）取代；`ColumnView` 仍在（供 `column_view_to_arrow` 与 scalar filter 使用），但「未来性能优化的关键接口」的角色已转移给 CoreBatch。
 
 为了同时服务 DataFusion 和 DuckDB，Core 不应该只暴露 Arrow。Core 有：
 
@@ -1184,6 +1364,10 @@ splayed-duckdb-extension（C++ 工程，非 cargo 成员）
   向量缓冲；扩展工程若改用 C++ `Vector(LogicalType, data_ptr)` 构造可零拷贝。
 - 演进顺序（按实施建议）：先扫描（已做）→ 分区谓词转换 → 写入 →
   ADBC/DuckDB 平替后端。
+  ⚠ **现状**：扫描已完成；**分区谓词转换**在 native 侧经
+  `PartitionScanRequest.partition_filters` 已部分支持，但 C++ 扩展壳
+  （`splayed-duckdb-extension`）的谓词下推、**写入、物化视图**仍为骨架/未来项；
+  **ADBC/DuckDB 平替后端**未做（当前 ADBC 走 DataFusion 执行 SQL）。
 
 构建产物（`--config "lib.crate-type=['cdylib','staticlib']"`）：
 `target/release/{splayed_duckdb.dll, splayed_duckdb.lib, splayed_duckdb.dll.lib}`。
@@ -1269,7 +1453,9 @@ example/                     # Python demo scripts
 
 ---
 
-# 12. 开发阶段（Phase 1–9）
+# 12. 开发阶段（Phase 1–9，均已 ✅ Done）
+
+> 后续阶段（Phase 10–20：CoreBatch、类型扩展、并行、适配层组件化、统计 footer、update_meta、分区管理/分区列/分区写、stats-agg 规则等）已全部完成，完整列表见 **`docs/development/phases.md`**。
 
 ## Phase 1：Format
 
@@ -1322,6 +1508,8 @@ SYM/TIME pruning、合取值过滤、LIMIT、统计信息、`get_table_definitio
 ---
 
 # 13. 性能基准（从第一天开始）
+
+> ⚠ **未实现（目标）**：仓库暂无任何 bench 基础设施（无 `benches/`，Cargo.lock 无 criterion/iai/divan）。下表与「vs Parquet 对比矩阵」均为**规划目标**，尚未落地；实现时可接入 criterion 并在 CI 中跑 benchmark job。
 
 不要等做完才 benchmark。至少建立：
 
