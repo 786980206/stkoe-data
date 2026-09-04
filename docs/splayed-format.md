@@ -1,6 +1,6 @@
 # splayed-format：数据格式定义
 
-splayed 磁盘数据格式定义。只定义物理布局与二进制语义；API 见 [splayed-core](splayed-core.md) 与 [splayed-table](splayed-table.md)。
+splayed 磁盘数据格式定义。只定义物理布局与二进制语义；API 见 [splayed-core](splayed-core.md)、[splayed-table](splayed-table.md) 与 [splayed-codec](splayed-codec.md)。
 
 ## 1. 文件类型
 
@@ -31,7 +31,27 @@ splayed 磁盘数据格式定义。只定义物理布局与二进制语义；API
 
 TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其一。
 
-## 3. NULL 语义
+## 3. 内存数据表示
+
+core / codec / 适配层共用的零依赖内存数据模型。
+
+```
+Buffer      { ptr, size, alignment, ownership }    // Owned / Borrowed / Mmap，负责底层内存与生命周期
+BufferView  { ptr, size }                          // non-owning；可经 offset + size 切片构造，不复制
+BitmapView  { data: BufferView, offset, length }   // 1 bit ↔ 1 行，LSB-first
+ColumnView  { data_type, values: BufferView, validity: BitmapView?, length }
+FieldSchema { name, data_type }
+Schema      { fields: FieldSchema[] }
+DataView    { schema, columns: ColumnView[], length }
+```
+
+- BufferView / BitmapView / ColumnView / DataView 均为 non-owning；生命周期不能超过底层 Buffer。
+- ColumnView：单列视图；values 与 validity 可来自不同 Buffer；`validity = null` 表示全部有效。
+- Schema：纯逻辑描述，不携带 encoding / compression / offset 等物理属性；不独立持久化（无 Schema 文件）。
+- DataView：read-only 优先；可只含部分字段（projection）；所有列统一 `length`；不同列可来自不同 Buffer。
+- `Data` 为 owning / materialized 表示；仅需要独立拥有数据时才发生 `DataView → Data` 复制。
+
+## 4. NULL 语义
 
 - NULL 由 validity bitmap 表示，与 DataType 无关。
 - 每个 FIELD 携带可选 validity bitmap：1 bit 对应 1 行，`1 = 有效，0 = NULL`，位序 LSB-first（bit i ↔ row i）。
@@ -39,7 +59,7 @@ TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其
 - NULL 单元的 value 位未定义，读侧忽略。
 - 写入总是 values + validity 成对提交。
 
-## 4. Encoding
+## 5. Encoding
 
 | ID | 编码 | 说明 |
 | --: | --- | --- |
@@ -48,7 +68,7 @@ TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其
 | 2 | `RLE` | Run Length Encoding（重复值） |
 | 3 | `BITPACK` | 位打包（小整数） |
 
-## 5. Compression
+## 6. Compression
 
 | ID | 压缩 | 特点 |
 | --: | --- | --- |
@@ -60,7 +80,7 @@ TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其
 - compressed FIELD 的 DATA / VALIDITY 整体作为 payload 参与编码压缩，header 恒为明文；分块与块头布局由 splayed-codec 定义。
 - compressed FIELD 可通过 write mode Handle 修改：内部解压为 working representation，close 时如有修改自动重压缩写回。
 
-## 6. META 格式（`.meta`）
+## 7. META 格式（`.meta`）
 
 ### Header（固定 64 字节）
 
@@ -74,11 +94,11 @@ TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其
 | 16 | 8 | `generation` | uint64 | 当前 META 数据版本，用于校验 FIELD 是否匹配 |
 | 24 | 4 | `time_count` | uint32 | TIME AXIS 元素数量 |
 | 28 | 4 | `sym_count` | uint32 | SYM 数量 |
-| 32 | 8 | `sym_dict_offset` | uint64 | SYM Dictionary 起始位置 |
-| 40 | 8 | `sym_index_offset` | uint64 | SYM INDEX 起始位置 |
-| 48 | 8 | `file_size` | uint64 | META 文件总大小 |
-| 56 | 4 | `row_count` | uint32 | 逻辑总行数 = `Σ time_count` = 每个 FIELD 的 `row_count` |
-| 60 | 4 | reserved | uint32 | 预留 |
+| 32 | 4 | `row_count` | uint32 | 逻辑总行数 = `Σ time_count` = 每个 FIELD 的 `row_count` |
+| 36 | 4 | reserved | uint32 | 预留 |
+| 40 | 8 | `sym_dict_offset` | uint64 | SYM Dictionary 起始位置 |
+| 48 | 8 | `sym_index_offset` | uint64 | SYM INDEX 起始位置 |
+| 56 | 8 | `file_size` | uint64 | META 文件总大小 |
 | 64 |  | HEADER END |  | 固定 64 字节 |
 
 ### 数据区
@@ -112,11 +132,11 @@ global_row = row_start + (time_index - time_start)
 
 META 创建后 layout 固定、进入只读状态；不提供 update / compress / decompress。
 
-内容或 layout 变化（新增 sym、扩大 time 范围、布局重排）时：`MetaBuilder` 构建新文件 → 临时文件 → 原子 rename 替换旧 `.meta`；替换原子完成，不出现 META 短暂不存在的状态。
-
-## 7. FIELD 格式
+## 8. FIELD 格式
 
 ### 物理布局
+
+下图为 `PLAIN + NONE` 表示的布局；compressed FIELD 的 DATA 区为 chunk 序列，见 [splayed-codec](splayed-codec.md) §3。
 
 ```text
 +------------------------------+
@@ -158,14 +178,10 @@ META 创建后 layout 固定、进入只读状态；不提供 update / compress 
 - VALIDITY 区大小 = `ceil(row_count / 8)`，`has_validity = 0` 时不存在。
 - `null_count` 为真实 NULL 计数，创建（带数据）与每次成功写入后维护。
 
-## 8. Generation 与原子提交
+## 9. Generation 与原子提交
 
 - `generation`：uint64，严格单调递增。
 - `META.generation` 是 Dataset 的数据版本；`FIELD.generation` 必须与之匹配，打开 / 首次访问时校验，不一致按过期或损坏处理。
 - `write_field_handle` / `update_field_handle` 成功后递增 `FIELD.generation`。
 - 文件级替换（META 重建、cast 产物切换）：写临时文件 → fsync → 原子 rename。
 - FIELD data / validity 原地写以 generation 屏障 + 读侧校验保证一致性。
-
-## 9. 统计 Footer
-
-FIELD 级统计（min / max / null_count 扩展区）暂未定义，预留于 DATA 区之后。

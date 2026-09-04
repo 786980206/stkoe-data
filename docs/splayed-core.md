@@ -54,54 +54,11 @@ RowRange
 
 > 规范说明：草稿中两种表示混用（`[100,3)` 与 `[1000,1250)`），统一为 offset/length——与 SYM INDEX 的 `row_start + time_count`、`write` 的 slice 语义一致。
 
-### 3.2 BufferView / BitmapView
+### 3.2 内存数据视图
 
-```
-BufferView { ptr, size }            non-owning，可经 offset+size 切片构造，不复制
-BitmapView { data: BufferView,      non-owning；1 bit ↔ 1 行，LSB-first
-             offset, length }
-```
+`Buffer / BufferView / BitmapView / ColumnView / Schema / DataView / Data` 的定义见 [splayed-format](splayed-format.md) §3——零依赖的公共数据模型，codec 与各适配层共用同一套视图类型。
 
-- 底层存储支持 `Owned / Borrowed / Mmap`（`Buffer` 负责生命周期）。
-- view 生命周期不能超过底层资源。
-
-### 3.3 ColumnView（单列）
-
-```
-ColumnView
-├── data_type
-├── values: BufferView
-├── validity: BitmapView?      // null = 全部有效
-└── length
-```
-
-- 单列非拥有视图；`values` 与 `validity` 可来自不同 Buffer。
-- Field 的读写、META / Dataset 的输入输出统一使用。
-
-### 3.4 Schema / FieldSchema
-
-```
-FieldSchema { name, data_type }
-Schema { fields: FieldSchema[] }
-```
-
-- 纯逻辑描述：不携带 encoding / compression / offset 等物理属性。
-- 从 Dataset / Data 的逻辑结构得到，不独立持久化（无 Schema 文件）。
-
-### 3.5 DataView（多列）
-
-```
-DataView
-├── schema
-├── columns: ColumnView[]
-└── length
-```
-
-- non-owning、read-only 优先；不复制列数据。
-- 可只包含部分字段（projection）；所有列统一 `length`；不同列可来自不同 Buffer（mmap A / mmap B / Arrow buffer 等混合）。
-- `Data` 是 owning / materialized 版本；只有需要独立拥有数据时才发生 `DataView → Data` 复制。
-
-### 3.6 数据参数统一
+### 3.3 数据参数统一
 
 ```
 Field    read / write          → ColumnView（单列）
@@ -109,7 +66,7 @@ META     create / read_index   → DataView（sym / time 两列）
 Dataset  read / write          → DataView（多列）
 ```
 
-### 3.7 ScanRequest
+### 3.4 ScanRequest
 
 ```
 ScanRequest
@@ -121,13 +78,13 @@ ScanRequest
 
 > 规范说明：相对草稿移除 `batch_size`——Scanner 一次 `next()` 只产出一个连续 RowRange，batch 聚合是 Reader 层职责（见 splayed-table 的 `TableReader`）。Field / META 是单列、两列扫描，无 projection；projection 仅 Dataset 级有意义。
 
-### 3.8 Predicate
+### 3.5 Predicate
 
 - core 定义的可组合条件表达式：`AND / OR / NOT` + 基本比较。
 - DuckDB / DataFusion / Polars 等适配层负责转换为 core 表达式。
 - 多字段 predicate 的执行顺序由上层 query planner 决定；core 只保证任一顺序下结果一致。
 
-### 3.9 Scanner / Reader 契约
+### 3.6 Scanner / Reader 契约
 
 ```
 next()   -> Result<T?, Error>    // None = 正常结束；Err = 执行错误
@@ -137,7 +94,7 @@ close()  -> Result<()>
 - `close()` 在正常结束、LIMIT 提前结束、错误、上层取消后都必须可安全调用。
 - 该契约对 `FieldScanner / IndexScanner / DatasetScanner / TableScanner / TableReader` 统一适用。
 
-### 3.10 mode
+### 3.7 mode
 
 `read | write`。表示访问意图，不是文件的 compression 状态。
 
@@ -395,7 +352,7 @@ close 后 Handle 不可再用；释放 fd / mmap 等资源；META 无任何写�
 
 ### 6.8 META 更新策略
 
-META immutable，无 `update_meta()`。内容或 layout 变化时由 `MetaBuilder` 重建新文件，经临时文件 + 原子 rename 替换（见 splayed-format §6）。
+META immutable，无 `update_meta()`。内容或 layout 变化（新增 sym、扩大 time 范围、布局重排）时由 `MetaBuilder` 构建新文件：写临时文件 → 原子 rename 替换旧 `.meta`；替换原子完成，不出现 META 短暂不存在的状态。
 
 ## 7. Dataset API
 
@@ -516,7 +473,7 @@ DatasetStatistics
 
 - 统计来自 META，不扫描 Field 数据；只读。
 - `sym_min / sym_max` 取字典首尾；`time_min / time_max` 取 TIME AXIS 首尾。
-- 不含 Field 级 min / max / null_count（是否保留见 splayed-format §9，待定）。
+- 不含 Field 级 min / max / null_count。
 
 ### 7.10 read_dataset
 
@@ -612,6 +569,5 @@ Dataset 级变化（重建）
 - stride / 非 contiguous Column。
 - core 内部的全局 predicate reorder / query planner。
 - 行级 DELETE、INSERT 追加、UPSERT、MERGE（见 splayed-table §6）。
-- Field 级统计（footer，待定，见 splayed-format §9）。
 
 设计原则：**core API 保持薄，只有上层真正需要的能力才下沉到 core。**

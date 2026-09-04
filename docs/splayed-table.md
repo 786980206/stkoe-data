@@ -108,7 +108,7 @@ TableReader  { next() -> Result<DataView?>,         close() -> Result<()> }
 
 - `None` = 正常结束；`Err` = IO / 数据损坏 / 非法请求 / 资源错误。
 - `close()` 在正常结束、LIMIT 提前结束、错误、取消后都可安全调用。
-- 与 core 的 Scanner / Reader 契约一致（splayed-core §3.9）。
+- 与 core 的 Scanner / Reader 契约一致（splayed-core §3.6）。
 
 ### 3.5 TableMetadata / TableStatistics
 
