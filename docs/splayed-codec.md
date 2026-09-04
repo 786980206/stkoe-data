@@ -49,7 +49,8 @@ chunk
 payload = compression( encode_encoding(values[rows]) || validity_bits[ceil(rows/8)] )
 ```
 
-- chunk 行数取固定常量（默认 8192，定稿可调），最后一块允许不足。
+- chunk 行数由写入侧决定，chunk 头自描述（`rows` 明文），读侧不假设固定大小；最后一块允许不足。
+- 常见策略：缺省固定 8192 行均匀分块；Dataset 层压缩时按 `k × time_count`（k 个连续 sym，默认 k = 8）生成 sym 对齐边界。
 - chunk 头（rows / values_len / payload_len）恒为明文小端。
 - `payload` 先按 Encoding 编码 values，再拼接该 chunk 的 validity 位，最后整段按 Compression 压缩；`values_len` 记录解压后 encoded values 的长度，validity 位在解压结果中按该偏移分离。
 - 无 Block Index：定位第 k 个 chunk 需顺序跳过前 k 个 chunk 头（每头 12 字节）；随机单点读场景应使用 `PLAIN + NONE`。
@@ -114,5 +115,6 @@ decode_chunk(encoding, compression, data_type,
 ## 8. 注意事项
 
 - 无 Block Index：compressed FIELD 面向大范围扫描 / 冷数据 / 归档；随机单点查询走 `PLAIN + NONE`。
+- 分块对齐（如 sym 对齐）由调用方以 `offsets` 参数表达，codec 不感知 META；compressed write 的 close 收尾沿用文件既有 chunk 分组。
 - `decode_chunk` 必须校验 `rows`、`values_len`、`payload_len` 与 payload 实际内容一致，不一致按数据损坏处理（Err）。
 - 编解码逐位可逆是硬性约束；`PLAIN` 之外每种 Encoding 都必须有覆盖 NULL 位型的 roundtrip 测试。

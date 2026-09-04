@@ -82,6 +82,7 @@ ScanRequest
 
 - core 定义的可组合条件表达式：`AND / OR / NOT` + 基本比较。
 - DuckDB / DataFusion / Polars 等适配层负责转换为 core 表达式。
+- predicate 在 ColumnView 的各 segment 内求值（段内 SIMD），段间结果按逻辑行序合并。
 - 多字段 predicate 的执行顺序由上层 query planner 决定；core 只保证任一顺序下结果一致。
 
 ### 3.6 Scanner / Reader 契约
@@ -97,6 +98,35 @@ close()  -> Result<()>
 ### 3.7 mode
 
 `read | write`。表示访问意图，不是文件的 compression 状态。
+
+### 3.8 Handle 对象
+
+Handle 是不透明的运行时对象，生命周期与内部状态由 core 管理。以下为实现模型，不是 public 契约；调用方不依赖内部字段。
+
+```
+FieldHandle
+├── fd / mmap                     // 原始 Field 文件
+├── header: FieldHeader           // header 明文缓存（字段定义见 splayed-format §8）
+├── chunk_rows: Vec<u32>?         // compressed：打开时从 chunk 头读得的分组
+├── working: values + validity    // compressed write：解压后的工作数据
+├── mode: read | write
+├── state: unmodified | modified
+└── 资源 / 生命周期
+
+MetaHandle
+├── fd / mmap                     // .meta
+├── header 缓存                   // version / time_type / generation / time_count / sym_count / row_count（splayed-format §7）
+└── 资源 / 生命周期                // 只读对象，无修改状态
+
+DatasetHandle
+├── meta: MetaHandle              // 常驻
+├── schema: Schema                // open 时由 META + Field 元信息得到
+├── fields: FieldHandle 缓存      // 按需打开与复用
+└── mode / 资源 / 生命周期
+```
+
+- `TableHandle` 属于 splayed-table 层，定义见 splayed-table §3.1。
+- `FieldHeader` / `MetaInfo` 等结构的字段以 splayed-format §7 / §8 的 header 定义为准，core 不重复定义。
 
 ## 4. 公共语义：逻辑行空间
 
@@ -122,7 +152,8 @@ row(sym_i, time_index) = row_start(i) + (time_index - time_start(i))
 | `create_field_file` | 创建 Field 文件并初始化 | File |
 | `open_field_file` | 打开已有 Field，返回 `FieldHandle` | File |
 | `delete_field_file` | 删除 Field 物理文件 | File |
-| `cast_field_file` | 生成 target 类型的副本 Field | File |
+| `rename_field_file` | 重命名 Field 文件 | File |
+| `cast_field_file` | 将 Field 原地转换为 `target_type` | File |
 | `compress_field_file` | uncompressed → compressed 物理表示 | File |
 | `decompress_field_file` | compressed → uncompressed 物理表示 | File |
 | `read_field_handle` | 按逻辑行读取，返回 `ColumnView` | Handle |
@@ -145,7 +176,13 @@ init = length(n) | data(ColumnView) | stream(reader)
 - `stream(reader)`：从流式数据源持续读取初始化；最终长度无需预先知道。
 - header 不要求调用方完整构造；可从 `path / data_type / init` 推断的信息由 core 生成。
 
-流程：写 header → 按 `row_count` 预分配 DATA（+ VALIDITY）→ 有数据则写值 → 落盘。
+流程（按 `init` 分派，分配与写值一步完成，不做先预分配再写值的二次写入）：
+
+- `length(n)`：写 header（`row_count = n`）→ 预分配 DATA（NULL）+ VALIDITY（全 0 位）。
+- `data(ColumnView)`：`row_count` = 数据长度；header + values + validity 一次性顺序写出；数据全有效时不写 validity 区（`has_validity = 0`）。
+- `stream(reader)`：写 header → 流式追加 values + validity → 结束时回填 `row_count` / `data_length` / `null_count`。
+
+创建完成前 fsync，配合上层（Dataset / Table）的临时文件 + 原子 rename。
 
 注意事项：
 
@@ -163,18 +200,29 @@ open_field_file(path, mode) -> Result<FieldHandle>
 - `read`：允许 read / scan；不修改原文件；compressed Field 的解压对上层隐藏。
 - `write`：允许 read / scan / write / update。uncompressed Field 直接原地修改；compressed Field 内部进入解压后的 working representation，发生修改后由 close 自动重压缩写回。
 
-### 5.3 read_field_handle
+### 5.3 rename_field_file
+
+```
+rename_field_file(path, new_name) -> Result<()>
+```
+
+- 同目录内重命名 Field 文件；文件名即字段名（沿用 Dataset 层的名称解析约定）。
+- 原子完成；`new_name` 对应文件已存在时 Error，不覆盖。
+- 只改文件名，不修改数据、header、generation。
+- 字段名合法性与重复检查由上层负责。
+
+### 5.4 read_field_handle
 
 ```
 read_field_handle(handle, offset, length) -> Result<ColumnView>
 ```
 
 - `offset / length` 为逻辑行（= 物理行）；`offset + length ≤ row_count`；`length = 0` 返回空 view。
-- 返回 zero-copy view；compressed Field 的 view 指向内部 working representation。
+- 返回 zero-copy ColumnView：`PLAIN + NONE` 为单段 mmap 切片；compressed Field 逐 chunk 物化，跨 chunk 的读取返回多段。
 - view 生命周期不能超过 Handle / 底层资源；close 后失效。
 - 不提供 `parallel` 参数，并发由上层控制。
 
-### 5.4 write_field_handle
+### 5.5 write_field_handle
 
 ```
 write_field_handle(handle, offset, data: ColumnView) -> Result<()>
@@ -183,7 +231,7 @@ write_field_handle(handle, offset, data: ColumnView) -> Result<()>
 职责：positional overwrite，按逻辑行覆盖写入。
 
 - 需要 write mode；从 `offset` 起覆盖写入。
-- values + validity 成对写入；`validity = null` 表示本段全部有效。
+- values + validity 成对写入；`data` 含多个 segment 时按逻辑行序逐段写入，segment 的 `validity = null` 表示该段全部有效。
 - 只改 data，不改 header；不改变逻辑长度；`offset + data.length ≤ row_count`。
 - 这是覆盖写，不是追加 / 扩容接口。
 - compressed Field 修改内部 working representation，close 时统一收尾。
@@ -192,7 +240,7 @@ write_field_handle(handle, offset, data: ColumnView) -> Result<()>
 
 > 规范说明：数据参数统一为 `ColumnView`（草稿中 buffer/stream 与 ColumnView 混用）。写路径长度有界，流式大数据 = 分块多次调用；`stream` 仅保留在 create 的 `init` 中（最终长度未知的场景）。
 
-### 5.5 update_field_handle
+### 5.6 update_field_handle
 
 ```
 update_field_handle(handle, header: FieldHeader) -> Result<()>
@@ -202,7 +250,7 @@ update_field_handle(handle, header: FieldHeader) -> Result<()>
 - 与 `write_field_handle` 的区别：write 改 data，update 改 header。
 - compressed Field 的 header 更新随 close 流程保持文件一致。
 
-### 5.6 scan_field_handle
+### 5.7 scan_field_handle
 
 ```
 scan_field_handle(handle, request) -> Result<FieldScanner>
@@ -214,7 +262,7 @@ FieldScanner::next() -> Result<RowRange?>
 - 只定位，不物化数据；输出可交给 `read_field_handle`，或作为其他 Field scan 的 `ranges` 输入做多字段下推。
 - Field 不理解 sym / time；只做值过滤。不支持 order 下推。
 
-### 5.7 close_field_handle
+### 5.8 close_field_handle
 
 ```
 close_field_handle(handle) -> Result<()>
@@ -223,28 +271,30 @@ close_field_handle(handle) -> Result<()>
 - close 后 Handle 不可再用；释放 fd / mmap / working memory。
 - read handle：无写回。
 - uncompressed write handle：写入已直接生效，无需额外动作。
-- compressed write handle：发生修改 → 自动 compress + rewrite，文件保持 compressed；未修改 → 不写回。
+- compressed write handle：发生修改 → 自动 compress + rewrite，文件保持 compressed；重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，自描述，不依赖 META；写路径不改 `row_count`，`Σ rows == row_count` 恒成立，分组可精确复用），写临时文件后原子替换；未修改 → 不写回。
 - 不提供 `commit / flush / dump` public API。
 
-### 5.8 cast_field_file
+### 5.9 cast_field_file
 
 ```
-cast_field_file(source, target, target_type) -> Result<()>
+cast_field_file(path, target_type) -> Result<()>
 ```
 
-- 读取 source → 数据类型转换 → 写入 target Field；不修改 source。
-- source 的压缩状态对调用方透明。
-- 类型转换可能改变物理表示，因此通过独立 target 完成，不属于 `write_field_handle` 的原地覆盖。
-- target 文件的替换策略与原子切换由上层（Dataset / Table）负责。
+- 读取 `path` 处 Field → 数据类型转换 → 写临时文件 → 原子 rename 替换原文件；对外表现为原地转换。
+- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换。
+- 转换失败时原文件保持不变。
+- 原文件的压缩状态对调用方透明；转换通过临时文件完成，不属于 `write_field_handle` 的原地覆盖。
 
-### 5.9 compress_field_file / decompress_field_file
+### 5.10 compress_field_file / decompress_field_file
 
 ```
-compress_field_file(path) -> Result<()>
+compress_field_file(path, offsets?) -> Result<()>
 decompress_field_file(path) -> Result<()>
 ```
 
 - File 级物理表示转换；不依赖已打开 Handle；逻辑数据与 header 语义不变。
+- `offsets`：可选的 chunk 起始行号，升序、`offsets[0] == 0`，隐含最后一块延伸到 `row_count`；省略时按固定 8192 行均匀分块（最后一块允许不足）。
+- 分块策略是调用方的职责：Dataset 层按 META 网格生成 sym 对齐边界（见 7.7），裸调用可省略 `offsets`。
 - 状态不符时返回明确错误（如 AlreadyCompressed / NotCompressed），不做静默 no-op。
 - 与 close 的自动压缩互补：一个面向离线维护，一个面向写生命周期。
 
@@ -290,7 +340,7 @@ open_meta_file(path, mode) -> Result<MetaHandle>
 
 ```
 read_meta_handle(handle) -> MetaInfo
-MetaInfo { version, time_type, generation, time_count, sym_count }
+MetaInfo { version, time_type, generation, time_count, sym_count, row_count }
 ```
 
 只读取结构化信息；不做 Index 定位；调用方无需了解物理布局。
@@ -380,6 +430,7 @@ Dataset（目录）
 | `create_dataset_field` | 新增单个 Field | Dataset |
 | `create_dataset_fields` | 批量新增 Field | Dataset |
 | `delete_dataset_field` | 删除指定 Field | Dataset |
+| `rename_dataset_field` | 重命名指定 Field | Dataset |
 | `cast_dataset_field` | 转换指定 Field 类型 | Dataset |
 | `compress_dataset_field` / `decompress_dataset_field` | 压缩 / 解压指定 Field | Dataset |
 | `read_dataset_schema` | 读取逻辑 Schema | Dataset |
@@ -433,9 +484,10 @@ delete_dataset(path) -> Result<()>
 ### 7.7 Field 结构操作
 
 ```
-create_dataset_field(path, name, data: ColumnView) -> Result<()>
+create_dataset_field(path, name, data_type, init?) -> Result<()>
 create_dataset_fields(path, data: DataView) -> Result<()>
 delete_dataset_field(path, name) -> Result<()>
+rename_dataset_field(path, name, new_name) -> Result<()>
 cast_dataset_field(path, name, target_type) -> Result<()>
 compress_dataset_field(path, name) -> Result<()>
 decompress_dataset_field(path, name) -> Result<()>
@@ -444,10 +496,11 @@ decompress_dataset_field(path, name) -> Result<()>
 共同语义：
 
 - `sym / time` 不作为普通 Field 操作；其身份由 META 管理。
-- 新增：名称不得与已有 Field 重复（批量时彼此也不得重复）；数据长度必须等于当前逻辑长度 `L`；类型取自输入 `ColumnView` 的 `DataType`；不改变 sym / time 范围；完成后 Schema 同步增长。
+- 新增：名称不得与已有 Field 重复（批量时彼此也不得重复）；字段长度必须等于当前逻辑长度 `L`；不改变 sym / time 范围；完成后 Schema 同步增长。`create_dataset_field` 的 `init` 对齐 core `create_field_file`：省略 = 全 NULL（`length(L)`）；`data(ColumnView)` / `stream(reader)` = 带数据初始化，行数必须恰为 `L`，分配与写值一步完成；`data_type` 显式传入并与数据一致。
 - 删除：内部复用 `delete_field_file`；META 不受影响；Schema 同步移除。
-- cast：内部复用 `cast_field_file`（生成新文件 → 原子替换旧文件由 Dataset 层负责）；完成后 Schema 中类型更新。
-- compress / decompress：内部复用对应 Field File API；批量 = 多次调用。
+- rename：内部复用 `rename_field_file`（同目录原子 rename）；`new_name` 不得与已有 Field 重复、不得为 `sym` / `time`；原子完成，失败时原字段名保持不变；完成后 Schema 同步更新。
+- cast：内部复用 `cast_field_file`（临时文件 + 原子替换在其内部完成）；完成后 Schema 中该 Field 类型更新。
+- compress：由 META 的 SYM INDEX 生成 chunk 边界（`k` 个连续 sym，默认 `k = 8`；单 sym 区间超过上限 64K 行时按行数劈开），以 `offsets` 传给 `compress_field_file`；decompress：直接调用 `decompress_field_file`。批量 = 多次调用。
 
 ### 7.8 read_dataset_schema
 

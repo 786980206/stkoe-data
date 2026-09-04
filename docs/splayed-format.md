@@ -36,26 +36,33 @@ TIME 类型为 `DATE32` / `TIMESTAMP_US`；META header 的 `time_type` 声明其
 core / codec / 适配层共用的零依赖内存数据模型。
 
 ```
-Buffer      { ptr, size, alignment, ownership }    // Owned / Borrowed / Mmap，负责底层内存与生命周期
-BufferView  { ptr, size }                          // non-owning；可经 offset + size 切片构造，不复制
-BitmapView  { data: BufferView, offset, length }   // 1 bit ↔ 1 行，LSB-first
-ColumnView  { data_type, values: BufferView, validity: BitmapView?, length }
-FieldSchema { name, data_type }
-Schema      { fields: FieldSchema[] }
-DataView    { schema, columns: ColumnView[], length }
+Buffer        { ptr, size, alignment, ownership }    // Owned / Borrowed / Mmap，负责底层内存与生命周期
+BufferView    { ptr, size }                          // non-owning；可经 offset + size 切片构造，不复制
+BitmapView    { data: BufferView, offset, length }   // 1 bit ↔ 1 行，LSB-first
+ColumnSegment { values: BufferView, validity: Option<BitmapView> }
+ColumnView    { data_type, segments: Vec<ColumnSegment>, length }
+FieldSchema   { name, data_type }
+Schema        { fields: FieldSchema[] }
+DataView      { schema, columns: ColumnView[], length }
 ```
 
-- BufferView / BitmapView / ColumnView / DataView 均为 non-owning；生命周期不能超过底层 Buffer。
-- ColumnView：单列视图；values 与 validity 可来自不同 Buffer；`validity = null` 表示全部有效。
+- BufferView / BitmapView / ColumnSegment / ColumnView / DataView 均为 non-owning；生命周期不能超过底层 Buffer。
+- ColumnSegment：一段连续行区间；段内连续是硬约束（SIMD 逐段求值的前提）；`validity = null` 表示该段全部有效。
+- ColumnView：单列视图，由一个或多个 segment 按逻辑行序组成。不变式：
+  - `segments` 非空、按逻辑行序排列；
+  - `Σ segments 行数 == length`；
+  - `PLAIN + NONE` 路径恒为单段（mmap 切片）；多段仅出现在 compressed 跨 chunk 读取与跨 Partition batch 聚合。
 - Schema：纯逻辑描述，不携带 encoding / compression / offset 等物理属性；不独立持久化（无 Schema 文件）。
-- DataView：read-only 优先；可只含部分字段（projection）；所有列统一 `length`；不同列可来自不同 Buffer。
+- DataView：read-only 优先；可只含部分字段（projection）；所有列统一 `length`；不同列可来自不同 Buffer；列内多段对 DataView 透明。
 - `Data` 为 owning / materialized 表示；仅需要独立拥有数据时才发生 `DataView → Data` 复制。
+
+与 Arrow 的转化：segment 与 Arrow Array 一一对应、零拷贝（values / validity 直接包装底层 Buffer，LSB-first 位序一致）；Arrow Array 要求单张连续 values buffer，多段列转单个 Array 需显式 rechunk（一次拷贝）。chunk 边界天然是分 batch 边界。
 
 ## 4. NULL 语义
 
 - NULL 由 validity bitmap 表示，与 DataType 无关。
 - 每个 FIELD 携带可选 validity bitmap：1 bit 对应 1 行，`1 = 有效，0 = NULL`，位序 LSB-first（bit i ↔ row i）。
-- 全有效列没有 validity 区（header `flags.has_validity = 0`）；内存表示中 `validity = null` 等价于全部有效。
+- 全有效列没有 validity 区（header `flags.has_validity = 0`）；内存表示中 segment 的 `validity = null` 等价于该段全部有效。
 - NULL 单元的 value 位未定义，读侧忽略。
 - 写入总是 values + validity 成对提交。
 
