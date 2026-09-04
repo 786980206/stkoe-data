@@ -123,7 +123,7 @@ impl SymIndexRecord {
                 found: bytes.len(),
             });
         }
-        Ok(bytemuck::pod_read_unaligned::<Self>(bytes))
+        Ok(bytemuck::pod_read_unaligned::<Self>(&bytes[..SYM_INDEX_RECORD_SIZE]))
     }
 
     /// 该 SYM 在 FIELD 中的预分配行范围 `[row_start, row_start + time_count)`。

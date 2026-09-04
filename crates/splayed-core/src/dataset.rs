@@ -1,0 +1,702 @@
+use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+
+use splayed_format::{Column, Data, DataView, DataType, FieldSchema, Schema, TimeType};
+
+use crate::error::{map_io_path, CoreError, Mode};
+use crate::field_file::{
+    close_field_handle, create_field_file, delete_field_file, open_field_file, rename_field_file,
+    cast_field_file, compress_field_file, decompress_field_file, FieldChunkReader, FieldHandle,
+    FieldInit, StreamChunk,
+};
+use crate::meta_file::{create_meta_file, MetaHandle};
+use crate::scan::{clamp_ranges, merge_ranges, Predicate, RowRange, ScanRequest};
+
+/// Dataset 逻辑目录布局：
+/// ```text
+/// dataset/
+/// ├── .meta          // Index：sym/time → 逻辑行
+/// └── <name>         // 字段数据文件（字段名即文件名，沿用 V1.0 约定）
+/// ```
+pub const META_FILE_NAME: &str = ".meta";
+/// 保留字段名：sym / time 由 META 管理，不作为普通 Field。
+pub const RESERVED_FIELD_NAMES: [&str; 2] = ["sym", "time"];
+
+fn is_reserved(name: &str) -> bool {
+    RESERVED_FIELD_NAMES.contains(&name)
+}
+
+fn validate_field_name(name: &str) -> Result<(), CoreError> {
+    if name.is_empty()
+        || name.starts_with('.')
+        || name.contains(['/', '\\'])
+        || is_reserved(name)
+    {
+        return Err(CoreError::Invalid(format!("invalid field name '{name}'")));
+    }
+    Ok(())
+}
+
+/// `create_dataset_field` 的初始化方式（对齐 core `create_field_file` 的 init 模型）。
+pub enum DatasetFieldInit {
+    /// 全 NULL（`length(L)`，L 为 Dataset 逻辑长度）。
+    AllNull,
+    /// 带数据初始化；行数必须恰为 `L`。
+    Data(Column),
+    /// 流式初始化；累计行数必须恰为 `L`。
+    Stream { chunk_rows: usize, reader: Box<dyn FieldChunkReader> },
+}
+
+/// 校验流式总长度恰为 L 的包装 reader。
+struct LengthCheckReader {
+    inner: Box<dyn FieldChunkReader>,
+    expected: u64,
+    got: u64,
+}
+
+impl FieldChunkReader for LengthCheckReader {
+    fn next_chunk(&mut self) -> Result<Option<StreamChunk>, CoreError> {
+        match self.inner.next_chunk()? {
+            Some(chunk) => {
+                self.got += chunk.rows as u64;
+                Ok(Some(chunk))
+            }
+            None => {
+                if self.got != self.expected {
+                    return Err(CoreError::Invalid(format!(
+                        "stream produced {0} rows, expected {1}",
+                        self.got, self.expected
+                    )));
+                }
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Dataset 的打开态对象：常驻 META + 按需打开的 Field Handle 缓存。
+pub struct DatasetHandle {
+    root: PathBuf,
+    meta: MetaHandle,
+    /// [sym Utf8, time] + 各 Field（按名称排序）
+    schema: Schema,
+    mode: Mode,
+    fields: HashMap<String, Box<FieldHandle>>,
+}
+
+impl DatasetHandle {
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    fn field_path(&self, name: &str) -> PathBuf {
+        self.root.join(name)
+    }
+
+    fn logical_length(&self) -> u64 {
+        self.meta.header().row_count as u64
+    }
+
+    /// Dataset Schema（sym / time + 各 Field）。
+    pub fn read_dataset_schema(&self) -> Schema {
+        self.schema.clone()
+    }
+
+    fn ensure_field(
+        fields: &mut HashMap<String, Box<FieldHandle>>,
+        root: &Path,
+        mode: Mode,
+        name: &str,
+    ) -> Result<(), CoreError> {
+        if !fields.contains_key(name) {
+            let path = root.join(name);
+            let handle = Box::new(open_field_file(&path, mode)?);
+            fields.insert(name.to_string(), handle);
+        }
+        Ok(())
+    }
+
+    fn field_handle<'a>(
+        fields: &'a HashMap<String, Box<FieldHandle>>,
+        name: &str,
+    ) -> Result<&'a FieldHandle, CoreError> {
+        fields
+            .get(name)
+            .map(|b| &**b)
+            .ok_or_else(|| CoreError::NotFound(PathBuf::from(name)))
+    }
+
+    /// 读取 Dataset 级统计（来自 META，不扫描 Field 数据；`row_count` = 容量网格逻辑行数）。
+    pub fn read_dataset_statistics(&self) -> Result<DatasetStatistics, CoreError> {
+        let header = self.meta.header();
+        let sym_count = header.sym_count;
+        let sym_min =
+            (sym_count > 0).then(|| self.meta.sym_str(0)).transpose()?.map(str::to_owned);
+        let sym_max = (sym_count > 0)
+            .then(|| self.meta.sym_str(sym_count - 1))
+            .transpose()?
+            .map(str::to_owned);
+        let time_min =
+            (header.time_count > 0).then(|| self.meta.time_at(0)).transpose()?.unwrap_or(0) as i64;
+        let time_max = (header.time_count > 0)
+            .then(|| self.meta.time_at(header.time_count - 1))
+            .transpose()?
+            .unwrap_or(0) as i64;
+        Ok(DatasetStatistics {
+            row_count: header.row_count as u64,
+            sym_count,
+            sym_min,
+            sym_max,
+            time_count: header.time_count,
+            time_min,
+            time_max,
+        })
+    }
+
+    /// 按逻辑行范围读取多列。默认返回 sym 与 time；其余 Field 由 `columns` 指定。
+    ///
+    /// sym/time 来自 META（time 列按 sym 区间零拷贝切片，sym keys 物化进 scratch）；
+    /// 各 Field 按需打开，零拷贝优先。
+    pub fn read_dataset(
+        &mut self,
+        offset: u64,
+        length: u64,
+        columns: Option<&[&str]>,
+    ) -> Result<DataView<'_>, CoreError> {
+        let l = self.logical_length();
+        if offset + length > l {
+            return Err(CoreError::Invalid(format!(
+                "read range [{offset}, {}) exceeds dataset length {l}",
+                offset + length
+            )));
+        }
+        // 校验请求的字段都存在
+        let requested: Vec<String> = columns
+            .map(|cols| {
+                cols.iter()
+                    .map(|c| c.to_string())
+                    .filter(|c| !is_reserved(c))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in &requested {
+            if self.schema.position(name).is_none() {
+                return Err(CoreError::Invalid(format!("unknown field '{name}'")));
+            }
+        }
+        // sym + time 来自 META；其余 Field 按需打开。
+        // 两阶段借用：先确保全部所需 Handle 已打开（独占），再以共享借用创建视图。
+        let mut needed: Vec<String> = Vec::new();
+        for field in &self.schema.fields {
+            if is_reserved(&field.name) {
+                continue;
+            }
+            if requested.is_empty() || requested.contains(&field.name.to_string()) {
+                needed.push(field.name.to_string());
+            }
+        }
+        for name in &needed {
+            DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, name)?;
+        }
+        // sym + time 来自 META（mut 借用 meta scratch）
+        let base = self.meta.read_index_handle(offset, length)?;
+        let mut schema = base.schema.clone();
+        let mut columns_out: Vec<splayed_format::ColumnView<'_>> = base.columns;
+        for name in &needed {
+            let handle = DatasetHandle::field_handle(&self.fields, name)?;
+            let view = handle.read_field_handle(offset, length)?;
+            let dt = handle.data_type();
+            schema.fields.push(FieldSchema::new(name.as_str(), dt));
+            columns_out.push(view);
+        }
+        base_view_done(schema, columns_out)
+    }
+
+    /// 对已有逻辑行做 positional overwrite（projection write；不保证跨 Field 原子性）。
+    pub fn write_dataset(&mut self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.mode.require_write("write_dataset")?;
+        let l = self.logical_length();
+        if offset + data.length() as u64 > l {
+            return Err(CoreError::Invalid("write range exceeds dataset length".into()));
+        }
+        if data.length() == 0 {
+            return Ok(()); // length == 0 是合法 no-op
+        }
+        // 校验：列都属于 Dataset Field（sym/time 不作为写入列），类型一致，列等长
+        for field in &data.schema.fields {
+            if is_reserved(&field.name) {
+                return Err(CoreError::Invalid(
+                    "write_dataset must not contain sym/time columns".into(),
+                ));
+            }
+            let schema_type = self
+                .schema
+                .data_type_of(&field.name)
+                .ok_or_else(|| CoreError::Invalid(format!("unknown field '{}'", field.name)))?;
+            if schema_type != field.data_type {
+                return Err(CoreError::Invalid(format!(
+                    "field '{}' type {:?} does not match dataset schema {schema_type:?}",
+                    field.name, field.data_type
+                )));
+            }
+        }
+        for field in &data.schema.fields {
+            let col = data.column(&field.name).expect("schema iteration guarantees");
+            DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, &field.name)?;
+            let handle = self.fields.get_mut(field.name.as_ref()).expect("just ensured");
+            handle.write_field_handle(offset, col)?;
+        }
+        Ok(())
+    }
+
+    /// 条件扫描：组合 META 与各 Field 的扫描结果，输出 Dataset 逻辑 RowRange。
+    ///
+    /// 多 predicate 的执行顺序：META（sym/time）先行，Field 谓词按名称序逐步收窄；
+    /// 跨字段的 OR / NOT 组合不支持（返回 Invalid），行级过滤兜底由上层完成。
+    pub fn scan_dataset(&mut self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+        let l = self.logical_length();
+        let mut current = clamp_ranges(&request.ranges, l);
+        if let Some(pred) = &request.predicate {
+            // 1) META：sym / time 条件（抽取为可下推的 And；无法下推的部分由行级过滤兜底）
+            let sym_time = collect_for_fields(pred, &["sym", "time"]);
+            if !matches!(&sym_time, Predicate::And(children) if children.is_empty()) {
+                let index_req = ScanRequest {
+                    ranges: current.clone(),
+                    projection: vec![],
+                    predicate: Some(sym_time),
+                    limit: None,
+                };
+                let mut scanner = self.meta.scan_index_handle(&index_req)?;
+                let mut narrowed = Vec::new();
+                while let Some(r) = scanner.next()? {
+                    narrowed.push(r);
+                }
+                scanner.close()?;
+                current = intersect_range_lists(&current, &narrowed);
+            }
+            // 2) Field 谓词：按字段分组，逐字段收窄
+            let mut groups = predicate_groups(pred)?;
+            groups.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, sub) in groups {
+                let field_req = ScanRequest {
+                    ranges: current.clone(),
+                    projection: vec![],
+                    predicate: Some(sub),
+                    limit: None,
+                };
+                let mut narrowed = Vec::new();
+                {
+                    DatasetHandle::ensure_field(&mut self.fields, &self.root, self.mode, &name)?;
+                    let handle = DatasetHandle::field_handle(&self.fields, &name)?;
+                    let mut scanner = handle.scan_field_handle(&field_req)?;
+                    while let Some(r) = scanner.next()? {
+                        narrowed.push(r);
+                    }
+                    scanner.close()?;
+                }
+                current = intersect_range_lists(&current, &narrowed);
+            }
+        }
+        Ok(DatasetScanner { ranges: VecDeque::from(current), remaining: request.limit })
+    }
+
+    /// 在已有 Dataset 中新增一个 Field。
+    pub fn create_dataset_field(
+        &mut self,
+        name: &str,
+        data_type: DataType,
+        init: DatasetFieldInit,
+    ) -> Result<(), CoreError> {
+        validate_field_name(name)?;
+        if self.schema.position(name).is_some() {
+            return Err(CoreError::AlreadyExists(self.field_path(name)));
+        }
+        let l = self.logical_length();
+        let init = match init {
+            DatasetFieldInit::AllNull => FieldInit::Length(l),
+            DatasetFieldInit::Data(col) => {
+                if col.data_type != data_type {
+                    return Err(CoreError::Invalid(format!(
+                        "field data type {:?} does not match requested {data_type:?}",
+                        col.data_type
+                    )));
+                }
+                if col.length() as u64 != l {
+                    return Err(CoreError::Invalid(format!(
+                        "field data length {} must equal dataset logical length {l}",
+                        col.length()
+                    )));
+                }
+                FieldInit::Data(col)
+            }
+            DatasetFieldInit::Stream { chunk_rows, reader } => FieldInit::Stream {
+                chunk_rows,
+                reader: Box::new(LengthCheckReader { inner: reader, expected: l, got: 0 }),
+            },
+        };
+        create_field_file(&self.field_path(name), data_type, init)?;
+        self.reload_schema();
+        Ok(())
+    }
+
+    /// 删除指定 Field（META 与 sym / time 不受影响）。
+    pub fn delete_dataset_field(&mut self, name: &str) -> Result<(), CoreError> {
+        validate_field_name(name)?;
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        self.fields.remove(name);
+        delete_field_file(&self.field_path(name))?;
+        self.reload_schema();
+        Ok(())
+    }
+
+    /// 重命名指定 Field（同目录原子 rename；失败时原字段名保持不变）。
+    pub fn rename_dataset_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError> {
+        validate_field_name(new_name)?;
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        if self.schema.position(new_name).is_some() {
+            return Err(CoreError::AlreadyExists(self.field_path(new_name)));
+        }
+        self.fields.remove(name);
+        rename_field_file(&self.field_path(name), new_name)?;
+        self.reload_schema();
+        Ok(())
+    }
+
+    /// 转换指定 Field 的数据类型（临时文件 + 原子替换在 `cast_field_file` 内部完成）。
+    pub fn cast_dataset_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError> {
+        validate_field_name(name)?;
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        self.fields.remove(name);
+        cast_field_file(&self.field_path(name), target_type)?;
+        self.reload_schema();
+        Ok(())
+    }
+
+    /// 压缩指定 Field（sym 对齐 chunk 边界由 META 网格生成：k 个连续 sym，超长 sym 按 cap 劈开）。
+    pub fn compress_dataset_field(&mut self, name: &str) -> Result<(), CoreError> {
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        self.fields.remove(name);
+        let offsets = self.sym_aligned_offsets(8, 64 * 1024);
+        compress_field_file(&self.field_path(name), Some(offsets))?;
+        Ok(())
+    }
+
+    /// 解压指定 Field。
+    pub fn decompress_dataset_field(&mut self, name: &str) -> Result<(), CoreError> {
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        self.fields.remove(name);
+        decompress_field_file(&self.field_path(name))?;
+        Ok(())
+    }
+
+    /// `(sym, time)` 联合键批量定位（转发 META，供 Table 层 write_table 使用）。
+    pub fn locate_dataset_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.meta.locate_index_handle(pairs)
+    }
+
+    fn sym_aligned_offsets(&self, k: usize, cap: u32) -> Vec<u64> {
+        let mut boundaries: Vec<u64> = vec![0];
+        let mut syms_in_chunk = 0usize;
+        for id in 0..self.meta.header().sym_count {
+            let Ok(rec) = self.meta.sym_record(id) else { break };
+            let (start, len) = (rec.row_start as u64, rec.time_count as u64);
+            if syms_in_chunk == k {
+                boundaries.push(start);
+                syms_in_chunk = 0;
+            }
+            syms_in_chunk += 1;
+            if len > cap as u64 {
+                boundaries.push(start);
+                let mut p = start + cap as u64;
+                while p < start + len {
+                    boundaries.push(p);
+                    p += cap as u64;
+                }
+                syms_in_chunk = 0;
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    }
+
+    fn reload_schema(&mut self) {
+        self.schema = build_schema(&self.root, self.meta.time_type()).unwrap_or_else(|_| {
+            Schema::new(vec![
+                FieldSchema::new("sym", DataType::Utf8),
+                FieldSchema::new("time", self.meta.time_type().data_type()),
+            ])
+        });
+    }
+
+    /// 关闭 Dataset：释放 META Handle 与全部 Field Handle（compressed write 收尾在此触发）。
+    pub fn close_dataset(mut self) -> Result<(), CoreError> {
+        let names: Vec<String> = self.fields.keys().cloned().collect();
+        for name in names {
+            if let Some(handle) = self.fields.remove(&name) {
+                close_field_handle(*handle)?;
+            }
+        }
+        self.meta.close()
+    }
+}
+
+/// DataView::new 的错误类型映射（FormatError → CoreError）。
+fn base_view_done<'a>(
+    schema: Schema,
+    columns: Vec<splayed_format::ColumnView<'a>>,
+) -> Result<DataView<'a>, CoreError> {
+    DataView::new(schema, columns).map_err(CoreError::from)
+}
+
+/// Dataset 级统计信息（来自 META）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatasetStatistics {
+    pub row_count: u64,
+    pub sym_count: u32,
+    pub sym_min: Option<String>,
+    pub sym_max: Option<String>,
+    pub time_count: u32,
+    pub time_min: i64,
+    pub time_max: i64,
+}
+
+/// 从目录内容构建 Schema（[sym, time] + 字段文件按名称排序）。
+fn build_schema(root: &Path, time_type: TimeType) -> Result<Schema, CoreError> {
+    let mut fields = vec![
+        FieldSchema::new("sym", DataType::Utf8),
+        FieldSchema::new("time", time_type.data_type()),
+    ];
+    let mut names: Vec<String> = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| map_io_path(root, e))? {
+        let entry = entry.map_err(CoreError::Io)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.ends_with(".tmp") {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    for name in names {
+        let mut f = File::open(root.join(&name)).map_err(|e| map_io_path(root, e))?;
+        let mut head = [0u8; 64];
+        std::io::Read::read_exact(&mut f, &mut head)?;
+        let header = splayed_format::FieldHeader::from_bytes(&head)?;
+        fields.push(FieldSchema::new(name.as_str(), header.data_type()?));
+    }
+    Ok(Schema::new(fields))
+}
+
+/// Dataset Scanner：输出综合 META 与参与条件判断的多个 Field 的扫描结果，
+/// 一次 `next()` 返回一个连续的 Dataset **逻辑** RowRange（不承担 batch 语义）。
+pub struct DatasetScanner {
+    ranges: VecDeque<RowRange>,
+    remaining: Option<u64>,
+}
+
+impl DatasetScanner {
+    pub fn next(&mut self) -> Result<Option<RowRange>, CoreError> {
+        if let Some(r) = self.ranges.pop_front() {
+            if let Some(rem) = &mut self.remaining {
+                let take = r.length.min(*rem);
+                *rem -= take;
+                if *rem == 0 {
+                    self.ranges.clear();
+                }
+                if take < r.length {
+                    return Ok(Some(RowRange::new(r.offset, take)));
+                }
+            }
+            Ok(Some(r))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+/// 两个 range 列表求交（各自有序合并）。
+fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
+    let mut out = Vec::new();
+    for ra in a {
+        for rb in b {
+            if let Some(inter) = ra.intersect(rb) {
+                out.push(inter);
+            }
+        }
+    }
+    merge_ranges(out)
+}
+
+/// 把 Dataset 级谓词按字段分组：(字段名, 该字段的子谓词)。
+/// sym / time 条件不分组（META 扫描已处理）；仅支持 Cmp 各自归属单一字段、
+/// And 组合；跨字段的 Or / Not 返回 Invalid（行级过滤兜底由上层完成）。
+fn predicate_groups(pred: &Predicate) -> Result<Vec<(String, Predicate)>, CoreError> {
+    let mut groups: Vec<(String, Predicate)> = Vec::new();
+    fn push(groups: &mut Vec<(String, Predicate)>, name: String, sub: Predicate) {
+        if let Some(g) = groups.iter_mut().find(|(n, _)| *n == name) {
+            let old = std::mem::replace(&mut g.1, Predicate::And(vec![]));
+            g.1 = Predicate::And(vec![old, sub]);
+        } else {
+            groups.push((name, sub));
+        }
+    }
+    fn walk(pred: &Predicate, groups: &mut Vec<(String, Predicate)>) -> Result<(), CoreError> {
+        match pred {
+            Predicate::And(children) => {
+                for c in children {
+                    walk(c, groups)?;
+                }
+                Ok(())
+            }
+            Predicate::Or(_) | Predicate::Not(_) => {
+                let mut fields = Vec::new();
+                pred.fields(&mut fields);
+                if fields.iter().all(|f| is_reserved(f)) {
+                    return Ok(()); // sym/time 组合由 META 扫描处理
+                }
+                if fields.len() == 1 && !is_reserved(&fields[0]) {
+                    let name = fields[0].to_string();
+                    push(groups, name, strip_all_fields(pred));
+                    Ok(())
+                } else {
+                    Err(CoreError::Invalid(
+                        "predicate crosses fields within Or/Not; not supported by dataset scan"
+                            .into(),
+                    ))
+                }
+            }
+            Predicate::Cmp { field: Some(name), .. } => {
+                if is_reserved(name) {
+                    return Ok(()); // sym/time 由 META 扫描处理
+                }
+                validate_field_name(name)?;
+                push(groups, name.to_string(), strip_all_fields(pred));
+                Ok(())
+            }
+            Predicate::Cmp { field: None, .. } => Ok(()),
+        }
+    }
+    walk(pred, &mut groups)?;
+    Ok(groups)
+}
+
+/// 抽取谓词中属于 `allowed` 字段的比较节点，组合为 And（无则空 And）。
+fn collect_for_fields(pred: &Predicate, allowed: &[&str]) -> Predicate {
+    fn collect(pred: &Predicate, allowed: &[&str], out: &mut Vec<Predicate>) {
+        match pred {
+            Predicate::And(children) => {
+                for c in children {
+                    collect(c, allowed, out);
+                }
+            }
+            Predicate::Cmp { field: Some(f), .. }
+                if allowed.iter().any(|a| f.as_ref() == *a) =>
+            {
+                out.push(pred.clone());
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    collect(pred, allowed, &mut out);
+    Predicate::And(out)
+}
+
+/// 把谓词中所有 Cmp 的字段名剥掉（下沉到单字段扫描时字段即自身）。
+fn strip_all_fields(pred: &Predicate) -> Predicate {
+    match pred {
+        Predicate::And(children) => {
+            Predicate::And(children.iter().map(strip_all_fields).collect())
+        }
+        Predicate::Or(children) => Predicate::Or(children.iter().map(strip_all_fields).collect()),
+        Predicate::Not(inner) => Predicate::Not(Box::new(strip_all_fields(inner))),
+        Predicate::Cmp { field: _, op, value } => Predicate::Cmp { field: None, op: *op, value: value.clone() },
+    }
+}
+
+// ------------------------------------------------------------------ File API
+
+/// 创建完整 Dataset：临时目录中建 META + 全部 Field，全部成功后原子 rename 到目标路径。
+pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError> {
+    if path.exists() {
+        return Err(CoreError::AlreadyExists(path.to_path_buf()));
+    }
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid("dataset input requires sym and time columns".into()));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| CoreError::Invalid("invalid dataset path".into()))?;
+    let tmp = parent.join(format!(".{name}.tmp"));
+    fs::create_dir_all(&tmp).map_err(|e| map_io_path(&tmp, e))?;
+
+    let result = (|| {
+        let view = data.as_view();
+        create_meta_file(&tmp.join(META_FILE_NAME), &view)?;
+        for field in &view.schema.fields {
+            if is_reserved(&field.name) {
+                continue;
+            }
+            let col = data.column(&field.name).expect("schema iteration guarantees");
+            create_field_file(
+                &tmp.join(field.name.as_ref()),
+                field.data_type,
+                FieldInit::Data(col.clone()),
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path).map_err(|e| map_io_path(path, e))?;
+    Ok(())
+}
+
+/// 创建 / 重建 Dataset 的 Index（即 `.meta`）；只创建 META，不创建 Field。
+pub fn create_dataset_index(path: &Path, data: &DataView<'_>) -> Result<(), CoreError> {
+    create_meta_file(&path.join(META_FILE_NAME), data)
+}
+
+/// 打开已有 Dataset（只打开 META；Field Handle 按需打开）。
+pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError> {
+    if !path.is_dir() {
+        return Err(CoreError::NotFound(path.to_path_buf()));
+    }
+    let meta = MetaHandle::open(&path.join(META_FILE_NAME))?;
+    let schema = build_schema(path, meta.time_type())?;
+    Ok(DatasetHandle {
+        root: path.to_path_buf(),
+        meta,
+        schema,
+        mode,
+        fields: HashMap::new(),
+    })
+}
+
+/// 删除完整 Dataset 根目录（META + 全部 Field）。
+pub fn delete_dataset(path: &Path) -> Result<(), CoreError> {
+    fs::remove_dir_all(path).map_err(|e| map_io_path(path, e))
+}

@@ -15,7 +15,7 @@ pub mod types;
 
 pub use bitmap::{Bitmap, BitmapView};
 pub use buffer::{Buffer, BufferView};
-pub use column::{Column, ColumnSegment, ColumnView};
+pub use column::{Column, ColumnSegment, ColumnValues, ColumnView, DictBuffers};
 pub use dataview::{Data, DataView};
 pub use error::FormatError;
 pub use field::{FieldHeader, FIELD_FLAGS_HAS_VALIDITY, FIELD_HEADER_SIZE};

@@ -1,20 +1,32 @@
 use crate::bitmap::{Bitmap, BitmapView};
-use crate::buffer::BufferView;
+use crate::buffer::{Buffer, BufferView};
 use crate::error::FormatError;
 use crate::types::DataType;
 use crate::validity_size;
+
+/// 段的值表示：定宽连续数组，或 Utf8 字典视图（keys u32 + 字典 offsets/strings）。
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnValues<'a> {
+    Fixed(BufferView<'a>),
+    Dict {
+        keys: BufferView<'a>,
+        dict_offsets: BufferView<'a>,
+        dict_strings: BufferView<'a>,
+    },
+}
 
 /// 单列段：一段连续行区间。
 ///
 /// 段内连续是硬约束（SIMD 逐段求值的前提）；`validity = None` 表示该段全部有效。
 #[derive(Debug, Clone, Copy)]
 pub struct ColumnSegment<'a> {
-    values: BufferView<'a>,
+    values: ColumnValues<'a>,
     validity: Option<BitmapView<'a>>,
     rows: usize,
 }
 
 impl<'a> ColumnSegment<'a> {
+    /// 定宽段：`values.len() == rows * data_type.size_of()`。
     pub fn new(
         data_type: DataType,
         values: BufferView<'a>,
@@ -25,11 +37,43 @@ impl<'a> ColumnSegment<'a> {
         if values.len() != expected {
             return Err(FormatError::SizeMismatch { expected, found: values.len() });
         }
-        Ok(ColumnSegment { values, validity, rows })
+        Ok(ColumnSegment { values: ColumnValues::Fixed(values), validity, rows })
     }
 
-    pub fn values(&self) -> BufferView<'a> {
-        self.values
+    /// Utf8 字典段：keys 为 u32 LE 字典索引；dict_offsets 为 `(n+1) × u64`；
+    /// dict_strings 为连续字符串字节。
+    pub fn new_dict(
+        keys: BufferView<'a>,
+        dict_offsets: BufferView<'a>,
+        dict_strings: BufferView<'a>,
+        validity: Option<BitmapView<'a>>,
+        rows: usize,
+    ) -> Result<Self, FormatError> {
+        if keys.len() != rows * 4 {
+            return Err(FormatError::SizeMismatch { expected: rows * 4, found: keys.len() });
+        }
+        if dict_offsets.is_empty() || dict_offsets.len() % 8 != 0 {
+            return Err(FormatError::InvalidLayout(
+                "dict offsets must be a non-empty multiple of 8 bytes".into(),
+            ));
+        }
+        Ok(ColumnSegment {
+            values: ColumnValues::Dict { keys, dict_offsets, dict_strings },
+            validity,
+            rows,
+        })
+    }
+
+    pub fn values(&self) -> &ColumnValues<'a> {
+        &self.values
+    }
+
+    /// 定宽段的字节切片（Dict 段返回 `None`）。
+    pub fn fixed_bytes(&self) -> Option<&'a [u8]> {
+        match &self.values {
+            ColumnValues::Fixed(v) => Some(v.as_slice()),
+            ColumnValues::Dict { .. } => None,
+        }
     }
 
     pub fn validity(&self) -> Option<BitmapView<'a>> {
@@ -98,26 +142,98 @@ impl<'a> ColumnView<'a> {
     pub fn null_count(&self) -> usize {
         self.segments.iter().map(|s| s.null_count()).sum()
     }
+
+    /// Utf8 列按行取字符串（Fixed 列返回 `None`）。
+    pub fn string_at(&self, row: usize) -> Option<&'a str> {
+        let mut pos = row;
+        for seg in &self.segments {
+            if pos < seg.rows() {
+                return match &seg.values {
+                    ColumnValues::Dict { keys, dict_offsets, dict_strings } => {
+                        let kb = keys.as_slice();
+                        if pos * 4 + 4 > kb.len() {
+                            return None;
+                        }
+                        let key =
+                            u32::from_le_bytes(kb[pos * 4..pos * 4 + 4].try_into().ok()?) as usize;
+                        let ob = dict_offsets.as_slice();
+                        if (key + 2) * 8 > ob.len() {
+                            return None;
+                        }
+                        let lo = u64::from_le_bytes(ob[key * 8..key * 8 + 8].try_into().ok()?);
+                        let hi =
+                            u64::from_le_bytes(ob[(key + 1) * 8..(key + 1) * 8 + 8].try_into().ok()?);
+                        let sb = dict_strings.as_slice();
+                        if hi as usize > sb.len() {
+                            return None;
+                        }
+                        std::str::from_utf8(&sb[lo as usize..hi as usize]).ok()
+                    }
+                    ColumnValues::Fixed(_) => None,
+                };
+            }
+            pos -= seg.rows();
+        }
+        None
+    }
 }
 
-/// 拥有型单列（[`Data`] 的列）。物化即连续单 Buffer。
+/// 拥有型字典缓冲（Utf8 列的 offsets + strings）。
+#[derive(Debug, Clone)]
+pub struct DictBuffers {
+    pub offsets: Buffer,
+    pub strings: Buffer,
+}
+
+/// 拥有型单列（[`Data`](crate::dataview::Data) 的列）。物化即连续单 Buffer；
+/// Utf8 列的 `values` 存字典 keys（u32），字符串数据在 `dict` 中。
 #[derive(Debug, Clone)]
 pub struct Column {
     pub data_type: DataType,
-    pub values: crate::buffer::Buffer,
+    pub values: Buffer,
     pub validity: Option<Bitmap>,
+    pub dict: Option<DictBuffers>,
 }
 
 impl Column {
-    /// 创建全 NULL（validity 全 0）或全有效（validity = None）的占位列。
+    /// 创建全 NULL（validity 全 0）或全有效（validity = None）的定宽占位列。
     pub fn zeroed(data_type: DataType, rows: usize, all_null: bool) -> Self {
-        let values = crate::buffer::Buffer::zeroed_aligned(rows * data_type.size_of(), 8);
+        assert!(data_type != DataType::Utf8, "use Column::from_dict for Utf8");
+        let values = Buffer::zeroed_aligned(rows * data_type.size_of(), 8);
         let validity = if all_null { Some(Bitmap::zeros(rows)) } else { None };
-        Column { data_type, values, validity }
+        Column { data_type, values, validity, dict: None }
+    }
+
+    /// 从字典数据构造 Utf8 列（keys 的数量即逻辑行数；offsets 为字典条目 n+1 项）。
+    pub fn from_dict(
+        keys: Vec<u32>,
+        offsets: Vec<u64>,
+        strings: Vec<u8>,
+        validity: Option<Bitmap>,
+    ) -> Self {
+        assert!(
+            offsets.len() >= 2 && offsets[0] == 0,
+            "dict offsets must have at least 2 entries starting at 0"
+        );
+        Column {
+            data_type: DataType::Utf8,
+            values: Buffer::from_vec(
+                keys.iter().flat_map(|k| k.to_le_bytes()).collect::<Vec<u8>>(),
+            ),
+            validity,
+            dict: Some(DictBuffers {
+                offsets: Buffer::from_vec(offsets.iter().flat_map(|o| o.to_le_bytes()).collect()),
+                strings: Buffer::from_vec(strings),
+            }),
+        }
     }
 
     pub fn length(&self) -> usize {
-        self.values.len() / self.data_type.size_of()
+        match self.data_type {
+            // Utf8 列：values 存字典 keys（u32），行数 = keys 数
+            DataType::Utf8 => self.values.len() / 4,
+            _ => self.values.len() / self.data_type.size_of(),
+        }
     }
 
     pub fn null_count(&self) -> usize {
@@ -125,12 +241,24 @@ impl Column {
     }
 
     pub fn as_view(&self) -> ColumnView<'_> {
-        let values = BufferView::from_buffer(&self.values);
         let validity = self.validity.as_ref().map(|v| v.as_view());
-        let segment =
-            ColumnSegment::new(self.data_type, values, validity, self.length()).expect(
-                "owned column is consistent by construction",
-            );
+        let segment = match &self.dict {
+            Some(dict) => ColumnSegment::new_dict(
+                BufferView::from_buffer(&self.values),
+                BufferView::from_buffer(&dict.offsets),
+                BufferView::from_buffer(&dict.strings),
+                validity,
+                self.length(),
+            )
+            .expect("owned dict column is consistent by construction"),
+            None => ColumnSegment::new(
+                self.data_type,
+                BufferView::from_buffer(&self.values),
+                validity,
+                self.length(),
+            )
+            .expect("owned fixed column is consistent by construction"),
+        };
         ColumnView::new(self.data_type, vec![segment])
             .expect("single-segment ColumnView is valid by construction")
     }
@@ -142,18 +270,16 @@ const _: () = assert!(validity_size(9) == 2);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer::Buffer;
+    use crate::buffer::BufferView;
 
     #[test]
     fn segment_checks_value_length() {
         let values = Buffer::from_vec(vec![0u8; 10]);
         let view = BufferView::from_buffer(&values);
-        // Int32 需要每行 4 字节：10 字节不对应整数行
         assert!(matches!(
             ColumnSegment::new(DataType::Int32, view, None, 2),
             Err(FormatError::SizeMismatch { expected: 8, found: 10 })
         ));
-        assert!(ColumnSegment::new(DataType::Int32, view, None, 2).is_err());
         assert!(ColumnSegment::new(DataType::Int8, view, None, 10).is_ok());
     }
 
@@ -181,5 +307,22 @@ mod tests {
 
         let valid = Column::zeroed(DataType::Float64, 250, false);
         assert_eq!(valid.null_count(), 0);
+    }
+
+    #[test]
+    fn dict_column_string_at() {
+        let strings = b"AAPLMSFTGOOG".to_vec();
+        let offsets = vec![0u64, 4, 8, 12];
+        let keys: Vec<u32> = vec![0, 0, 1, 2, 1];
+        let col = Column::from_dict(keys, offsets, strings, None);
+        assert_eq!(col.length(), 5);
+        let view = col.as_view();
+        assert_eq!(view.data_type(), DataType::Utf8);
+        assert_eq!(view.string_at(0), Some("AAPL"));
+        assert_eq!(view.string_at(1), Some("AAPL"));
+        assert_eq!(view.string_at(2), Some("MSFT"));
+        assert_eq!(view.string_at(3), Some("GOOG"));
+        assert_eq!(view.string_at(4), Some("MSFT"));
+        assert_eq!(view.string_at(5), None);
     }
 }

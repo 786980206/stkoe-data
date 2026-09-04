@@ -19,6 +19,8 @@ pub enum DataType {
     UInt32 = 11,
     UInt64 = 12,
     Date64 = 13,
+    /// 变宽 UTF-8 字符串（仅以字典视图承载：keys u32 + offsets + strings）。
+    Utf8 = 14,
 }
 
 impl DataType {
@@ -36,6 +38,8 @@ impl DataType {
             | DataType::Float64
             | DataType::TimestampUs
             | DataType::Date64 => 8,
+            // 变宽类型无固定宽度；字典段以 keys 长度（4B/行）校验
+            DataType::Utf8 => 0,
         }
     }
 
@@ -55,6 +59,7 @@ impl DataType {
             DataType::UInt32 => "UINT32",
             DataType::UInt64 => "UINT64",
             DataType::Date64 => "DATE64",
+            DataType::Utf8 => "UTF8",
         }
     }
 
@@ -72,9 +77,9 @@ impl DataType {
         )
     }
 
-    /// 整数族（含 DATE/TIMESTAMP，按整数位型处理）。
+    /// 整数族（含 DATE/TIMESTAMP，按整数位型处理；Utf8 不是整数）。
     pub const fn is_integer(self) -> bool {
-        !matches!(self, DataType::Float32 | DataType::Float64)
+        !matches!(self, DataType::Float32 | DataType::Float64 | DataType::Utf8)
     }
 
     pub fn from_id(id: u8) -> Result<Self, FormatError> {
@@ -101,6 +106,7 @@ impl TryFrom<u8> for DataType {
             11 => Ok(DataType::UInt32),
             12 => Ok(DataType::UInt64),
             13 => Ok(DataType::Date64),
+            14 => Ok(DataType::Utf8),
             other => Err(FormatError::UnknownDataType(other)),
         }
     }
@@ -219,9 +225,10 @@ mod tests {
             assert_eq!(dt.id(), id);
             assert_eq!(dt.size_of(), size);
         }
+        assert_eq!(DataType::from_id(14).unwrap(), DataType::Utf8);
         assert!(matches!(
-            DataType::from_id(14),
-            Err(FormatError::UnknownDataType(14))
+            DataType::from_id(15),
+            Err(FormatError::UnknownDataType(15))
         ));
     }
 

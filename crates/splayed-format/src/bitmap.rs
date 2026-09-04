@@ -129,6 +129,18 @@ impl Bitmap {
         BitmapView::new(BufferView::from_buffer(&self.data), self.bit_offset, self.len)
             .expect("owned bitmap layout is valid by construction")
     }
+
+    /// 提取 `[offset, offset + len)` 位区间为独立字节（bit 0 对应区间第 0 行）。
+    pub fn extract_bits(&self, offset: usize, len: usize) -> Result<Vec<u8>, FormatError> {
+        let view = self.as_view().slice(offset, len)?;
+        let mut out = vec![0u8; (len + 7) / 8];
+        for i in 0..len {
+            if view.is_valid(i) {
+                out[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
