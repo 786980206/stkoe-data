@@ -47,29 +47,21 @@ impl MetaBuilder {
             return Err(CoreError::Invalid("meta input must not be empty".into()));
         }
 
-        // 遍历 1：批量收集 time 值 → 全局去重有序 TIME AXIS（typed slice 零函数调用）
-        let mut axis_set: Vec<u64> = Vec::with_capacity(rows);
-        for seg in time.segments() {
-            let bytes = seg
-                .fixed_bytes()
-                .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
-            match time_type {
-                TimeType::Date32 => {
-                    let typed: &[i32] = bytemuck::cast_slice(bytes);
-                    axis_set.extend(typed.iter().map(|&v| v as u64));
+        // 批量 cast：sym keys → &[u32]，time → &[u64]（零逐行函数调用）
+        let mut keys_flat: Vec<u32> = Vec::with_capacity(rows);
+        for seg in sym.segments() {
+            let keys: &[u32] = match seg.values() {
+                splayed_format::ColumnValues::Dict { keys, .. } => {
+                    bytemuck::cast_slice(keys.as_slice())
                 }
-                TimeType::TimestampUs => {
-                    let typed: &[i64] = bytemuck::cast_slice(bytes);
-                    axis_set.extend(typed.iter().map(|&v| v as u64));
+                _ => {
+                    return Err(CoreError::Invalid(
+                        "sym column must be dictionary-encoded".into(),
+                    ))
                 }
-            }
+            };
+            keys_flat.extend_from_slice(keys);
         }
-        axis_set.sort_unstable();
-        axis_set.dedup();
-        let axis: Vec<u64> = axis_set;
-        let axis_pos = |v: u64| -> usize { axis.partition_point(|&x| x < v) };
-
-        // time 列批量 cast 为 u64 slices
         let mut time_flat: Vec<u64> = Vec::with_capacity(rows);
         for seg in time.segments() {
             let bytes = seg
@@ -87,92 +79,81 @@ impl MetaBuilder {
             }
         }
 
-        // 遍历 2：sym keys 批量 cast + run 检测（u32 slice 直接比较）
-        let mut syms: Vec<SymState> = Vec::new();
-        let mut prev_name: Option<String> = None;
-        let mut prev_time: u64 = u64::MIN;
-        let mut global_offset = 0usize;
-        for seg in sym.segments() {
-            let keys: &[u32] = match seg.values() {
-                splayed_format::ColumnValues::Dict { keys, .. } => {
-                    bytemuck::cast_slice(keys.as_slice())
-                }
-                _ => {
-                    return Err(CoreError::Invalid(
-                        "sym column must be dictionary-encoded".into(),
-                    ))
-                }
-            };
-            let seg_rows = seg.rows();
-            let mut i = 0usize;
-            while i < seg_rows {
-                let key = keys[i];
-                let run_start_global = global_offset + i;
-                let run_start = i;
-                while i < seg_rows && keys[i] == key {
-                    i += 1;
-                }
-                let run = i - run_start;
-                // run 边界解析一次字符串
+        // 单遍扫描：收集 time 值 + sym run 边界（仅 run 切换时解析字符串）
+        struct SymRun {
+            row_start: usize,
+            time_start: u64,
+            time_end: u64,
+        }
+        let mut time_values: Vec<u64> = Vec::with_capacity(rows);
+        let mut sym_runs: Vec<SymRun> = Vec::new();
+        let mut run_names: Vec<String> = Vec::new();
+
+        for i in 0..rows {
+            time_values.push(time_flat[i]);
+            let is_new = sym_runs.last().map_or(true, |r| keys_flat[i] != keys_flat[r.row_start]);
+            if is_new {
                 let name = sym
-                    .string_at(run_start_global)
+                    .string_at(i)
                     .ok_or_else(|| CoreError::Invalid("sym value at row is NULL".into()))?
                     .to_owned();
-                if let Some(prev) = &prev_name {
-                    if prev.as_str() > name.as_str() {
-                        return Err(CoreError::Invalid(
-                            "meta input must be sorted by (sym ASC, time ASC)".into(),
-                        ));
-                    }
-                }
-                let same_sym = prev_name.as_deref() == Some(name.as_str());
-                let run_first_t = time_flat[run_start_global];
-                let run_last_t = time_flat[run_start_global + run - 1];
-                let start_t_idx = axis_pos(run_first_t);
-                let end_t_idx = axis_pos(run_last_t) + 1;
-
-                // run 内 time 严格递增
-                let mut last_t = if same_sym { prev_time } else { u64::MIN };
-                for &t in &time_flat[run_start_global..run_start_global + run] {
-                    if t <= last_t {
-                        return Err(CoreError::Invalid(
-                            "meta input must be sorted by (sym ASC, time ASC)".into(),
-                        ));
-                    }
-                    last_t = t;
-                }
-
-                match syms.last_mut() {
-                    Some(state) if same_sym => state.last_pos = end_t_idx - 1,
-                    _ => syms.push(SymState {
-                        name,
-                        first_pos: start_t_idx,
-                        last_pos: end_t_idx - 1,
-                    }),
-                }
-                prev_name = Some(syms.last().unwrap().name.clone());
-                prev_time = run_last_t;
+                sym_runs.push(SymRun {
+                    row_start: i,
+                    time_start: time_flat[i],
+                    time_end: time_flat[i],
+                });
+                run_names.push(name);
+            } else {
+                sym_runs.last_mut().unwrap().time_end = time_flat[i];
             }
-            global_offset += seg_rows;
         }
 
-        let sym_count = syms.len() as u32;
+        // TIME AXIS：排序 + 去重
+        time_values.sort_unstable();
+        time_values.dedup();
+        let axis: Vec<u64> = time_values;
+
+        // 轴 index 映射（HashMap O(1) 查找）
+        let time_to_index: std::collections::HashMap<u64, u32> =
+            axis.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
+
+        // run 后置校验：time_end >= time_start（捕获未排序输入）
+        for run in &sym_runs {
+            if run.time_end < run.time_start {
+                return Err(CoreError::Invalid(
+                    "meta input must be sorted by (sym ASC, time ASC)".into(),
+                ));
+            }
+        }
+
+        // SYM INDEX
+        let mut row_start = 0u32;
+        let mut sym_index = Vec::with_capacity(sym_runs.len());
+        for run in &sym_runs {
+            let start = time_to_index[&run.time_start];
+            let end = time_to_index[&run.time_end];
+            sym_index.push(SymIndexRecord {
+                time_start: start,
+                time_count: end - start + 1,
+                row_start,
+            });
+            row_start += end - start + 1;
+        }
+        let sym_count = sym_runs.len() as u32;
         let time_count = axis.len() as u32;
-        let row_count: u64 = syms
-            .iter()
-            .map(|s| (s.last_pos - s.first_pos + 1) as u64)
-            .sum();
+        let row_count = row_start as u64;
         if row_count > u32::MAX as u64 {
             return Err(CoreError::Invalid("total row capacity exceeds u32".into()));
         }
 
+        // 序列化
         let axis_len = time_count as usize * ts;
         let sym_dict_offset = DATA_OFFSET + axis_len as u64;
         let strings_start = sym_dict_offset as usize + (sym_count as usize + 1) * 8;
         let mut string_bytes: Vec<u8> = Vec::new();
         let mut dict_offsets: Vec<u64> = vec![0u64];
-        for s in &syms {
-            string_bytes.extend_from_slice(s.name.as_bytes());
+        for name in &run_names {
+            string_bytes.extend_from_slice(name.as_bytes());
             dict_offsets.push(string_bytes.len() as u64);
         }
         let sym_index_offset = strings_start as u64 + string_bytes.len() as u64;
@@ -180,7 +161,7 @@ impl MetaBuilder {
 
         let header = MetaHeader::new(
             time_type,
-            1, // builder 产出初始 generation；重建时由调用方递增
+            1,
             time_count,
             sym_count,
             row_count as u32,
@@ -197,24 +178,11 @@ impl MetaBuilder {
             out.extend_from_slice(&off.to_le_bytes());
         }
         out.extend_from_slice(&string_bytes);
-        let mut row_start = 0u32;
-        for st in &syms {
-            let rec = SymIndexRecord {
-                time_start: st.first_pos as u32,
-                time_count: (st.last_pos - st.first_pos + 1) as u32,
-                row_start,
-            };
-            row_start += rec.time_count;
+        for rec in &sym_index {
             out.extend_from_slice(&rec.to_bytes());
         }
         Ok(out)
     }
-}
-
-struct SymState {
-    name: String,
-    first_pos: usize,
-    last_pos: usize,
 }
 
 fn infer_time_type(dt: DataType) -> Result<TimeType, CoreError> {
