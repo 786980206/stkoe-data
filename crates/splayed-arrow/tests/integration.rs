@@ -1,8 +1,8 @@
 //! splayed-arrow 集成测试：类型映射、NULL 保留、字典列、端到端 Table → Arrow。
 
 use splayed_arrow::{
-    column_to_arrow, data_to_record_batch, data_view_to_batch, from_arrow_type,
-    record_batch_to_data, scan_to_arrow, to_arrow_type,
+    column_to_array, data_to_record_batch, data_view_to_record_batch, from_arrow_type,
+    read_table_as_arrow, record_batch_to_data, to_arrow_type,
 };
 use splayed_core::Mode;
 use arrow_array::Array as _;
@@ -17,7 +17,7 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 use splayed_table::{
-    create_table, open_table, TableOptions, TableScanRequest,
+    create_table, open_table, scan_table, TableOptions, TableScanRequest,
 };
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -153,13 +153,13 @@ fn multi_segment_view_to_batch() {
         ],
     )
     .unwrap();
-    let arr = splayed_arrow::column_view_to_arrow(&view).unwrap();
+    let arr = splayed_arrow::column_view_to_array(&view).unwrap();
     let arr = arr
         .as_any()
         .downcast_ref::<arrow_array::Float64Array>()
         .unwrap();
     assert_eq!(arr.values(), &[1.0, 2.0, 3.0]);
-    let _ = data_view_to_batch; // API 存在性
+    let _ = data_view_to_record_batch; // API 存在性
 }
 
 #[test]
@@ -169,7 +169,14 @@ fn table_scan_to_arrow_end_to_end() {
     let data = sample_data();
     create_table(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
-    let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
+    // 流式 Reader：逐批转换，不物化整个结果集
+    let scanner = scan_table(&table, TableScanRequest::default()).unwrap();
+    let mut reader = read_table_as_arrow(&table, scanner, Some(2));
+    let mut batches = Vec::new();
+    while let Some(b) = reader.next().unwrap() {
+        batches.push(b);
+    }
+    reader.close().unwrap();
     assert!(!batches.is_empty());
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 4);
@@ -208,7 +215,13 @@ fn multi_segment_view_to_batch_and_table_e2e() {
     let root = dir.join("tbl");
     create_table(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
-    let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
+    let scanner = scan_table(&table, TableScanRequest::default()).unwrap();
+    let mut reader = read_table_as_arrow(&table, scanner, Some(2));
+    let mut batches = Vec::new();
+    while let Some(b) = reader.next().unwrap() {
+        batches.push(b);
+    }
+    reader.close().unwrap();
     // 单 Dataset 全表扫描 = 单一连续 range；batch_size=2 精确切分（截断头 + pending
     // 剩余 range），每批恰好 2 行、不超发
     assert_eq!(batches.len(), 2);
@@ -221,13 +234,49 @@ fn multi_segment_view_to_batch_and_table_e2e() {
 }
 
 #[test]
-fn column_to_arrow_direct() {
+fn column_to_array_direct() {
     let col = Column::zeroed(DataType::TimestampUs, 3, false);
-    let arr = column_to_arrow(&col).unwrap();
+    let arr = column_to_array(&col).unwrap();
     let arr = arr
         .as_any()
         .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
         .unwrap();
     assert_eq!(arr.len(), 3);
     assert_eq!(arr.values(), &[0i64; 3]);
+}
+
+/// 字典 key 超出 i32 值域 → checked cast 报错（不是 reinterpret——u32::MAX 无法
+/// 表示为 i32，文档 §2 明确语义）。
+#[test]
+fn dict_key_overflow_is_checked() {
+    let col = Column::from_dict(
+        vec![0x8000_0000, 0], // 2^31 > i32::MAX
+        vec![0, 1, 2],
+        b"ab".to_vec(),
+        None,
+    );
+    let err = column_to_array(&col).unwrap_err();
+    assert!(matches!(err, splayed_arrow::ArrowConvError::Unsupported(ref m) if m.contains("exceeds i32")));
+}
+
+/// 流式 Reader：全局 limit 经 Scanner 传导，总行数不超过 limit。
+#[test]
+fn arrow_reader_limit_early_termination() {
+    let dir = temp_dir("limit");
+    let root = dir.join("tbl");
+    create_table(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+    let req = TableScanRequest { limit: Some(3), ..Default::default() };
+    let scanner = scan_table(&table, req).unwrap();
+    let mut reader = read_table_as_arrow(&table, scanner, Some(2));
+    let mut total = 0usize;
+    let mut lens = Vec::new();
+    while let Some(b) = reader.next().unwrap() {
+        lens.push(b.num_rows());
+        total += b.num_rows();
+    }
+    reader.close().unwrap();
+    assert_eq!(total, 3);
+    assert!(lens.iter().all(|&l| l <= 2));
+    cleanup(&dir);
 }

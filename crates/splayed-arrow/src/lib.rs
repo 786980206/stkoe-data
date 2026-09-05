@@ -1,7 +1,11 @@
 //! splayed-arrow：V2.0 Arrow 转换层（core 内存模型 ↔ Arrow RecordBatch）。
 //!
-//! 权威设计见 `docs/splayed-arrow.md`：类型映射、NULL 位图直接映射、
-//! Utf8 字典 → Dictionary(Int32, Utf8)；零拷贝边界与已知优化项同见该文档。
+//! 权威设计见 `docs/splayed-arrow.md`。三层 API：
+//! - **Layer 1 Array 转换**：`column_to_array` / `column_view_to_array`（单列）；
+//! - **Layer 2 Batch 转换**：`data_to_record_batch` / `data_view_to_record_batch`
+//!   / `record_batch_to_data`（core ↔ Arrow 纯内存转换）；
+//! - **Layer 3 Table 流式适配**：`read_table_as_arrow` → `TableArrowReader`
+//!   （包装 `TableReader` 逐批输出 RecordBatch，不拥有查询语义）。
 
 use std::sync::Arc;
 
@@ -17,7 +21,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType as ArrowDt, Field as ArrowField, Schema as ArrowSchema,
                     TimeUnit};
 
-use splayed_table::{TableHandle, TableScanRequest};
+use splayed_table::{TableHandle, TableReader, TableScanner};
 use splayed_format::{Data, DataView};
 use splayed_format::{
     Bitmap, Buffer, Column, DataType, DictBuffers, FieldSchema, Schema,
@@ -135,8 +139,8 @@ fn null_buffer_to_bitmap(nulls: &NullBuffer) -> Bitmap {
 
 // ---------------------------------------------------------------- to arrow
 
-/// 拥有型 Column → Arrow ArrayRef（docs/splayed-arrow.md §5）。
-pub fn column_to_arrow(col: &Column) -> Result<ArrayRef> {
+/// 拥有型 Column → Arrow ArrayRef（Layer 1；docs/splayed-arrow.md §5）。
+pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
     let validity = col.validity.as_ref().map(bitmap_to_null_buffer);
     let values = col.values.as_slice();
     match col.data_type {
@@ -240,19 +244,21 @@ fn cast_to_vec<T: bytemuck::Pod>(bytes: &[u8]) -> Result<Vec<T>> {
     Ok(bytemuck::cast_slice::<u8, T>(bytes).to_vec())
 }
 
-/// 多段视图 → 单 ArrayRef（段间按行序拼接拷贝）。
-pub fn column_view_to_arrow(view: &splayed_format::ColumnView<'_>) -> Result<ArrayRef> {
+/// 多段视图 → 单 ArrayRef（Layer 1；段间按行序拼接拷贝——RecordBatch 单列单数组
+/// 约束；跨段零拷贝依赖 core buffer ownership 与 Arrow buffer layout 的兼容设计，
+/// 见 docs/splayed-arrow.md §4）。
+pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<ArrayRef> {
     // 单段走拥有列的路径（语义一致）
     if view.segments().len() == 1 {
         let seg = &view.segments()[0];
         let owned = segment_to_owned(seg, view.data_type());
-        return column_to_arrow(&owned);
+        return column_to_array(&owned);
     }
     // 多段：逐段构造后用 arrow concat 拼接
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(view.segments().len());
     for seg in view.segments() {
         let owned = segment_to_owned(seg, view.data_type());
-        arrays.push(column_to_arrow(&owned)?);
+        arrays.push(column_to_array(&owned)?);
     }
     if arrays.is_empty() {
         // 空列：单空段路径已覆盖；防御分支
@@ -262,7 +268,7 @@ pub fn column_view_to_arrow(view: &splayed_format::ColumnView<'_>) -> Result<Arr
             None,
             0,
         )?, view.data_type());
-        return column_to_arrow(&owned);
+        return column_to_array(&owned);
     }
     // concat（同类型）
     let dt = arrays[0].data_type().clone();
@@ -355,53 +361,84 @@ fn pack_bits(view: splayed_format::BitmapView<'_>) -> Vec<u8> {
     out
 }
 
-/// Data → RecordBatch（schema 字段顺序保持）。
+/// Schema → Arrow 字段列表（类型映射统一入口，两条 batch 路径共用）。
+/// V2 不建模 NOT NULL 约束：nullable 恒为 true——schema 跨批次稳定，
+/// 不随当批是否含 NULL 变化。
+fn arrow_fields(schema: &Schema) -> Vec<ArrowField> {
+    schema
+        .fields
+        .iter()
+        .map(|f| ArrowField::new(f.name.as_ref(), to_arrow_type(f.data_type), true))
+        .collect()
+}
+
+/// Data → RecordBatch（Layer 2；schema 字段顺序保持，逐列复用 `column_to_array`）。
 pub fn data_to_record_batch(data: &Data) -> Result<RecordBatch> {
-    let mut fields = Vec::with_capacity(data.schema.fields.len());
+    let fields = arrow_fields(&data.schema);
     let mut arrays = Vec::with_capacity(data.schema.fields.len());
     for field in &data.schema.fields {
         let col = data.column(&field.name).expect("schema iteration guarantees");
-        fields.push(ArrowField::new(
-            field.name.as_ref(),
-            to_arrow_type(field.data_type),
-            col.validity.is_some(),
-        ));
-        arrays.push(column_to_arrow(col)?);
+        arrays.push(column_to_array(col)?);
     }
     let arrow_schema = Arc::new(ArrowSchema::new(fields));
     Ok(RecordBatch::try_new(arrow_schema, arrays)?)
 }
 
-/// 多段 DataView → RecordBatch。
-pub fn data_view_to_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch> {
-    let mut fields = Vec::with_capacity(view.schema.fields.len());
+/// 多段 DataView → RecordBatch（Layer 2；逐列视图直转，**不物化为 Data**——
+/// 否则引入一次多余的全量拷贝）。
+pub fn data_view_to_record_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch> {
+    let fields = arrow_fields(&view.schema);
     let mut arrays = Vec::with_capacity(view.schema.fields.len());
     for field in &view.schema.fields {
         let col = view.column(&field.name).expect("schema iteration guarantees");
-        fields.push(ArrowField::new(
-            field.name.as_ref(),
-            to_arrow_type(field.data_type),
-            col.null_count() > 0,
-        ));
-        arrays.push(column_view_to_arrow(col)?);
+        arrays.push(column_view_to_array(col)?);
     }
     let arrow_schema = Arc::new(ArrowSchema::new(fields));
     Ok(RecordBatch::try_new(arrow_schema, arrays)?)
 }
 
-/// Table 端到端：`query_table` + 逐批转换（语义 = scan + read + to arrow）。
-pub fn scan_to_arrow(
-    table: &TableHandle,
-    request: TableScanRequest,
+// ---------------------------------------------------------------- Table → Arrow
+
+/// Table → Arrow 流式适配器（Layer 3）：包装 `TableReader`，逐批输出
+/// `RecordBatch`。**不拥有查询语义**——裁剪 / 谓词 / limit 由 `TableScanner`
+/// 完成，本层只做 DataView → RecordBatch 转换；流式输出不物化整个结果集。
+pub struct TableArrowReader<'t> {
+    inner: TableReader<'t>,
+}
+
+/// Table 端到端流式读取（Layer 3）：`scan_table` 产出的 `TableScanner` +
+/// `batch_size` → 构造 Arrow Reader。直接接收 Scanner（而非 ScanRequest）——
+/// 查询语义归 Table 层，Arrow 层不重新 scan。构造无 I/O（错误延迟到 `next()`）。
+///
+/// ```text
+/// TableScanRequest → scan_table → TableScanner
+///     → read_table_as_arrow → TableArrowReader
+///     → next() → RecordBatch（逐批，流式）
+/// ```
+pub fn read_table_as_arrow<'t>(
+    table: &'t TableHandle,
+    scanner: TableScanner<'t>,
     batch_size: Option<usize>,
-) -> Result<Vec<RecordBatch>> {
-    let mut reader = splayed_table::query_table(table, request, batch_size)?;
-    let mut out = Vec::new();
-    while let Some(view) = reader.next()? {
-        out.push(data_view_to_batch(&view)?);
+) -> TableArrowReader<'t> {
+    TableArrowReader {
+        inner: splayed_table::read_table(table, scanner, batch_size),
     }
-    reader.close()?;
-    Ok(out)
+}
+
+impl<'t> TableArrowReader<'t> {
+    /// 下一批 `RecordBatch`；结束返回 `None`。`batch_size = Some(n)` 时每批
+    /// 恰好 n 行（最后一批允许小）；`None` 时一 range 一批。
+    pub fn next(&mut self) -> Result<Option<RecordBatch>> {
+        match self.inner.next()? {
+            None => Ok(None),
+            Some(view) => data_view_to_record_batch(&view).map(Some),
+        }
+    }
+
+    /// 关闭：任何时刻（正常结束 / LIMIT 提前结束 / 错误 / 取消）都可安全调用。
+    pub fn close(self) -> Result<()> {
+        self.inner.close().map_err(ArrowConvError::from)
+    }
 }
 
 // ---------------------------------------------------------------- from arrow
@@ -440,10 +477,12 @@ fn utf8_dict_to_column(
         strings.extend_from_slice(values.value(i).as_bytes());
         offsets.push(strings.len() as u64);
     }
+    // V2 字典 keys 非空：行级 NULL 由 validity 位图表达；Arrow 端 null key 槽位
+    // 以 0 填充（payload 被 validity 掩蔽），不 panic
     let keys: Vec<u32> = dict
         .keys()
         .iter()
-        .map(|k| k.expect("dict keys are non-nullable in V2.0") as u32)
+        .map(|k| k.unwrap_or(0) as u32)
         .collect();
     Ok((
         Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
