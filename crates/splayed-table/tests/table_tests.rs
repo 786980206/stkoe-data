@@ -537,3 +537,66 @@ fn create_table_empty_data_creates_root() {
     assert!(std::fs::read_dir(&root).unwrap().next().is_none()); // 无任何子项
     cleanup(&dir);
 }
+
+/// create_table_partition / delete_table_partition 校验语义（主线程轻量校验 + 委托）。
+#[test]
+fn partition_entry_validation() {
+    let dir = temp_dir("part_validate");
+    let root = dir.join("tbl");
+
+    // create：Table 根不存在 → NotFound（不隐式引导建表）
+    let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
+    let sample = make_data(&[("AAPL", d803, 10.0)]);
+    assert!(matches!(
+        create_table_partition(&root, "month=2026-08", sample.clone()),
+        Err(splayed_core::CoreError::NotFound(_))
+    ));
+
+    // create：分区名不符合 scheme → Invalid
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(create_table_partition(&root, "not-a-partition", sample.clone()).is_err());
+
+    // create：缺 sym/time 列 → Invalid（在任何盘上落痕之前失败）
+    let bare = Data::new(
+        Schema::new(vec![FieldSchema::new("price", DataType::Float64)]),
+        vec![Column { data_type: DataType::Float64, values: Buffer::from_slice_copy(&[1.0]), validity: None, dict: None }],
+    )
+    .unwrap();
+    assert!(create_table_partition(&root, "month=2026-08", bare).is_err());
+
+    // create：空数据 → Invalid（禁止空 Dataset）
+    let empty = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+        ]),
+        vec![
+            Column::from_dict(Vec::new(), vec![0u64, 0], Vec::new(), None),
+            Column { data_type: DataType::Date32, values: Buffer::from_vec(Vec::new()), validity: None, dict: None },
+        ],
+    )
+    .unwrap();
+    assert!(create_table_partition(&root, "month=2026-08", empty).is_err());
+
+    // delete：非 scheme 命名子目录拒绝删除（防误删任意目录）
+    std::fs::create_dir_all(root.join("random_dir")).unwrap();
+    assert!(delete_table_partition(&root, "random_dir").is_err());
+    assert!(root.join("random_dir").exists()); // 未被误删
+
+    // delete：分区不存在 → NotFound；Table 根不存在 → NotFound
+    assert!(matches!(
+        delete_table_partition(&root, "month=2026-08"),
+        Err(splayed_core::CoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        delete_table_partition(&dir.join("nope"), "month=2026-08"),
+        Err(splayed_core::CoreError::NotFound(_))
+    ));
+
+    // 委托 happy path：create + delete 全链路
+    create_table_partition(&root, "month=2026-08", sample).unwrap();
+    assert!(root.join("month=2026-08").is_dir());
+    delete_table_partition(&root, "month=2026-08").unwrap();
+    assert!(!root.join("month=2026-08").exists());
+    cleanup(&dir);
+}

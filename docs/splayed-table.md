@@ -248,13 +248,35 @@ pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result
 
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `partition_name` | `&str` | 输入 | 必须符合当前 scheme；create 时必须不存在（已存在 → Error） |
-| `data`（create） | `Data` | 输入 | 该 Partition 的完整 Dataset 数据（要求同 `create_dataset`） |
+| `table_path` | `&Path` | 输入 | Table 根目录；create / delete 均要求已存在（不存在 → `NotFound`，不隐式引导建表） |
+| `partition_name` | `&str` | 输入 | 必须符合当前 scheme；create 时必须不存在（已存在 → Error）；delete 时非 scheme 命名一律拒绝（防误删任意子目录） |
+| `data`（create） | `Data` | 输入 | 该 Partition 的完整 Dataset 数据（**列所有权直接移交**，无 gather / 克隆）；必须含 sym / time；空数据拒绝（禁止空 Dataset） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Partition 创建 / 删除完成 |
 
+**内部实现流程**：
+```
+create  ① 主线程轻量校验：Table 根存在 → 分区名符合 scheme → 与既有分区 scheme 一致
+              → 分区目录不存在 → 含 sym/time → 非空
+        ② 直接委托 create_dataset（列所有权移交）——META 校验 + Field 并行创建
+              全部由 Dataset 层管理，Table 层不嵌套并行
+delete  ① 主线程轻量校验：Table 根存在 → 分区名符合 scheme → 分区目录存在
+        ② 委托 delete_dataset 递归删除（不打开 Dataset、不扫描数据；删除非热路径，无需并行）
+```
+
+**核心原则**：
+- **薄包装定位**：两者分别是 `create_dataset` / `delete_dataset` 的 Table 级包装，只负责
+  路径 / 分区名管理，不执行任何额外数据扫描或 partition 重算。
+- **信任调用者**：`data` 属于 `partition_name` 不做 O(N) 逐行归属校验；行序合法性由
+  MetaBuilder 构建期校验（在任何盘上落痕之前失败，零残留）。
+- **Table 层禁止自行并行**：所有并发由 Dataset 层内部策略统一控制；上层需一次操作
+  多个分区时，由更上层以统一 `max_parallelism` 并行调用。
+- **失败语义与 create_table 一致**：create 不回滚，已写入文件保留；delete 显式
+  `NotFound`（不做幂等删除，避免掩盖逻辑错误）。
+- **并发契约**：调用方保证目标 Partition 无打开的 Dataset 句柄（Windows 下打开的
+  mmap 会阻止删除；由 Table 层生命周期保证）。Table 无中央 partition index，
+  删除后 `discover_partitions` 自然不再列出。
+
 **说明**：
-- create：内部即 core `create_dataset`——`data` 列所有权直接移交（无 gather / 克隆）；
-  delete：删除对应 Partition 目录（Dataset），不影响其他 Partition。
 - 这是向 Table 引入新数据的唯一入口（`write_table` 只覆盖已有行；向已有 Partition 追加数据暂缓，见 §6）。
 
 ### 4.3 delete_table

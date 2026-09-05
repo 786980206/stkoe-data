@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use splayed_core::{CreateDatasetOptions, create_dataset, open_dataset, CoreError, DatasetHandle, Mode};
+use splayed_core::{
+    CreateDatasetOptions, CoreError, DatasetHandle, Mode, create_dataset, delete_dataset,
+    open_dataset,
+};
 use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeType};
 
 use crate::partition::{civil_from_days, partition_name, partition_range, value_to_days, PartitionScheme};
@@ -511,20 +514,26 @@ pub fn create_table(
 }
 
 /// 新增单个 Partition / Dataset（partition_name 必须符合既有 scheme 且不存在）。
+///
+/// 并发模型：主线程轻量校验（路径 / 分区名 / 非空）后**直接委托** `create_dataset`——
+/// 它是唯一执行数据 I/O 的地方（META 校验 + Field 并行创建由 Dataset 层统一管理，
+/// Table 层不嵌套并行）。信任调用者：`data` 属于 `partition_name`，不做 O(N) 逐行
+/// 分区归属校验；行序合法性由 MetaBuilder 构建期校验（在任何盘上落痕之前失败）。
 pub fn create_table_partition(
     table_path: &Path,
     partition_name: &str,
     data: Data,
 ) -> Result<(), CoreError> {
-    if table_path.join(partition_name).exists() {
-        return Err(CoreError::AlreadyExists(table_path.join(partition_name)));
+    // ① 主线程轻量校验：Table 根必须存在（不隐式引导建表）
+    if !table_path.is_dir() {
+        return Err(CoreError::NotFound(table_path.to_path_buf()));
     }
-    let existing = existing_scheme(table_path)?;
     let scheme = PartitionScheme::from_partition_name(partition_name).ok_or_else(|| {
         CoreError::Invalid(format!(
             "partition name '{partition_name}' does not match any scheme"
         ))
     })?;
+    let existing = existing_scheme(table_path)?;
     match existing {
         Some(prev) if prev != scheme => {
             return Err(CoreError::Invalid(
@@ -533,15 +542,20 @@ pub fn create_table_partition(
         }
         _ => {}
     }
+    let partition_path = table_path.join(partition_name);
+    if partition_path.exists() {
+        return Err(CoreError::AlreadyExists(partition_path));
+    }
+    // ② 输入校验：必须含 sym / time；空分区拒绝（不创建空 Dataset）
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid("partition data requires sym and time columns".into()));
+    }
     if data.length() == 0 {
         return Err(CoreError::Invalid("partition data must not be empty".into()));
     }
-    // 列所有权直接移交（整段数据无需 gather）
-    splayed_core::create_dataset(
-        &table_path.join(partition_name),
-        data,
-        splayed_core::CreateDatasetOptions::default(),
-    )
+    // ③ 委托 Dataset 层：列所有权直接移交（无 gather / 克隆）；
+    //    失败语义与 create_table 一致——不回滚，已写入文件保留
+    create_dataset(&partition_path, data, CreateDatasetOptions::default())
 }
 
 /// 删除整个 Table（根目录及全部 Partition Dataset）。
@@ -550,12 +564,26 @@ pub fn delete_table(table_path: &Path) -> Result<(), CoreError> {
 }
 
 /// 删除单个 Partition（Dataset 目录）。
+///
+/// 委托 `delete_dataset` 递归删除；不打开 Dataset、不扫描数据（删除非热路径，
+/// 无需并行）。分区不存在 → `NotFound`（显式语义，不做幂等删除，避免掩盖逻辑错误）。
+/// 并发契约：调用方保证该 Partition 无打开的 Dataset 句柄（Windows 下打开的
+/// mmap 会阻止删除；由 Table 层生命周期保证）。
 pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result<(), CoreError> {
-    let dir = table_path.join(partition_name);
-    if !dir.is_dir() {
-        return Err(CoreError::NotFound(dir));
+    if !table_path.is_dir() {
+        return Err(CoreError::NotFound(table_path.to_path_buf()));
     }
-    fs::remove_dir_all(&dir).map_err(|e| CoreError::Io(e))
+    // 分区名校验：非 scheme 命名的子目录一律拒绝删除（防误删任意目录）
+    if PartitionScheme::from_partition_name(partition_name).is_none() {
+        return Err(CoreError::Invalid(format!(
+            "partition name '{partition_name}' does not match any scheme"
+        )));
+    }
+    let partition_path = table_path.join(partition_name);
+    if !partition_path.is_dir() {
+        return Err(CoreError::NotFound(partition_path));
+    }
+    delete_dataset(&partition_path)
 }
 
 /// 重命名 Table 根目录（同一父目录内，原子；调用前 Table 必须无打开 Handle）。
