@@ -244,23 +244,27 @@ compress_field_file(path, offsets?) -> Result<()>
 decompress_field_file(path) -> Result<()>
 ```
 
-**compress 内部实现**：
+**compress 内部实现**（chunk 流式，内存 O(一个编码 chunk)）：
 ```
-open(read) → clone_view → drop(handle)
-    → 边界生成（offsets 或均匀 8192）
-    → 逐段 encode_chunk(Plain, Zstd, ...) → 拼 header + chunks
-    → write_field_atomic（tmp + rename）
-```
-
-**decompress 内部实现**：
-```
-open(read) → decode_working（全量解压）→ drop(handle)
-    → 写 uncompressed header + values + validity
-    → write_field_atomic
+open(read) → 未压缩校验；header（编码前即完全确定，无需占位回填）直写 tmp
+    → 逐 chunk：range_views 零拷贝切片 → encode_chunk → 直写 tmp
+    → tmp sync_all → drop handles → rename（失败清理 tmp，原文件保持不变）
 ```
 
-- File 级物理表示转换；不依赖已打开 Handle；逻辑数据与 header 语义不变。
+**decompress 内部实现**（chunk 流式，内存 O(一个解码 chunk)，不全量解压）：
+```
+mmap 原文件 → 直接解析 header + chunk 位置（不经 open_field_file，避免 open 全量解压）
+    → tmp set_len 预分配 DATA + VALIDITY（零填充即占位 HEADER）
+    → 逐 chunk：decode_chunk → values 顺序直写 DATA（游标 64 起）
+      → validity 位跨 chunk 拼接（无 validity 的 chunk 补全 1 位）顺序直写 VALIDITY
+        （游标 64+data_len 起；单句柄双游标，两区域各自顺序 IO）
+    → header 回填：has_validity = 是否有 chunk 携带 validity（全无则收缩 validity 区）；
+      data_type / generation / row_count / null_count 保持源值
+    → tmp sync_all → drop handles → rename（失败清理 tmp，原文件保持不变）
+```
+
+- File 级物理表示转换；逻辑数据与 header 语义不变（只改物理表示：data_type / row_count / null_count / generation 不变）。
 - `offsets`：可选的 chunk 起始行号，升序、`offsets[0] == 0`，隐含最后一块延伸到 `row_count`；省略时按固定 8192 行均匀分块（最后一块允许不足）。
 - 分块策略是调用方的职责：Dataset 层按 META 网格生成 sym 对齐边界（见 7.7），裸调用可省略 `offsets`。
 - 状态不符时返回明确错误（如 AlreadyCompressed / NotCompressed），不做静默 no-op。
-- 与 close 的自动压缩互补：一个面向离线维护，一个面向写生命周期。
+- compress 编码配置固定 PLAIN + ZSTD（cast 经 `compress_field_file_encoded` 保持源配置）；decompress 目标恒为 PLAIN + NONE。

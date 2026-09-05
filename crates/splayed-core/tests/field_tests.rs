@@ -500,6 +500,44 @@ fn compress_decompress_roundtrip() {
 }
 
 #[test]
+fn compress_decompress_streamed_with_validity() {
+    let dir = temp_dir("cd_validity");
+    let path = dir.join("price");
+    // NULL 行跨 chunk 边界（边界 7 非字节对齐）：行 5, 9, 16 为 NULL
+    let values: Vec<f64> = (0..20).map(|i| i as f64).collect();
+    let mut bm = Bitmap::ones(20);
+    for &r in &[5usize, 9, 16] {
+        bm.set(r, false);
+    }
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+
+    compress_field_file(&path, Some(vec![0, 7])).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert!(handle.is_chunked());
+    assert_eq!(handle.header().null_count, 3);
+    close_field_handle(handle).unwrap();
+
+    decompress_field_file(&path).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert!(!handle.is_chunked());
+    assert_eq!(handle.header().null_count, 3);
+    assert_eq!(handle.header().generation, 1);
+    assert_eq!(
+        view_values(&handle.read_field_handle(0, 20).unwrap()),
+        (0..20).map(|i| i as f64).collect::<Vec<_>>()
+    );
+    // NULL 行与有效行逐一校验（跨 chunk 边界两侧）
+    for r in [5usize, 9, 16] {
+        assert_eq!(handle.read_field_handle(r as u64, 1).unwrap().null_count(), 1, "row {r}");
+    }
+    for r in [0usize, 6, 7, 15, 17, 19] {
+        assert_eq!(handle.read_field_handle(r as u64, 1).unwrap().null_count(), 0, "row {r}");
+    }
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
 fn cast_converts_values_in_place() {
     let dir = temp_dir("cast");
     let path = dir.join("price");

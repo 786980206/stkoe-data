@@ -71,6 +71,8 @@ fn map_io(path: &Path, e: std::io::Error) -> CoreError {
 
 /// 把一个 ColumnView 的内容克隆为拥有字节（values, validity, rows）。
 /// 无任何位图的列返回 `validity = None`（全有效）；混有位图的段按全 1 补齐。
+/// 注意：validity 为逐段字节对齐拼接，段边界非字节对齐时不能跨段按全局位消费。
+#[allow(dead_code)]
 pub(crate) fn clone_view(view: &ColumnView<'_>) -> (Vec<u8>, Option<Vec<u8>>, usize) {
     let mut values = Vec::with_capacity(view.length() * view.data_type().size_of());
     let mut bits: Vec<u8> = Vec::new();
@@ -704,30 +706,6 @@ pub fn rename_field_file(path: &Path, new_name: &str) -> Result<(), CoreError> {
     Ok(())
 }
 
-/// 原子写出（临时文件 + fsync + rename）。
-fn write_field_atomic(
-    path: &Path,
-    header: FieldHeader,
-    values: &[u8],
-    validity: Option<&[u8]>,
-) -> Result<(), CoreError> {
-    let tmp = tmp_path(path);
-    {
-        let mut f = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(&header.to_bytes())?;
-        f.write_all(values)?;
-        if let Some(bits) = validity {
-            f.write_all(bits)?;
-        }
-    }
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
 /// cast 单批行数（限定批次内存：256K 行 × 8B ≈ 2MB values + 位级 validity）。
 const CAST_BATCH_ROWS: u64 = 1 << 18;
 
@@ -959,21 +937,21 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
 
 /// [`compress_field_file`] 的参数化版本：encoding / compression 由调用方指定
 /// （cast 用它保持源 Field 的压缩配置）。
+///
+/// chunk 流式：header（编码前即完全确定，无需占位回填）直写 tmp 后，
+/// 逐 chunk 零拷贝切片 → encode_chunk → 直写 tmp；内存 O(一个编码 chunk)，
+/// 不全量 clone、不构造完整目标文件。
 fn compress_field_file_encoded(
     path: &Path,
     offsets: Option<Vec<u64>>,
     encoding: Encoding,
     compression: Compression,
 ) -> Result<(), CoreError> {
-    let (header, values, validity) = {
-        let handle = open_field_file(path, Mode::Read)?;
-        if handle.is_chunked() {
-            return Err(CoreError::InvalidState("field is already compressed".into()));
-        }
-        let owned = clone_view(&handle.read_field_handle(0, handle.row_count())?);
-        (handle.header, owned.0, owned.1)
-    };
-    let rows = header.row_count as usize;
+    let handle = open_field_file(path, Mode::Read)?;
+    if handle.is_chunked() {
+        return Err(CoreError::InvalidState("field is already compressed".into()));
+    }
+    let rows = handle.header.row_count as usize;
     let boundaries: Vec<u64> = match offsets {
         Some(mut list) => {
             if list.first() != Some(&0) {
@@ -993,69 +971,181 @@ fn compress_field_file_encoded(
         }
         None => (0..rows).step_by(8192).map(|o| o as u64).collect(),
     };
-    let dt = header.data_type()?;
-    let size = dt.size_of();
-    let mut new_header = header;
+    let dt = handle.data_type();
+    let mut new_header = handle.header;
     new_header.compression = compression.id();
     new_header.encoding = encoding.id();
     new_header.set_has_validity(false);
     new_header.validity_offset = 0;
-    let mut out = Vec::with_capacity(HEADER_SIZE + values.len() / 2);
-    out.extend_from_slice(&new_header.to_bytes());
-    for w in boundaries.windows(2) {
-        let (lo, hi) = (w[0] as usize, w[1] as usize);
-        let bits = validity.as_ref().map(|b| {
-            BitmapView::new(BufferView::new(b), lo, hi - lo)
-                .expect("validity slice within bounds")
-                .to_packed_bytes()
-        });
-        out.extend_from_slice(&encode_chunk(
-            encoding,
-            compression,
-            dt,
-            &values[lo * size..hi * size],
-            bits.as_deref(),
-            hi - lo,
-        )?);
+    let tmp = tmp_path(path);
+    let mut out = File::options().write(true).create(true).truncate(true).open(&tmp)?;
+    let result = (|| -> Result<(), CoreError> {
+        out.write_all(&new_header.to_bytes())?;
+        let mut ranges: Vec<(u64, u64)> =
+            boundaries.windows(2).map(|w| (w[0], w[1])).collect();
+        let last = *boundaries.last().unwrap();
+        if (last as usize) < rows {
+            ranges.push((last, rows as u64));
+        }
+        for (lo, hi) in ranges {
+            let (values, validity) = handle.range_views(lo, hi - lo)?;
+            let bits = validity.map(|b| b.to_packed_bytes());
+            let encoded = encode_chunk(
+                encoding,
+                compression,
+                dt,
+                values,
+                bits.as_deref(),
+                (hi - lo) as usize,
+            )?;
+            out.write_all(&encoded)?;
+        }
+        out.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // 失败清理 tmp，原文件保持不变
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    let last = *boundaries.last().unwrap() as usize;
-    if last < rows {
-        let bits = validity.as_ref().map(|b| {
-            BitmapView::new(BufferView::new(b), last, rows - last)
-                .expect("validity slice within bounds")
-                .to_packed_bytes()
-        });
-        out.extend_from_slice(&encode_chunk(
-            encoding,
-            compression,
-            dt,
-            &values[last * size..],
-            bits.as_deref(),
-            rows - last,
-        )?);
-    }
-    write_field_atomic(path, new_header, &out[HEADER_SIZE..], None)?;
+    drop(out);
+    drop(handle);
+    fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// 解压已有 Field（compressed → uncompressed，PLAIN + NONE，临时文件 + 原子替换）。
-pub fn decompress_field_file(path: &Path) -> Result<(), CoreError> {
-    let (header, values, validity) = {
-        let handle = open_field_file(path, Mode::Read)?;
-        if !handle.is_chunked() {
-            return Err(CoreError::InvalidState("field is not compressed".into()));
+/// 把 chunk 的打包 validity 位按全局位流拼接（acc 跨 chunk 携带）产出到 `emitted`；
+/// `bits = None` 表示该 chunk 全部有效（补 1 位）。
+fn stitch_chunk_bits(
+    bits: Option<&[u8]>,
+    rows: usize,
+    bit_acc: &mut u64,
+    acc_bits: &mut u32,
+    emitted: &mut Vec<u8>,
+) {
+    for i in 0..rows {
+        let bit = match bits {
+            Some(b) => (b[i / 8] >> (i % 8)) & 1,
+            None => 1,
+        };
+        *bit_acc |= (bit as u64) << *acc_bits;
+        *acc_bits += 1;
+        if *acc_bits == 8 {
+            emitted.push(*bit_acc as u8);
+            *bit_acc = 0;
+            *acc_bits = 0;
         }
-        let owned = clone_view(&handle.read_field_handle(0, handle.row_count())?);
-        (handle.header, owned.0, owned.1)
-    };
-    let new_header = FieldHeader::new_uncompressed(
-        header.data_type()?,
-        header.generation,
-        header.row_count,
-        header.null_count,
-        validity.is_some(),
-    );
-    write_field_atomic(path, new_header, &values, validity.as_deref())
+    }
+}
+
+/// 解压已有 Field（compressed → uncompressed，PLAIN + NONE，临时文件 + 原子替换）。
+///
+/// chunk 流式：mmap 原文件直接解析 chunk 位置（不经 `open_field_file`，避免全量解压），
+/// 逐 chunk 解码——values 顺序直写 DATA、validity 位跨 chunk 拼接后顺序直写 VALIDITY
+/// （单句柄双游标，两个区域各自顺序 IO）；内存 O(一个解码 chunk)。
+pub fn decompress_field_file(path: &Path) -> Result<(), CoreError> {
+    let file = File::open(path).map_err(|e| map_io(path, e))?;
+    let map = unsafe { Mmap::map(&file)? };
+    let header = FieldHeader::from_bytes(&map[..HEADER_SIZE])?;
+    if !header.is_chunked() {
+        return Err(CoreError::InvalidState("field is not compressed".into()));
+    }
+    let dt = header.data_type()?;
+    let encoding = header.encoding()?;
+    let compression = header.compression()?;
+    let size = dt.size_of();
+    let rows = header.row_count as usize;
+    let data_len = rows * size;
+    let validity_len = validity_size(header.row_count);
+    // chunk 字节区间 (pos, len, rows)
+    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
+    {
+        let mut pos = HEADER_SIZE;
+        while pos < map.len() {
+            let h = splayed_codec::ChunkHeader::from_bytes(&map[pos..])?;
+            let len = splayed_codec::CHUNK_HEADER_SIZE + h.payload_len as usize;
+            chunks.push((pos, len, h.rows as usize));
+            pos += len;
+        }
+        if pos != map.len() {
+            return Err(CoreError::InvalidState(
+                "chunk stream does not exactly cover file".into(),
+            ));
+        }
+    }
+    let tmp = tmp_path(path);
+    let mut out = File::options().write(true).create(true).truncate(true).open(&tmp)?;
+    // 预分配 DATA + VALIDITY 区（set_len 零填充即占位 HEADER）；
+    // 全部 chunk 均无 validity 时收缩掉 VALIDITY 区
+    out.set_len(HEADER_SIZE as u64 + data_len as u64 + validity_len as u64)?;
+    let result = (|| -> Result<(), CoreError> {
+        let mut data_pos = HEADER_SIZE as u64;
+        let mut validity_pos = HEADER_SIZE as u64 + data_len as u64;
+        let (mut bit_acc, mut acc_bits) = (0u64, 0u32);
+        let mut saw_validity = false;
+        let mut data_written = 0usize;
+        for &(pos, len, crows) in &chunks {
+            let (values, validity, decoded_rows) =
+                splayed_codec::decode_chunk(encoding, compression, dt, &map[pos..pos + len])?;
+            if decoded_rows != crows {
+                return Err(CoreError::InvalidState(
+                    "chunk header rows mismatch with decoded rows".into(),
+                ));
+            }
+            // DATA 顺序写
+            out.seek(SeekFrom::Start(data_pos))?;
+            out.write_all(&values)?;
+            data_pos += values.len() as u64;
+            data_written += values.len();
+            // VALIDITY 顺序写（位级拼接，跨 chunk 字节对齐）
+            let mut emitted = Vec::new();
+            if validity.is_some() {
+                saw_validity = true;
+            }
+            stitch_chunk_bits(validity.as_deref(), decoded_rows, &mut bit_acc, &mut acc_bits, &mut emitted);
+            if !emitted.is_empty() {
+                out.seek(SeekFrom::Start(validity_pos))?;
+                out.write_all(&emitted)?;
+                validity_pos += emitted.len() as u64;
+            }
+        }
+        if data_written != data_len {
+            return Err(CoreError::InvalidState(format!(
+                "decoded data length {data_written} != expected {data_len}"
+            )));
+        }
+        if saw_validity && acc_bits > 0 {
+            // 收尾：最后一个不足 8 位的部分字节（高位零填充）
+            out.seek(SeekFrom::Start(validity_pos))?;
+            out.write_all(&[bit_acc as u8])?;
+        }
+        // 回填 header：has_validity = 是否有 chunk 携带 validity；
+        // data_type / generation / row_count / null_count 保持源值
+        let new_header = FieldHeader::new_uncompressed(
+            dt,
+            header.generation,
+            header.row_count,
+            header.null_count,
+            saw_validity,
+        );
+        out.seek(SeekFrom::Start(0))?;
+        out.write_all(&new_header.to_bytes())?;
+        if !saw_validity {
+            out.set_len(HEADER_SIZE as u64 + data_len as u64)?;
+        }
+        out.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        // 失败清理 tmp，原文件保持不变
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(out);
+    drop(map);
+    drop(file);
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// 打开已有 Field（open 不负责创建）。compressed Field 打开时一次性解压为工作表示。
