@@ -18,4 +18,5 @@ pub use table::{
     open_table, rename_table, Capabilities, PartitionInfo, Partitioning, TableHandle, TableMetadata,
     TableOptions, TableStatistics,
 };
+
 pub use write::write_table;

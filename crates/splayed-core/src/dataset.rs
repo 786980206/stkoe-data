@@ -169,7 +169,8 @@ impl DatasetHandle {
         })
     }
 
-    /// 按逻辑行范围读取多列。默认返回 sym 与 time；其余 Field 由 `columns` 指定。
+    /// 按逻辑行范围读取多列。**默认只返回 sym 与 time**；其余 Field 由 `columns`
+    /// 指定（不需要重复指定 sym / time）。
     ///
     /// sym/time 来自 META（time 列按 sym 区间零拷贝切片，sym keys 物化进 scratch）；
     /// 各 Field 按需打开，零拷贝优先。
@@ -207,7 +208,7 @@ impl DatasetHandle {
             if is_reserved(&field.name) {
                 continue;
             }
-            if requested.is_empty() || requested.contains(&field.name.to_string()) {
+            if requested.contains(&field.name.to_string()) {
                 needed.push(field.name.to_string());
             }
         }
@@ -382,6 +383,25 @@ impl DatasetHandle {
         self.fields.borrow_mut().remove(name);
         rename_field_file(&self.field_path(name), new_name)?;
         self.reload_schema();
+        Ok(())
+    }
+
+    /// 修改指定 Field 的 header（不改 data；data_type / row_count 由 core 强制为现值）。
+    /// 为 Table 层 `update_table_field` 的下沉通道。
+    pub fn update_dataset_field_header(
+        &self,
+        name: &str,
+        header: splayed_format::FieldHeader,
+    ) -> Result<(), CoreError> {
+        if self.schema.position(name).is_none() {
+            return Err(CoreError::NotFound(self.field_path(name)));
+        }
+        DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
+        let mut handle = self.fields.borrow_mut();
+        handle
+            .get_mut(name)
+            .expect("just ensured")
+            .update_field_handle(header)?;
         Ok(())
     }
 

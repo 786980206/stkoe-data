@@ -60,6 +60,30 @@ impl TableHandle {
         Ok(unsafe { &*ptr })
     }
 
+    /// 结构操作用的可变访问（不与视图并存；调用方契约）。
+    pub(crate) fn dataset_for_mut(
+        &mut self,
+        partition: &str,
+    ) -> Result<&mut DatasetHandle, CoreError> {
+        if !self.datasets.borrow().contains_key(partition) {
+            let dir = if self.scheme == PartitionScheme::None {
+                self.root.clone()
+            } else {
+                self.root.join(partition)
+            };
+            let ds = open_dataset(&dir, self.mode)?;
+            self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
+        }
+        let mut borrow = self.datasets.borrow_mut();
+        let ptr: *mut DatasetHandle = match borrow.get_mut(partition) {
+            Some(b) => &mut **b as *mut DatasetHandle,
+            None => unreachable!("just inserted"),
+        };
+        drop(borrow);
+        // 安全性：Box 地址稳定；此刻无其他借用（结构操作不与视图并存）
+        Ok(unsafe { &mut *ptr })
+    }
+
     /// 时间单位（从第一个可用 Dataset 的 META 推断，缓存）。
     pub(crate) fn peek_time_type(&self) -> Result<TimeType, CoreError> {
         if let Some(tt) = self.time_type.borrow().as_ref() {
@@ -510,5 +534,143 @@ impl TableHandle {
             },
             partitions: infos?,
         })
+    }
+
+    // -------------------------------------------------- Field 结构操作
+
+    /// 所有 Partition 新增全 NULL 字段（core `create_field_file(init = length(L_p))`）。
+    /// 前置：所有 Partition 均不含 `field`；不保证跨 Partition 原子。
+    pub fn create_table_field(
+        &mut self,
+        field: &str,
+        data_type: DataType,
+    ) -> Result<(), CoreError> {
+        if field == "sym" || field == "time" {
+            return Err(CoreError::Invalid(format!("'{field}' is managed by META")));
+        }
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_some() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' already exists in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?
+                .create_dataset_field(field, data_type, splayed_core::DatasetFieldInit::AllNull)?;
+        }
+        Ok(())
+    }
+
+    /// 删除所有 Partition 中的同名字段。前置：所有 Partition 均含该字段。
+    pub fn delete_table_field(&mut self, field: &str) -> Result<(), CoreError> {
+        if field == "sym" || field == "time" {
+            return Err(CoreError::Invalid(format!("'{field}' is managed by META")));
+        }
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.delete_dataset_field(field)?;
+        }
+        Ok(())
+    }
+
+    /// 更新所有 Partition 中该字段的 header 物理属性
+    /// （data_type / row_count 由 core 强制为现值；类型转换走 `cast_table_field`）。
+    pub fn update_table_field(
+        &mut self,
+        field: &str,
+        header: splayed_format::FieldHeader,
+    ) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.update_dataset_field_header(field, header)?;
+        }
+        Ok(())
+    }
+
+    /// 重命名所有 Partition 中的同名字段。前置：均含 `field` 且均无 `new_name`。
+    pub fn rename_table_field(&mut self, field: &str, new_name: &str) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            let schema = self.dataset_for(p)?.read_dataset_schema();
+            if schema.position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+            if schema.position(new_name).is_some() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{new_name}' already exists in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.rename_dataset_field(field, new_name)?;
+        }
+        Ok(())
+    }
+
+    /// 转换所有 Partition 中该字段的类型；中途失败直接重试补齐
+    /// （已为目标类型的 Partition 再转换是无害 no-op）。
+    pub fn cast_table_field(&mut self, field: &str, target_type: DataType) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.cast_dataset_field(field, target_type)?;
+        }
+        Ok(())
+    }
+
+    /// 压缩所有 Partition 中的同名字段（前置：均为 uncompressed）。
+    pub fn compress_table_field(&mut self, field: &str) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.compress_dataset_field(field)?;
+        }
+        Ok(())
+    }
+
+    /// 解压所有 Partition 中的同名字段（前置：均为 compressed）。
+    pub fn decompress_table_field(&mut self, field: &str) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        for p in &partitions {
+            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' missing in partition '{p}'"
+                )));
+            }
+        }
+        for p in &partitions {
+            self.dataset_for_mut(p)?.decompress_dataset_field(field)?;
+        }
+        Ok(())
     }
 }

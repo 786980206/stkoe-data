@@ -85,9 +85,15 @@ fn dataset_create_read_write_roundtrip() {
     assert_eq!(schema.len(), 3);
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
 
-    // 全量读取：sym / time / price
+    // 默认列语义：columns = None → 只返回 sym 与 time（设计文档 §7.10）
     let view = ds.read_dataset(0, 8, None).unwrap();
+    assert_eq!(view.schema.len(), 2);
+    assert!(view.column("price").is_none());
+
+    // 全量读取：sym / time / price
+    let view = ds.read_dataset(0, 8, Some(&["price"])).unwrap();
     assert_eq!(view.length(), 8);
+    assert_eq!(view.schema.len(), 3);
     let sym_col = view.column("sym").unwrap();
     assert_eq!(sym_col.string_at(0), Some("AAPL"));
     assert_eq!(sym_col.string_at(3), Some("GOOG"));
@@ -107,7 +113,7 @@ fn dataset_create_read_write_roundtrip() {
         .collect();
     assert_eq!(prices, vec![10.0, 11.0, 12.0, 30.0, 31.0, 32.0, 20.0, 21.0]);
 
-    // projection：只取 price
+    // projection：只取 price（sym/time 恒在）
     let view = ds.read_dataset(0, 8, Some(&["price"])).unwrap();
     assert_eq!(view.schema.len(), 3); // sym + time + price
     assert!(view.column("price").is_some());

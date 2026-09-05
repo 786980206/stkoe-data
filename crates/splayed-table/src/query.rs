@@ -53,7 +53,8 @@ impl TableScanner {
 pub struct TableReader<'t> {
     table: &'t TableHandle,
     scanner: TableScanner,
-    projection: Vec<String>,
+    /// `Some(v)` 且 v 非空 = 已展开；`Some(vec![])` / `None` = 待首次 next() 展开。
+    projection: Option<Vec<String>>,
     batch_size: usize,
     exhausted: bool,
 }
@@ -64,6 +65,18 @@ impl<'t> TableReader<'t> {
         if self.exhausted {
             return Ok(None);
         }
+        // 空投影 = 全字段（SELECT *）：首次 next() 时展开为最后 Partition Schema 的字段
+        if self.projection.as_ref().is_none_or(|p| p.is_empty()) {
+            let schema = self.table.read_table_schema()?;
+            let full: Vec<String> = schema
+                .fields
+                .iter()
+                .filter(|f| f.name.as_ref() != "sym" && f.name.as_ref() != "time")
+                .map(|f| f.name.to_string())
+                .collect();
+            self.projection = Some(full);
+        }
+        let projection = self.projection.as_ref().unwrap();
         let target = self.batch_size.max(1);
         let mut total = 0usize;
         let mut pulled: Vec<PartitionRowRange> = Vec::new();
@@ -87,8 +100,7 @@ impl<'t> TableReader<'t> {
         let mut column_segments: Vec<Vec<splayed_format::ColumnSegment<'_>>> = Vec::new();
         for prr in &pulled {
             let ds = self.table.dataset_for(&prr.partition)?;
-            let cols: Vec<&str> =
-                self.projection.iter().map(|s| s.as_str()).collect();
+            let cols: Vec<&str> = projection.iter().map(|s| s.as_str()).collect();
             let view = ds.read_dataset(
                 prr.row_range.offset,
                 prr.row_range.length,
@@ -209,7 +221,7 @@ pub fn read_table<'t>(
     scanner: TableScanner,
     batch_size: Option<usize>,
 ) -> TableReader<'t> {
-    let projection = scanner.projection.clone();
+    let projection = Some(scanner.projection.clone());
     TableReader {
         table,
         scanner,

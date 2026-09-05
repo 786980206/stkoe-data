@@ -501,6 +501,13 @@ impl FieldHandle {
         header.row_count = self.header.row_count;
         header.generation = self.header.generation + 1;
         header.validate()?;
+        // 结构派生字段按现值重算，防止调用方传入不一致的布局描述
+        if !header.is_chunked() {
+            header.data_length =
+                header.row_count as u64 * header.data_type()?.size_of() as u64;
+            header.validity_offset =
+                u64::from(header.has_validity()) * (64 + header.data_length);
+        }
         self.header = header;
         self.modified = true;
         if let Backing::MmapMut(m) = &mut self.backing {

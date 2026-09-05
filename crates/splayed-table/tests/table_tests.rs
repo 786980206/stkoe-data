@@ -326,3 +326,63 @@ fn validity_survives_partition_split() {
     drop(table);
     cleanup(&dir);
 }
+
+#[test]
+fn table_field_structure_operations() {
+    let dir = temp_dir("fieldops");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample(), PartitionScheme::Month).unwrap();
+    let mut table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+
+    // create：全 NULL
+    table.create_table_field("volume", DataType::Int64).unwrap();
+    let schema = table.read_table_schema().unwrap();
+    assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
+    // 重复创建 → Error
+    assert!(table.create_table_field("volume", DataType::Int64).is_err());
+
+    // update：header（volume 保持 Int64，行数由 core 强制）
+    // update 需要合法 FieldHeader：用 core 的 new_uncompressed 构造
+    let header = splayed_format::FieldHeader::new_uncompressed(DataType::Int64, 0, 0, 0, false);
+    table.update_table_field("volume", header).unwrap();
+
+    // rename
+    table.rename_table_field("volume", "vol").unwrap();
+    let schema = table.read_table_schema().unwrap();
+    assert!(schema.data_type_of("volume").is_none());
+    assert_eq!(schema.data_type_of("vol"), Some(DataType::Int64));
+
+    // cast：price f64 → i64 → f64
+    table.cast_table_field("price", DataType::Int64).unwrap();
+    let schema = table.read_table_schema().unwrap();
+    assert_eq!(schema.data_type_of("price"), Some(DataType::Int64));
+    table.cast_table_field("price", DataType::Float64).unwrap();
+
+    // compress / decompress
+    table.compress_table_field("price").unwrap();
+    {
+        let req = TableScanRequest::default();
+        let mut reader = splayed_table::query_table(&table, req, None).unwrap();
+        let mut prices = Vec::new();
+        while let Some(view) = reader.next().unwrap() {
+            prices.extend(f64s(view.column("price").unwrap()));
+        }
+        reader.close().unwrap();
+        assert_eq!(
+            prices,
+            vec![10.0, 11.0, 20.0, 21.0, 12.0, 13.0, 22.0, 23.0]
+        );
+    }
+    table.decompress_table_field("price").unwrap();
+
+    // delete
+    table.delete_table_field("vol").unwrap();
+    assert!(table.read_table_schema().unwrap().data_type_of("vol").is_none());
+
+    // 前置校验：缺字段 → Error
+    assert!(table.rename_table_field("vol", "vol2").is_err());
+    assert!(table.delete_table_field("vol").is_err());
+
+    table.close().unwrap();
+    cleanup(&dir);
+}
