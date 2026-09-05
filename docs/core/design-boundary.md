@@ -71,6 +71,9 @@
 
 ## 10. Benchmark vs Parquet
 
+> 基准方法论（数据生成规范 / 参数对齐 / 场景定义 W1+R1–R6 / 指标与校验）已独立成文：
+> **docs/benchmark.md**。正式复测按该文档执行（执行器 `crates/splayed-bench`）。
+
 基准：`crates/splayed-table/benches/vs_parquet.rs`（criterion；对照 arrow-rs parquet 56）。
 
 ### 10.1 首轮基线（2026-09，64 sym × 250 行 = 16K 行，按月分区）
