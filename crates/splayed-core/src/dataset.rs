@@ -4,7 +4,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use splayed_format::{Column, Data, DataView, DataType, FieldSchema, Schema, TimeType};
+use splayed_format::{
+    Column, ColumnValues, ColumnView, Data, DataView, DataType, FieldSchema, Schema, TimeType,
+};
 
 use crate::error::{map_io_path, CoreError, Mode};
 use crate::field_file::{
@@ -13,7 +15,13 @@ use crate::field_file::{
     FieldInit, StreamValues,
 };
 use crate::meta_file::{create_meta_file, MetaBuilder, MetaHandle};
-use crate::scan::{clamp_ranges, Predicate, RowRange, ScanRequest};
+use crate::scan::{clamp_ranges, merge_ranges, Predicate, RowRange, ScanRequest};
+
+/// `write_dataset` Field 级并行的总字节门槛：低于此值走串行快路径
+/// （线程创建 ~几十 µs，高于小体量 memcpy 的并行收益）。
+const WRITE_PARALLEL_MIN_BYTES: usize = 1 << 20;
+/// `scan_dataset` Field 级并行的候选总行数门槛：低于此值走串行快路径。
+const SCAN_PARALLEL_MIN_ROWS: u64 = 1 << 16;
 
 /// Dataset 逻辑目录布局：
 /// ```text
@@ -97,6 +105,10 @@ pub struct DatasetHandle {
     mode: Mode,
     /// Field Handle 缓存（Box 稳定地址；只增不删，构造后仅共享访问）。
     fields: RefCell<HashMap<String, Box<FieldHandle>>>,
+    /// Field 级并行上限（write_dataset / scan_dataset 的并行度旋钮，由最上层控制；
+    /// 1 = 串行。Dataset 层不自建线程池，只用 `std::thread::scope` 按
+    /// min(max_parallelism, 任务数) 分桶）。
+    max_parallelism: usize,
 }
 
 impl DatasetHandle {
@@ -106,6 +118,11 @@ impl DatasetHandle {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// 设置 Field 级并行上限（影响 write_dataset / scan_dataset；1 = 串行）。
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        self.max_parallelism = max_parallelism.max(1);
     }
 
     fn field_path(&self, name: &str) -> PathBuf {
@@ -182,10 +199,12 @@ impl DatasetHandle {
     }
 
     /// 按逻辑行范围读取多列。**默认只返回 sym 与 time**；其余 Field 由 `columns`
-    /// 指定（不需要重复指定 sym / time）。
+    /// 指定（不需要重复指定 sym / time），输出按 projection **请求序**组装。
     ///
-    /// sym/time 来自 META（time 列按 sym 区间零拷贝切片，sym keys 物化进 scratch）；
-    /// 各 Field 按需打开，零拷贝优先。
+    /// 并发模型（单线程）：META 零拷贝 → 串行 ensure_field → 逐 Field 零拷贝切片
+    /// → 请求序组装。读路径全程 O(1) 指针运算、不触碰数据页（uncompressed =
+    /// mmap 切片；compressed = working 切片），Field 级并行的调度开销远高于
+    /// 切片收益——并行的插入点在 chunk 惰性解码落地之后（读变成解码密集）。
     pub fn read_dataset(
         &self,
         offset: u64,
@@ -193,65 +212,64 @@ impl DatasetHandle {
         columns: Option<&[&str]>,
     ) -> Result<DataView<'_>, CoreError> {
         let l = self.logical_length();
-        if offset + length > l {
+        if offset.checked_add(length).map_or(true, |end| end > l) {
             return Err(CoreError::Invalid(format!(
                 "read range [{offset}, {}) exceeds dataset length {l}",
-                offset + length
+                offset.saturating_add(length)
             )));
         }
-        // 校验请求的字段都存在
-        let requested: Vec<String> = columns
-            .map(|cols| {
-                cols.iter()
-                    .map(|c| c.to_string())
-                    .filter(|c| !is_reserved(c))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // ① 主线程：解析 projection（请求序去重，跳过 sym/time 保留名）+ 串行 ensure_field
+        let mut requested: Vec<String> = Vec::new();
+        if let Some(cols) = columns {
+            for c in cols {
+                if is_reserved(c) {
+                    continue;
+                }
+                if self.schema.position(c).is_none() {
+                    return Err(CoreError::Invalid(format!("unknown field '{c}'")));
+                }
+                if !requested.iter().any(|r| r == c) {
+                    requested.push(c.to_string());
+                }
+            }
+        }
         for name in &requested {
-            if self.schema.position(name).is_none() {
-                return Err(CoreError::Invalid(format!("unknown field '{name}'")));
-            }
-        }
-        // sym + time 来自 META；其余 Field 按需打开。
-        // 两阶段借用：先确保全部所需 Handle 已打开（独占），再以共享借用创建视图。
-        let mut needed: Vec<String> = Vec::new();
-        for field in &self.schema.fields {
-            if is_reserved(&field.name) {
-                continue;
-            }
-            if requested.contains(&field.name.to_string()) {
-                needed.push(field.name.to_string());
-            }
-        }
-        for name in &needed {
             DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
         }
-        // sym + time 来自 META（mut 借用 meta scratch）
+        // ② META 零拷贝：sym RepeatDict 段（零物化）+ time 轴切片
         let base = self.meta.read_index_handle(offset, length)?;
-        let mut schema = base.schema.clone();
-        let mut columns_out: Vec<splayed_format::ColumnView<'_>> = base.columns;
-        for name in &needed {
+        let mut columns_out: Vec<splayed_format::ColumnView<'_>> =
+            Vec::with_capacity(2 + requested.len());
+        columns_out.extend(base.columns);
+        // ③ 逐 Field 零拷贝读取（串行切片），按请求序追加
+        let mut schema_fields: Vec<FieldSchema> = base.schema.fields.to_vec();
+        for name in &requested {
             let handle = DatasetHandle::field_handle(&self.fields, name)?;
-            let view = handle.read_field_handle(offset, length)?;
-            let dt = handle.data_type();
-            schema.fields.push(FieldSchema::new(name.as_str(), dt));
-            columns_out.push(view);
+            columns_out.push(handle.read_field_handle(offset, length)?);
+            schema_fields.push(FieldSchema::new(name.as_str(), handle.data_type()));
         }
-        base_view_done(schema, columns_out)
+        DataView::new(Schema::new(schema_fields), columns_out).map_err(CoreError::from)
     }
 
     /// 对已有逻辑行做 positional overwrite（projection write；不保证跨 Field 原子性）。
+    ///
+    /// 并发模型（三阶段）：① 主线程校验 + 串行 ensure_field（并行区域不触碰字段
+    /// 缓存）；② 收集互不相交的 `&mut FieldHandle`；③ Field 级并行写
+    /// （`std::thread::scope` round-robin 分桶，各 Field 完全独立）。单字段或
+    /// 总字节 < `WRITE_PARALLEL_MIN_BYTES` 走串行快路径。
     pub fn write_dataset(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
+        // ① 主线程：mode / 边界 / 列名校验 / 类型校验 + 串行 ensure_field
         self.mode.require_write("write_dataset")?;
         let l = self.logical_length();
-        if offset + data.length() as u64 > l {
+        if offset
+            .checked_add(data.length() as u64)
+            .map_or(true, |end| end > l)
+        {
             return Err(CoreError::Invalid("write range exceeds dataset length".into()));
         }
         if data.length() == 0 {
             return Ok(()); // length == 0 是合法 no-op
         }
-        // 校验：列都属于 Dataset Field（sym/time 不作为写入列），类型一致，列等长
         for field in &data.schema.fields {
             if is_reserved(&field.name) {
                 return Err(CoreError::Invalid(
@@ -270,26 +288,93 @@ impl DatasetHandle {
             }
         }
         for field in &data.schema.fields {
-            let col = data.column(&field.name).expect("schema iteration guarantees");
             DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, &field.name)?;
-            let mut handle = self.fields.borrow_mut();
-            handle
-                .get_mut(field.name.as_ref())
-                .expect("just ensured")
-                .write_field_handle(offset, col)?;
         }
-        Ok(())
+        // ② 收集不相交 &mut FieldHandle：values_mut 一次性独占借用整个缓存，
+        //    各值天然互不相交（无需 unsafe / 多次 get_mut）；字段名（= 文件名）
+        //    配对到 data.columns 下标。RefMut 只在主线程存活，并行任务不触碰缓存。
+        {
+            let mut seen = std::collections::HashSet::new();
+            for field in &data.schema.fields {
+                if !seen.insert(field.name.as_ref()) {
+                    return Err(CoreError::Invalid(format!(
+                        "duplicate field '{}' in write_dataset",
+                        field.name
+                    )));
+                }
+            }
+        }
+        let mut guard = self.fields.borrow_mut();
+        let mut targets: Vec<(usize, &mut FieldHandle)> = Vec::with_capacity(data.columns.len());
+        for handle in guard.values_mut() {
+            let name = handle
+                .path()
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if let Some(i) = data.schema.position(&name) {
+                targets.push((i, handle));
+            }
+        }
+        // ③ 写入：单字段 / 小写 / 并行度 1 → 串行快路径；否则 Field 级并行
+        let total: usize = data.columns.iter().map(view_bytes).sum();
+        let p = self.max_parallelism;
+        if targets.len() <= 1 || total < WRITE_PARALLEL_MIN_BYTES || p <= 1 {
+            for (i, handle) in targets {
+                handle.write_field_handle(offset, &data.columns[i])?;
+            }
+            return Ok(());
+        }
+        let p = p.min(targets.len());
+        // round-robin 分桶（字段大小不均时负载更均匀）；桶内顺序、桶间并行。
+        // 不用 vec![Vec::new(); p]（&mut 不满足 Clone），逐个构造
+        let mut buckets: Vec<Vec<(usize, &mut FieldHandle)>> =
+            (0..p).map(|_| Vec::new()).collect();
+        for (j, target) in targets.into_iter().enumerate() {
+            buckets[j % p].push(target);
+        }
+        std::thread::scope(|s| {
+            let mut joins = Vec::new();
+            for bucket in buckets {
+                joins.push(s.spawn(move || -> Result<(), CoreError> {
+                    for (i, handle) in bucket {
+                        handle.write_field_handle(offset, &data.columns[i])?;
+                    }
+                    Ok(())
+                }));
+            }
+            let mut first_err: Option<CoreError> = None;
+            for j in joins {
+                match j.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        first_err.get_or_insert(CoreError::InvalidState(
+                            "field writer thread panicked".into(),
+                        ));
+                    }
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        })
     }
 
     /// 条件扫描：组合 META 与各 Field 的扫描结果，输出 Dataset 逻辑 RowRange。
     ///
-    /// 多 predicate 的执行顺序：META（sym/time）先行，Field 谓词按名称序逐步收窄；
+    /// 并发模型（三阶段）：① 主线程 clamp + META（sym/time）先行（单线程，体积小
+    /// 且能大幅缩小候选）+ 串行 ensure_field；② 各 Field 以**相同候选范围**独立
+    /// 扫描（`std::thread::scope` round-robin 分桶；并行区域不触碰字段缓存）；
+    /// ③ 主线程顺序求交（空集提前退出）+ 相邻合并。多字段并行扫描与逐字段串行
+    /// 收窄结果一致（谓词逐行求值，∩ 满足交换/结合），并行只改变求值次序。
     /// 跨字段的 OR / NOT 组合不支持（返回 Invalid），行级过滤兜底由上层完成。
     pub fn scan_dataset(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+        // ① 主线程：裁剪 + META sym/time 先行
         let l = self.logical_length();
         let mut current = clamp_ranges(&request.ranges, l);
+        let mut groups: Vec<(String, Predicate)> = Vec::new();
         if let Some(pred) = &request.predicate {
-            // 1) META：sym / time 条件（抽取为可下推的 And；无法下推的部分由行级过滤兜底）
             let sym_time = collect_for_fields(pred, &["sym", "time"]);
             if !matches!(&sym_time, Predicate::And(children) if children.is_empty()) {
                 let index_req = ScanRequest {
@@ -306,30 +391,101 @@ impl DatasetHandle {
                 scanner.close()?;
                 current = intersect_range_lists(&current, &narrowed);
             }
-            // 2) Field 谓词：按字段分组，逐字段收窄
-            let mut groups = predicate_groups(pred)?;
+            groups = predicate_groups(pred)?;
             groups.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, sub) in groups {
-                let field_req = ScanRequest {
-                    ranges: current.clone(),
-                    projection: vec![],
-                    predicate: Some(sub),
-                    limit: None,
-                };
-                let mut narrowed = Vec::new();
-                {
-                    DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, &name)?;
-                    let handle = DatasetHandle::field_handle(&self.fields, &name)?;
-                    let mut scanner = handle.scan_field_handle(&field_req)?;
-                    while let Some(r) = scanner.next()? {
-                        narrowed.push(r);
-                    }
-                    scanner.close()?;
-                }
-                current = intersect_range_lists(&current, &narrowed);
-            }
         }
-        Ok(DatasetScanner { ranges: VecDeque::from(current), remaining: request.limit })
+        // ② 串行 ensure_field 全部目标字段，收集共享 handle（并行阶段不触碰缓存）
+        let handles: Vec<&FieldHandle> = groups
+            .iter()
+            .map(|(name, _)| {
+                DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
+                DatasetHandle::field_handle(&self.fields, name)
+            })
+            .collect::<Result<_, CoreError>>()?;
+        // ③ 各 Field 独立扫描（相同输入 ranges）；多字段且候选足够大才并行。
+        //    limit 不下推子扫描：单字段截断后求交会漏行，最终由 Scanner.remaining 严格控制
+        let results: Vec<Vec<RowRange>> =
+            if groups.is_empty() || current.is_empty() {
+                Vec::new()
+            } else {
+                let total_rows: u64 = current.iter().map(|r| r.length).sum();
+                let p = self.max_parallelism;
+                if groups.len() > 1 && total_rows >= SCAN_PARALLEL_MIN_ROWS && p > 1 {
+                    let p = p.min(groups.len());
+                    // 共享引用先行绑定：move 闭包只捕获 &Vec，不移动本体
+                    let (groups_ref, handles_ref, current_ref) = (&groups, &handles, &current);
+                    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); p];
+                    for (gi, _) in groups.iter().enumerate() {
+                        buckets[gi % p].push(gi);
+                    }
+                    std::thread::scope(|s| -> Result<Vec<Vec<RowRange>>, CoreError> {
+                        let mut joins = Vec::new();
+                        for bucket in buckets {
+                            joins.push(s.spawn(
+                                move || -> Result<Vec<(usize, Vec<RowRange>)>, CoreError> {
+                                    let mut out = Vec::new();
+                                    for gi in bucket {
+                                        let sub = groups_ref[gi].1.clone();
+                                        let req = ScanRequest {
+                                            ranges: current_ref.clone(),
+                                            projection: vec![],
+                                            predicate: Some(sub),
+                                            limit: None,
+                                        };
+                                        let mut sc = handles_ref[gi].scan_field_handle(&req)?;
+                                        let mut hit = Vec::new();
+                                        while let Some(r) = sc.next()? {
+                                            hit.push(r);
+                                        }
+                                        sc.close()?;
+                                        out.push((gi, hit));
+                                    }
+                                    Ok(out)
+                                },
+                            ));
+                        }
+                        let mut results: Vec<Vec<RowRange>> = vec![Vec::new(); groups.len()];
+                        for j in joins {
+                            let done = j.join().map_err(|_| {
+                                CoreError::InvalidState("field scanner thread panicked".into())
+                            })??;
+                            for (gi, hit) in done {
+                                results[gi] = hit;
+                            }
+                        }
+                        Ok(results)
+                    })?
+                } else {
+                    // 单字段 / 小候选串行快路径
+                    let mut results = Vec::with_capacity(groups.len());
+                    for (gi, (_, sub)) in groups.iter().enumerate() {
+                        let req = ScanRequest {
+                            ranges: current.clone(),
+                            projection: vec![],
+                            predicate: Some(sub.clone()),
+                            limit: None,
+                        };
+                        let mut sc = handles[gi].scan_field_handle(&req)?;
+                        let mut hit = Vec::new();
+                        while let Some(r) = sc.next()? {
+                            hit.push(r);
+                        }
+                        sc.close()?;
+                        results.push(hit);
+                    }
+                    results
+                }
+            };
+        // ④ 主线程收尾：顺序求交（空集提前退出）+ 相邻合并
+        let mut final_ranges = current;
+        for r in &results {
+            if final_ranges.is_empty() {
+                break;
+            }
+            final_ranges = intersect_range_lists(&final_ranges, r);
+        }
+        final_ranges = merge_ranges(final_ranges);
+        Ok(DatasetScanner { ranges: VecDeque::from(final_ranges), remaining: request.limit })
     }
 
     /// 在已有 Dataset 中新增一个 Field。
@@ -504,12 +660,17 @@ impl DatasetHandle {
     }
 }
 
-/// DataView::new 的错误类型映射（FormatError → CoreError）。
-fn base_view_done<'a>(
-    schema: Schema,
-    columns: Vec<splayed_format::ColumnView<'a>>,
-) -> Result<DataView<'a>, CoreError> {
-    DataView::new(schema, columns).map_err(CoreError::from)
+/// 列的字节量近似（写并行门槛用）：Fixed 取 values 长度，Dict 取 keys
+/// （4B/行），RepeatDict 零存储取 0；validity 为 1/8 量级，忽略。
+fn view_bytes(view: &ColumnView<'_>) -> usize {
+    view.segments()
+        .iter()
+        .map(|s| match s.values() {
+            ColumnValues::Fixed(v) => v.len(),
+            ColumnValues::Dict { keys, .. } => keys.len(),
+            ColumnValues::RepeatDict { .. } => 0,
+        })
+        .sum()
 }
 
 /// Dataset 级统计信息（来自 META）。
@@ -813,6 +974,7 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
         schema,
         mode,
         fields: RefCell::new(HashMap::new()),
+        max_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
     })
 }
 

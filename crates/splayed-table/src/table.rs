@@ -49,6 +49,10 @@ impl TableHandle {
                 self.root.join(partition)
             };
             let ds = open_dataset(&dir, self.mode)?;
+            let mut ds = ds;
+            if let Some(mp) = self.options.max_parallelism {
+                ds.set_max_parallelism(mp);
+            }
             self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
         }
         let borrow = self.datasets.borrow();
@@ -72,6 +76,10 @@ impl TableHandle {
                 self.root.join(partition)
             };
             let ds = open_dataset(&dir, self.mode)?;
+            let mut ds = ds;
+            if let Some(mp) = self.options.max_parallelism {
+                ds.set_max_parallelism(mp);
+            }
             self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
         }
         let mut borrow = self.datasets.borrow_mut();

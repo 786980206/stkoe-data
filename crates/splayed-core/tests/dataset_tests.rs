@@ -6,7 +6,7 @@ use splayed_core::{
     create_dataset, create_dataset_index, delete_dataset, open_dataset, CoreError, CmpOp,
     DatasetFieldInit, FieldChunkReader, Mode, Predicate, Scalar, ScanRequest, StreamValues,
 };
-use splayed_format::{Buffer, Column, Data, DataType, FieldSchema, Schema};
+use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
@@ -423,4 +423,227 @@ fn create_dataset_parallel_options() {
         ds.close_dataset().unwrap();
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ------------------------------------------------- 并行路径（write / scan / read 组装）
+
+/// 大体量数据（1 sym × n 行；price 伪随机 f64、volume 每 97 行一个 NULL 的 i64），
+/// 字节量足以越过 write_dataset / scan_dataset 的并行门槛。
+fn large_two_field_data(n: usize) -> Data {
+    let sym_col = Column::from_dict(vec![0u32; n], vec![0, 1], b"A".to_vec(), None);
+    let time_col = Column {
+        data_type: DataType::TimestampUs,
+        values: Buffer::from_slice_copy(
+            &(0..n).map(|i| 1_000_000 + i as i64).collect::<Vec<i64>>(),
+        ),
+        validity: None,
+        dict: None,
+    };
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(
+            &(0..n)
+                .map(|i| ((i.wrapping_mul(2654435761)) % 1000) as f64)
+                .collect::<Vec<f64>>(),
+        ),
+        validity: None,
+        dict: None,
+    };
+    let vol_bits = {
+        let mut bytes = vec![0u8; n.div_ceil(8)];
+        for i in 0..n {
+            if i % 97 != 0 {
+                bytes[i / 8] |= 1 << (i % 8);
+            }
+        }
+        bytes
+    };
+    let volume_col = Column {
+        data_type: DataType::Int64,
+        values: Buffer::from_slice_copy(
+            &(0..n).map(|i| (i % 7) as i64).collect::<Vec<i64>>(),
+        ),
+        validity: Some(Bitmap::from_bytes(vol_bits, n)),
+        dict: None,
+    };
+    Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::TimestampUs),
+            FieldSchema::new("price", DataType::Float64),
+            FieldSchema::new("volume", DataType::Int64),
+        ]),
+        vec![sym_col, time_col, price_col, volume_col],
+    )
+    .unwrap()
+}
+
+fn vol_validity_bytes(n: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; n.div_ceil(8)];
+    for i in 0..n {
+        if i % 97 != 0 {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bytes
+}
+
+#[test]
+fn write_dataset_parallel_large_matches_expected() {
+    let n = 100_000; // 2 字段 × 8B × 100K = 1.5 MiB ≥ WRITE_PARALLEL_MIN_BYTES（1 MiB）
+    let dir = temp_dir("write_par");
+    let root = dir.join("ds");
+    create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
+        .unwrap();
+    let mut ds = open_dataset(&root, Mode::Write).unwrap();
+    ds.set_max_parallelism(4); // 强制走并行分支
+
+    // 全量覆盖：price 翻负、volume 全 42（沿用原 validity 位型，NULL 位置不变）
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(
+            &(0..n).map(|i| -(i as f64) * 0.25).collect::<Vec<f64>>(),
+        ),
+        validity: None,
+        dict: None,
+    };
+    let volume_col = Column {
+        data_type: DataType::Int64,
+        values: Buffer::from_slice_copy(&vec![42i64; n]),
+        validity: Some(Bitmap::from_bytes(vol_validity_bytes(n), n)),
+        dict: None,
+    };
+    let patch = splayed_format::DataView::new(
+        Schema::new(vec![
+            FieldSchema::new("price", DataType::Float64),
+            FieldSchema::new("volume", DataType::Int64),
+        ]),
+        vec![price_col.as_view(), volume_col.as_view()],
+    )
+    .unwrap();
+    ds.write_dataset(0, &patch).unwrap();
+
+    // 重复列名显式拒绝（并行分桶依赖字段唯一）
+    let dup = splayed_format::DataView::new(
+        Schema::new(vec![
+            FieldSchema::new("price", DataType::Float64),
+            FieldSchema::new("price", DataType::Float64),
+        ]),
+        vec![price_col.as_view(), price_col.as_view()],
+    )
+    .unwrap();
+    assert!(matches!(
+        ds.write_dataset(0, &dup),
+        Err(CoreError::Invalid(_))
+    ));
+
+    ds.close_dataset().unwrap();
+
+    // 重开验证：两字段均被并行写入正确值，NULL 数不变，sym/time 未受影响
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+    let view = ds.read_dataset(0, n as u64, Some(&["volume", "price"])).unwrap();
+    assert_eq!(
+        view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
+        vec!["sym", "time", "volume", "price"] // 请求序组装
+    );
+    let prices: Vec<f64> = view
+        .column("price")
+        .unwrap()
+        .segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec())
+        .collect();
+    assert_eq!(prices[0], 0.0);
+    assert_eq!(prices[n / 2], -(n as f64 / 2.0) * 0.25);
+    assert_eq!(prices[n - 1], -((n - 1) as f64) * 0.25);
+    let vol = view.column("volume").unwrap();
+    assert_eq!(vol.null_count(), (0..n).step_by(97).count());
+    let volumes: Vec<i64> = vol
+        .segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, i64>(s.fixed_bytes().unwrap()).to_vec())
+        .collect();
+    assert!(volumes.iter().all(|&v| v == 42));
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn scan_dataset_parallel_multi_field_matches_brute_force() {
+    let n = 128_000; // ≥ SCAN_PARALLEL_MIN_ROWS（64K），双字段谓词 → 并行扫描分支
+    let dir = temp_dir("scan_par");
+    let root = dir.join("ds");
+    create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
+        .unwrap();
+    let mut ds = open_dataset(&root, Mode::Read).unwrap();
+    ds.set_max_parallelism(4);
+
+    let pred = Predicate::And(vec![
+        Predicate::cmp("price", CmpOp::Gt, Scalar::Float(500.0)),
+        Predicate::cmp("volume", CmpOp::Lt, Scalar::Int(3)),
+    ]);
+    let mut scanner = ds
+        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .unwrap();
+    let mut got = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        got.push((r.offset, r.length));
+    }
+    scanner.close().unwrap();
+
+    // 暴力期望：price > 500 ∧ volume 有效且 < 3（NULL 不命中）
+    let mut hits = Vec::new();
+    for i in 0..n {
+        let price_ok = ((i.wrapping_mul(2654435761)) % 1000) as f64 > 500.0;
+        let vol_ok = i % 97 != 0 && (i % 7) < 3;
+        if price_ok && vol_ok {
+            hits.push(i as u64);
+        }
+    }
+    // 有序不重叠 + 行集精确一致
+    assert!(got.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0));
+    let got_rows: Vec<u64> = got.iter().flat_map(|&(o, l)| o..o + l).collect();
+    assert_eq!(got_rows, hits);
+
+    // 单字段谓词保持串行快路径语义不变
+    let pred = Predicate::cmp("volume", CmpOp::Lt, Scalar::Int(2));
+    let mut scanner = ds
+        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .unwrap();
+    let mut rows = 0u64;
+    while let Some(r) = scanner.next().unwrap() {
+        rows += r.length;
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, (0..n).filter(|&i| i % 97 != 0 && i % 7 < 2).count() as u64);
+
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn read_dataset_projection_request_order_and_validation() {
+    let dir = temp_dir("read_order");
+    let root = dir.join("ds");
+    create_dataset(&root, two_field_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+
+    // 输出按 projection 请求序（schema 序为 price, volume）
+    let view = ds.read_dataset(0, 4, Some(&["volume", "price"])).unwrap();
+    assert_eq!(
+        view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
+        vec!["sym", "time", "volume", "price"]
+    );
+    // 保留名 / 重复请求被跳过去重，sym/time 恒在最前
+    let view = ds.read_dataset(0, 4, Some(&["price", "sym", "price"])).unwrap();
+    assert_eq!(
+        view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
+        vec!["sym", "time", "price"]
+    );
+    assert!(matches!(
+        ds.read_dataset(0, 4, Some(&["nope"])),
+        Err(CoreError::Invalid(_))
+    ));
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
 }

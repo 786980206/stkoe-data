@@ -14,6 +14,7 @@ Dataset（目录）
 - Field Handle 按需打开；首次访问某个 Field 时校验其与 Dataset 的 generation / Schema 一致性。
 - Field 名称 ↔ 文件名的映射由 Dataset 层定义（沿用字段名 = 文件名约定）。
 - Dataset 不引入独立 Schema 文件、独立 Index 文件——Dataset Index 就是 `.meta`。
+- `DatasetHandle.max_parallelism`（默认 = 逻辑核数，`set_max_parallelism` 可调）是 `write_dataset` / `scan_dataset` Field 级并行的唯一并发旋钮；`read_dataset` 为纯零拷贝切片，恒单线程（见 §7.10）。
 
 ### 7.2 总览
 
@@ -133,7 +134,8 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
 2. MetaHandle::open(path/.meta)  →  File::open + Mmap::map + header 校验
 3. build_schema(path, time_type)  →  read_dir 列出字段名（过滤 starts_with('.') 与 *.tmp）
                                     →  names.sort() → 逐 field File::open + read_exact 64B header → data_type
-4. 构造 DatasetHandle { meta, schema, fields: RefCell<HashMap>（空）, mode }
+4. 构造 DatasetHandle { meta, schema, fields: RefCell<HashMap>（空）, mode,
+        max_parallelism: 默认 = 逻辑核数 }
 ```
 
 **说明**（open_dataset 优化原则）：
@@ -142,7 +144,9 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
 - Schema 只读取 Field Header（逐字段 64B `read_exact`，无 mmap、不读数据区）。
 - Schema 缓存到 `DatasetHandle`，open 后 `read_dataset_schema` 不再扫描目录；
   Field 结构操作（create / delete / rename / cast）同步更新缓存。
-- 不引入并行参数：Field header I/O 很轻（N 次 64B 顺序读），并行没有收益。
+- open 自身不引入并行参数：Field header I/O 很轻（N 次 64B 顺序读），并行没有收益；
+  Handle 携带 `max_parallelism` 默认值仅作为后续 write / scan 并行的旋钮
+  （`set_max_parallelism` 可调，Table 层由 `TableOptions.max_parallelism` 下沉）。
 - 过滤 `starts_with('.') || ends_with(".tmp")`：比原则更宽——覆盖 `.meta`、`.meta.tmp`、
   cast 的 `.cast.{pid}.{n}.tmp` 及一切隐藏文件；字段名排序保证 Schema 顺序确定。
 - 保持轻量化：open 全程零数据 I/O，mmap 与数据读取延迟到首次 read / write / scan。
@@ -302,28 +306,28 @@ impl DatasetHandle {
 | --- | --- | --- | --- |
 | `&self` | `&DatasetHandle` | 输入 | Handle（read / write mode 均可） |
 | `offset` | `u64` | 输入 | 逻辑行起始 |
-| `length` | `u64` | 输入 | 读取行数；`offset + length ≤ L` |
-| `columns` | `Option<&[&str]>` | 输入 | 需要的 Field 集合（projection），必须显式列出；`sym` / `time` 恒返回，无需指定；`None` = 仅返回 sym / time |
+| `length` | `u64` | 输入 | 读取行数；`offset + length ≤ L`（checked_add 防溢出） |
+| `columns` | `Option<&[&str]>` | 输入 | 需要的 Field 集合（projection），必须显式列出；`sym` / `time` 恒返回，无需指定；`None` = 仅返回 sym / time；保留名 / 重复项被跳过去重 |
 | 返回 | `Result<DataView<'_>, CoreError>` | 输出 | 多列 zero-copy 视图；生命周期不超过相关 Handle |
 
-**内部实现**（两阶段借用）：
+**内部实现流程**：
 ```
-阶段 1（&mut self.fields）  →  ensure_field：确保所有需要的 Field Handle 已打开
-阶段 2（&self.meta + &self.fields）  →  共享借用创建视图
-    base = meta.read_index_handle(offset, length)
-        →  locate_row(offset) 二分 SYM INDEX
-        →  sym 列 RepeatDict 段（零物化，无 scratch arena）
-        →  time 列切片 TIME AXIS（零拷贝多段）
-    各 Field → field_handle.read_field_handle(offset, length)
-        →  mmap 切片（PLAIN+NONE 单段）或 working 切片（compressed 多段）
-    组装 → DataView
+① 主线程：解析 projection（请求序去重，跳过 sym / time 保留名；未知名 → Invalid）
+        + 串行 ensure_field 全部目标 Field
+② META 零拷贝：read_index_handle(offset, length)
+        → sym RepeatDict 段（零物化）+ time 轴切片
+③ 逐 Field 零拷贝读取（串行）→ mmap 切片（PLAIN+NONE）或 working 切片（compressed）
+④ 按 projection 请求序组装 → DataView::new（列数 / 等长 / 类型一致性校验）
 ```
-- 两阶段借用避免 &mut self.fields 与 &self.meta 冲突
+
+**核心原则（并发模型：单线程）**：
+- **读路径全程 O(1) 指针运算、不触碰数据页**：uncompressed = mmap 切片，compressed = working 切片，每 Field 成本为亚微秒级；Field 级并行的线程调度开销（每次 spawn ~几十 µs）远高于切片收益，故 `read_dataset` **保持单线程**——这正对应「PLAIN 字段是连续 mmap，拆分只增调度开销」原则。
+- **并行的插入点**：chunk 级惰性解码落地之后（读从切片变成解码密集），此处是 Field 级并行的天然位置。
+- `ensure_field` 串行先行，返回的视图借用于 Field 缓存（Box 地址稳定、只增不删）。
+- `offset / length` 是 Dataset 逻辑行范围；因逻辑 = 物理，各 Field 直接以相同范围读取，无需换算。
 
 **说明**：
-- `offset / length` 是 Dataset 逻辑行范围；因逻辑 = 物理，各 Field 直接以相同 offset / length 读取，无需换算。
-- `sym` / `time` 恒返回（来自 META，零拷贝）；其余 Field 由 `columns` 显式指定（`None` = 仅 sym / time）。
-- 一个范围可跨多个 sym；所需 Field 按需打开。
+- 输出按 projection **请求序**组装（`sym` / `time` 恒在最前）；列查找由调用方按名进行时顺序无感。
 - 零拷贝优先；返回的 `DataView` 不拥有数据，生命周期不超过相关 Handle。
 
 流程：
@@ -331,8 +335,8 @@ impl DatasetHandle {
 ```
 read_dataset(offset, length, columns?)
         ├── META → sym/time view（TIME AXIS + SYM INDEX RepeatDict）
-        ├── 各 Field → read_field_handle → ColumnView
-        └── 组装 → DataView
+        ├── 各 Field → read_field_handle → ColumnView（零拷贝切片，串行）
+        └── 按 projection 请求序组装 → DataView
 ```
 
 ### 7.11 write_dataset
@@ -353,23 +357,33 @@ impl DatasetHandle {
 | `data` | `&DataView<'_>` | 输入 | 待写入列（支持 projection write）；`sym` / `time` 不作为写入列；所有输入列等长 |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 各列覆盖写入完成（跨列无原子性） |
 
-**内部实现**：
+**内部实现流程（三阶段并发模型）**：
 ```
-1. mode.require_write + 边界校验（offset + len ≤ L）+ 类型校验
-2. 逐列（按 data.schema 顺序）：
-     ensure_field（&self.fields）
-     self.fields.borrow_mut().get_mut(name).write_field_handle(offset, col_view)
-3. 不保证跨 Field 原子性：第 N 列写入失败时前 N-1 列已生效
+① 主线程：mode.require_write + 边界校验（checked_add）+ 列名重复检查 + 类型校验
+        + 串行 ensure_field 全部目标 Field（并行阶段不触碰字段缓存）
+② 主线程：fields.values_mut() 一次性独占借用收集互不相交的 &mut FieldHandle
+        （字段名 = 文件名 ↔ data.columns 下标配对）；RefMut 只在主线程存活
+③ 写入：
+    单字段 / 总字节 < WRITE_PARALLEL_MIN_BYTES (1 MiB) / max_parallelism = 1
+        → 串行快路径（逐字段 write_field_handle）
+    否则 → Field 级并行：std::thread::scope round-robin 分桶
+        （桶内顺序、桶间并行，P = min(max_parallelism, 字段数)），
+        各桶独立 write_field_handle，join 后返回首个错误
 ```
 - write_field_handle 内部按 Field 的物理表示分派（mmap 直写或 working 修改）
-- 每次 write 成功后 field generation += 1
+- 每次 write 成功后 field generation += 1（各 Field 独立，无需原子自增）
+
+**核心原则**：
+- **主线程准备，并行只做纯写入**：校验 / 缓存管理全部在串行阶段完成；并行区域只有互不相交的 `&mut FieldHandle` 写入，不触碰任何全局缓存或锁（`&mut` 不相交性由 `values_mut` 遍历 + 列名唯一校验保证）。
+- **小写快路径**：线程创建 ~几十 µs，高于小体量 memcpy 的并行收益；总字节 ≥ 1 MiB 才并行。
+- **并行度由最上层控制**：`max_parallelism` 默认 = 逻辑核数，`set_max_parallelism` 可调；Table 层由 `TableOptions.max_parallelism` 下沉。Dataset 层不自建线程池。
+- **不保证跨 Field 原子性**：多个 Field 独立写入，部分成功不回滚（并行下失败字段之外的字段可能已完成，与串行「停在首个错误」的差异在预期内）。
 
 **说明**：
 - 职责：对已有逻辑行做 positional overwrite；只覆盖已有数据区域；不改变 META layout、逻辑长度、sym / time 身份；不是追加接口。
 - `length = 0` 合法 no-op。
-- 支持 projection write：`data` 可只含 Schema 的部分字段；字段必须属于 Schema 且类型兼容；未提供字段保持原值。
+- 支持 projection write：`data` 可只含 Schema 的部分字段；字段必须属于 Schema 且类型兼容；未提供字段保持原值；**重复列名返回 Invalid**（并行分桶依赖字段唯一）。
 - 每列按名称定位到对应 Field，调用 `write_field_handle`（values + validity 成对写入；`validity = null` 表示本段全有效）。
-- **不保证跨 Field 原子性**：多个 Field 独立写入，部分成功不回滚，Dataset 可能处于部分更新状态；不提供跨 Field transaction / rollback。
 
 ### 7.12 scan_dataset
 
@@ -395,28 +409,42 @@ impl DatasetScanner {
 | `request.limit` | `Option<u64>` | 输入 | 最多产生的命中行数 |
 | 返回 scanner | `Result<DatasetScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个逻辑 RowRange，结束返回 `None` |
 
-**内部实现**：
+**内部实现流程（三阶段并发模型）**：
 ```
-1. clamp_ranges(request.ranges, L)  →  裁剪到 [0, L)
-2. collect_for_fields(predicate, ["sym","time"])  →  提取 sym/time 子谓词
-     →  meta.scan_index_handle(sym_time_req)  →  narrowed ranges
-3. predicate_groups(predicate)  →  按字段分组（跳过 sym/time 保留名）
-     →  按名称排序 → 逐 Field：ensure_field → scan_field_handle(sub_req)
-     →  逐 Field 收窄 ranges（intersect_range_lists 归并求交）
-4. DatasetScanner { ranges: VecDeque(current), remaining: request.limit }
+① 主线程：clamp_ranges(request.ranges, L)（裁剪 + 合并）
+     → collect_for_fields(["sym","time"]) → meta.scan_index_handle → 求交
+        （META 单线程先行：体积小、能大幅缩小候选）
+     → predicate_groups 按字段分组（跳过 sym/time 保留名）→ 按名称排序
+     → 串行 ensure_field 全部目标字段 + 收集共享 &FieldHandle（并行阶段不触碰缓存）
+② 各 Field 以【相同候选范围】独立扫描 scan_field_handle（limit = None）：
+    单字段 / 候选总行数 < SCAN_PARALLEL_MIN_ROWS (64K) / max_parallelism = 1
+        → 串行快路径
+    否则 → std::thread::scope round-robin 分桶并行 drain（P = min(max_parallelism, 组数)），
+        每线程输出 owned Vec<RowRange>（并行区域不触碰字段缓存）
+③ 主线程收尾：顺序求交（双指针 O(a+b)，空集提前退出）
+     → merge_ranges 相邻/重叠合并 → DatasetScanner { ranges, remaining: limit }
 ```
-- 求交用双指针归并 O(a + b)，非 O(a × b)
+
+**核心原则**：
+- **META 先行**：sym / time 条件先单线程收窄候选，减少后续所有 Field 扫描的工作量。
+- **并行扫描使用相同输入 ranges**：谓词求值是逐行性质，`∩` 满足交换 / 结合，各 Field 独立扫描同一候选范围后求交 ≡ 逐字段串行收窄（B(A∩R) = B(R)∩A∩R）；并行只改变求值次序，不改变结果。
+- **`ensure_field` 永不进入并行热路径**：缓存管理是主线程职责，并行任务只接收稳定 handle。
+- **limit 不下推子扫描**：单字段按 limit 截断后求交会漏行；`request.limit` 仅由 `DatasetScanner.remaining` 在输出端严格控制。
+- **小扫描快路径**：候选总行数 < 64K 时线程调度开销大于谓词求值收益，串行执行。
+- **求交 / 合并留主线程**：纯内存 O(a+b) 操作，顺序执行并逐轮提前退出。
 
 **说明**：
 - Scanner 组合 META 与各 Field 的扫描结果（求交 / 裁剪 / 合并），输出 **Dataset 逻辑 RowRange**。
 - 只定位不读取；实际数据由 `read_dataset` 消费；batch 收集由上层负责。
-- 多 predicate 的执行顺序由上层 planner 决定。
+- 跨字段的 Or / Not 组合不支持（返回 Invalid），行级过滤兜底由上层完成。
+- 并行扫描中任一字段失败立即返回错误，已完成字段的结果不回滚（与 write_dataset 一致）。
 
 流程：
 
 ```
-scan_index（sym/time 条件）→ candidate ranges
-    → scan_field_handle（值条件，逐 Field）→ 求交 / 裁剪
+scan_index（sym/time 条件，单线程）→ candidate ranges
+    → scan_field_handle（值条件，各 Field 同输入独立扫描；多字段大候选时并行）
+    → 顺序求交 + 相邻合并（主线程）
     → DatasetScanner → 逻辑 RowRange → read_dataset → DataView
 ```
 

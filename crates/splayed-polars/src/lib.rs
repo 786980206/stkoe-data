@@ -92,7 +92,6 @@ impl SplayedTable {
             let cols_ref: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
             let full = ds.read_dataset(0, take as u64, Some(&cols_ref))?;
             let mut df = view_to_frame(&full)?;
-            eprintln!("DBG part={p:?} df_h={}", df.height());
             // 精确返回请求列（with_columns 顺序；sym/time 仅在被请求时出现）
             if let Some(cols) = with_columns {
                 let wanted: Vec<&str> = cols.iter().map(|c| c.as_str()).collect();
