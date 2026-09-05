@@ -12,7 +12,7 @@ use crate::field_file::{
     FieldInit, StreamChunk,
 };
 use crate::meta_file::{create_meta_file, MetaHandle};
-use crate::scan::{clamp_ranges, merge_ranges, Predicate, RowRange, ScanRequest};
+use crate::scan::{clamp_ranges, Predicate, RowRange, ScanRequest};
 
 /// Dataset 逻辑目录布局：
 /// ```text

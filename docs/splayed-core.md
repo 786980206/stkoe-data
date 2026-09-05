@@ -639,3 +639,21 @@ Dataset 级变化（重建）
 - 谓词求值逐行走 `read_row_scalar` 标量分发；类型特化的段内向量化（SIMD）待实现。
 - Handle 的 scratch 缓冲逐次累积（视图生命周期契约要求），长生命周期高频读场景的回收策略待定。
 - `read_index_handle` 的 sym keys 逐行物化；常量 run 可用 RLE 型段表示。
+
+## 10. Benchmark vs Parquet（V2.0 首轮基线，2026-09）
+
+数据：64 sym × 250 行 = 16K 行 × 4 列（sym/time/price/volume），按月分区。
+基准：`crates/splayed-table/benches/vs_parquet.rs`（criterion；对照 arrow-rs parquet 56）。
+
+| 路径 | splayed | parquet | 差距 |
+| --- | --- | --- | --- |
+| 写入（端到端建表） | ~83 ms | ~10 ms | ≈ 8× |
+| 全表读取（Table 层） | ~6.5 ms | ~0.55 ms | ≈ 12× |
+| 谓词扫描（price > 15） | ~6.9 ms | ~0.69 ms | ≈ 10× |
+
+结论与定位：当前 V2.0 为**正确性优先**实现——写入开销主要在 MetaBuilder / 每分区
+DataView 物化（gather），读取开销在三层 API 的逐分区打开 + 视图组装 + 谓词行级
+求值。上述「已知优化项」（chunk 惰性解码、谓词向量化、scratch 回收、建表 gather
+优化）是缩小差距的主要抓手；splayed 的目标优势场景（容量网格 O(1) 行定位、
+零拷贝 sym/time 视图）在当前基准的全表读中尚未体现，因 Table 层端到端包含
+schema 组装等固定开销。
