@@ -216,8 +216,15 @@ impl DatasetHandle {
 | --- | --- | --- | --- |
 | 返回 | `Schema`（owned） | 输出 | 当前全部逻辑字段（含 sym / time）及 `DataType` |
 
-**说明**：
-- 不触发数据扫描；不返回物理属性（encoding / compression / offset）。
+**说明**（read_dataset_schema 优化原则）：
+- 直接返回 `DatasetHandle` 中缓存的 Schema（`self.schema.clone()`），不重新扫描目录；
+  缓存由 `open_dataset` 构建一次，此后本接口 O(1)（纯内存，O(字段数) clone）返回。
+- 不触发 Field / META I/O。
+- Schema 保持 owned：返回值是快照，不暴露内部生命周期；后续结构变化不影响已拿到的副本，close 后仍可用。
+- 只描述逻辑字段（name + DataType），不混入 compression / offset 等物理信息。
+- 无需并行——纯内存访问。
+- 缓存一致性：Field 结构操作（create / delete / rename / cast / compress / decompress）
+  变更后经 `reload_schema()` 重建缓存，读路径永远只读缓存。
 - 另有 `peek_time_type(&self) -> TimeType` 访问器（来自 META header）。
 
 ### 7.9 read_dataset_statistics
