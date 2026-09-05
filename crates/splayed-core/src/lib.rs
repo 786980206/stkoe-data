@@ -11,7 +11,8 @@ pub mod meta_file;
 pub mod scan;
 
 pub use dataset::{
-    create_dataset, create_dataset_index, delete_dataset, open_dataset, DatasetFieldInit,
+    create_dataset, create_dataset_index, delete_dataset, open_dataset, CreateDatasetOptions,
+    DatasetFieldInit,
     DatasetHandle, DatasetStatistics, RESERVED_FIELD_NAMES,
 };
 pub use error::{CoreError, Mode};

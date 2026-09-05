@@ -43,7 +43,12 @@ Dataset（目录）
 
 **接口定义**：
 ```rust
-pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError>
+pub struct CreateDatasetOptions {
+    pub max_parallelism: usize,   // Field 文件并行创建的线程上限（1 = 串行）；默认 = 逻辑核数
+}
+impl Default for CreateDatasetOptions { /* std::thread::available_parallelism() */ }
+
+pub fn create_dataset(path: &Path, data: Data, options: CreateDatasetOptions) -> Result<(), CoreError>
 ```
 
 **参数**：
@@ -52,23 +57,30 @@ pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError>
 | --- | --- | --- | --- |
 | `path` | `&Path` | 输入 | Dataset 目录路径；必须不存在 |
 | `data` | `Data` | 输入 | 拥有数据所有权的完整表数据（Schema + 全部列值）；必须含 `sym` 与 `time`，按 `(sym ASC, time ASC)` 排序 |
+| `options` | `CreateDatasetOptions` | 输入 | 并行选项：`max_parallelism` 控制 Field 并行创建线程数 |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Dataset 创建完成 |
 
 **内部实现**：
 ```
 1. 校验 path 不存在、data 含 sym/time
-2. create_meta_file(path/.meta, data.as_view())
-      → MetaBuilder::build（批量 cast + run 检测）
-      → write_meta_atomic（tmp + sync_all + rename）
-3. 遍历非 sym/time 列 → create_field_file(path/<name>, type, Data(col))
-4. 失败 → remove_dir_all(path) 清理残留
+2. ① META 单线程先行：MetaBuilder::build(data.as_view())
+      一次扫描完成全局合法性校验（排序 / 连续子区间 / 容量网格）+ 构建；失败不落盘
+3. ② 抽走非 sym/time 列（std::mem::take，列所有权零拷贝移动——不 clone）
+4. ③ 临时目录（.{name}.tmp）→ META 字节直写 + fsync
+5. ④ Field 并行创建：P = min(max_parallelism, 字段数)
+      round-robin 分桶 → std::thread::scope：桶内顺序 create_field_file、桶间并行
+6. 全部成功 → fs::rename(tmp, path) 原子发布；失败 → remove_dir_all(tmp) 清理
 ```
-- 新路径直写（无 temp dir 中转——目录不存在时无原子性需求）
-- 失败时清理整个目录
+
+**核心原则**：先用 META 一次扫描完成全局合法性校验，再并行创建所有独立 Field；
+Field 之间完全独立，是并行创建的基本单元；并行度由 `max_parallelism` 暴露给上层控制。
+META 构建保持单线程（顺序扫描本身无并行点），这一层不重复扫描、不拷贝数据（列所有权移动）。
 
 **说明**：
 - sym / time 转为 META（Index），其余列逐个转为 Field 文件；三者来自同一份输入，天然一致。
 - 不要求各 SYM 时间集合相同；缺失时间点由 Field 的 NULL 表示。
+- META 文件在 tmp 内 fsync 后才做目录级 rename；Field 文件沿用 create_field_file 语义（无逐文件 fsync）。
+- 无 rayon 依赖：并行用 `std::thread::scope` + 手工分桶实现，保持 core 依赖精简。
 
 ### 7.4 create_dataset_index
 
@@ -291,7 +303,7 @@ impl DatasetHandle {
 | `&self` | `&DatasetHandle` | 输入 | Handle（read / write mode 均可） |
 | `offset` | `u64` | 输入 | 逻辑行起始 |
 | `length` | `u64` | 输入 | 读取行数；`offset + length ≤ L` |
-| `columns` | `Option<&[&str]>` | 输入 | 需要的 Field 集合（projection）；`sym` / `time` 恒返回，无需指定；`None` = 全部字段 |
+| `columns` | `Option<&[&str]>` | 输入 | 需要的 Field 集合（projection），必须显式列出；`sym` / `time` 恒返回，无需指定；`None` = 仅返回 sym / time |
 | 返回 | `Result<DataView<'_>, CoreError>` | 输出 | 多列 zero-copy 视图；生命周期不超过相关 Handle |
 
 **内部实现**（两阶段借用）：
@@ -310,7 +322,7 @@ impl DatasetHandle {
 
 **说明**：
 - `offset / length` 是 Dataset 逻辑行范围；因逻辑 = 物理，各 Field 直接以相同 offset / length 读取，无需换算。
-- 默认返回 `sym` 与 `time`（来自 META，零拷贝）；其余 Field 由 `columns` 指定。
+- `sym` / `time` 恒返回（来自 META，零拷贝）；其余 Field 由 `columns` 显式指定（`None` = 仅 sym / time）。
 - 一个范围可跨多个 sym；所需 Field 按需打开。
 - 零拷贝优先；返回的 `DataView` 不拥有数据，生命周期不超过相关 Handle。
 

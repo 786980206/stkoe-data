@@ -74,11 +74,11 @@ fn sample_data() -> Data {
 fn dataset_create_read_write_roundtrip() {
     let dir = temp_dir("roundtrip");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data()).unwrap();
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     assert!(root.join(".meta").exists());
     assert!(root.join("price").exists());
     // 重复创建 → AlreadyExists
-    assert!(create_dataset(&root, sample_data()).is_err());
+    assert!(create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).is_err());
 
     let ds = open_dataset(&root, Mode::Read).unwrap();
     let schema = ds.read_dataset_schema();
@@ -137,7 +137,7 @@ fn dataset_create_read_write_roundtrip() {
 fn dataset_write_and_scan() {
     let dir = temp_dir("write_scan");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data()).unwrap();
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Write).unwrap();
 
     // write：覆盖 MSFT 两行（逻辑行 [3, 5)）
@@ -221,7 +221,7 @@ fn dataset_write_and_scan() {
 fn dataset_struct_ops_and_compression() {
     let dir = temp_dir("struct");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data()).unwrap();
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
 
     // create：全 NULL 字段
@@ -294,7 +294,7 @@ fn dataset_struct_ops_and_compression() {
 fn dataset_locate_index() {
     let dir = temp_dir("locate");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data()).unwrap();
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
 
     // 有序唯一输入：AAPL@100 → row 0，AAPL@300 → row 2，GOOG@200 → row 4, GOOG@300 → row 5
@@ -330,7 +330,7 @@ fn dataset_locate_index() {
 fn dataset_index_rebuild() {
     let dir = temp_dir("reindex");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data()).unwrap();
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     // 重建 .meta（同输入）
     let data = sample_data();
     create_dataset_index(&root, &data.as_view()).unwrap();
@@ -365,7 +365,7 @@ fn create_dataset_field_failure_leaves_no_residue() {
         &[1, 2, 3, 4, 1, 2, 3, 4],
         &[10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0],
     );
-    create_dataset(&root, data).unwrap();
+    create_dataset(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
 
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
     let err = ds
@@ -381,5 +381,46 @@ fn create_dataset_field_failure_leaves_no_residue() {
     let ds = open_dataset(&root, Mode::Read).unwrap();
     assert!(ds.read_dataset_schema().position("vol").is_none());
     ds.close_dataset().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 两字段数据（price + volume），确保 create_dataset 命中并行分支（字段数 ≥ 2）。
+fn two_field_data() -> Data {
+    let mut data = make_data(
+        &["A", "A", "B", "B"],
+        &[1, 2, 1, 2],
+        &[10.0, 11.0, 20.0, 21.0],
+    );
+    let vol: Vec<i64> = vec![1, 2, 3, 4];
+    data.schema.fields.push(FieldSchema::new("volume", DataType::Int64));
+    data.columns.push(Column {
+        data_type: DataType::Int64,
+        values: Buffer::from_slice_copy(&vol),
+        validity: None,
+        dict: None,
+    });
+    data
+}
+
+#[test]
+fn create_dataset_parallel_options() {
+    let dir = temp_dir("create_par");
+    let data = two_field_data();
+
+    // 串行（max_parallelism = 1）
+    let root1 = dir.join("serial");
+    create_dataset(&root1, data.clone(), splayed_core::CreateDatasetOptions { max_parallelism: 1 }).unwrap();
+    // 并行（max_parallelism = 8 > 字段数 → P = 2）
+    let root2 = dir.join("par");
+    create_dataset(&root2, data, splayed_core::CreateDatasetOptions { max_parallelism: 8 }).unwrap();
+
+    for root in [&root1, &root2] {
+        let ds = open_dataset(&root, Mode::Read).unwrap();
+        assert_eq!(ds.read_dataset_schema().fields.len(), 4); // sym / time / price / volume
+        let view = ds.read_dataset(0, 4, Some(&["price", "volume"])).unwrap();
+        assert_eq!(view.length(), 4);
+        assert_eq!(view.column("volume").unwrap().length(), 4);
+        ds.close_dataset().unwrap();
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use splayed_core::{create_dataset, open_dataset, CoreError, DatasetHandle, Mode};
+use splayed_core::{CreateDatasetOptions, create_dataset, open_dataset, CoreError, DatasetHandle, Mode};
 use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeType};
 
 use crate::partition::{partition_name, partition_range, PartitionScheme};
@@ -373,7 +373,7 @@ pub fn create_table(
         return Err(CoreError::Invalid("table input requires sym and time columns".into()));
     }
     if scheme == PartitionScheme::None {
-        return create_dataset(table_path, data.clone());
+        return create_dataset(table_path, data.clone(), CreateDatasetOptions::default());
     }
     let tt = infer_tt(data.column("time").unwrap().data_type)?;
     let time_view = data.column("time").unwrap().as_view();
@@ -399,7 +399,7 @@ pub fn create_table(
             }
             let dir = table_path.join(name);
             handles.push(scope.spawn(move || {
-                splayed_core::create_dataset(&dir, sub)
+                splayed_core::create_dataset(&dir, sub, splayed_core::CreateDatasetOptions::default())
             }));
         }
         for h in handles {
@@ -438,7 +438,7 @@ pub fn create_table_partition(
     }
     let indices: Vec<usize> = (0..data.length()).collect();
     let sub = gather_data(&data, &indices)?;
-    splayed_core::create_dataset(&table_path.join(partition_name), sub)
+    splayed_core::create_dataset(&table_path.join(partition_name), sub, splayed_core::CreateDatasetOptions::default())
 }
 
 /// 删除整个 Table（根目录及全部 Partition Dataset）。

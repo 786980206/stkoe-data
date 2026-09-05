@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use splayed_format::{Column, Data, DataView, DataType, FieldSchema, Schema, TimeType};
@@ -11,7 +12,7 @@ use crate::field_file::{
     cast_field_file, compress_field_file, decompress_field_file, FieldChunkReader, FieldHandle,
     FieldInit, StreamValues,
 };
-use crate::meta_file::{create_meta_file, MetaHandle};
+use crate::meta_file::{create_meta_file, MetaBuilder, MetaHandle};
 use crate::scan::{clamp_ranges, Predicate, RowRange, ScanRequest};
 
 /// Dataset 逻辑目录布局：
@@ -689,14 +690,52 @@ fn strip_all_fields(pred: &Predicate) -> Predicate {
 
 // ------------------------------------------------------------------ File API
 
-/// 创建完整 Dataset：临时目录中建 META + 全部 Field，全部成功后原子 rename 到目标路径。
-pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError> {
+/// `create_dataset` 的并行选项。
+#[derive(Debug, Clone)]
+pub struct CreateDatasetOptions {
+    /// Field 文件并行创建的线程上限（1 = 串行）；默认 = 逻辑核数。
+    pub max_parallelism: usize,
+}
+
+impl Default for CreateDatasetOptions {
+    fn default() -> Self {
+        CreateDatasetOptions {
+            max_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        }
+    }
+}
+
+/// 创建完整 Dataset：META 单线程先行（一次扫描完成全局合法性校验），
+/// Field 文件并行创建（各字段完全独立，列所有权零拷贝移动），
+/// 临时目录中全部成功后原子 rename 到目标路径。
+pub fn create_dataset(
+    path: &Path,
+    data: Data,
+    options: CreateDatasetOptions,
+) -> Result<(), CoreError> {
     if path.exists() {
         return Err(CoreError::AlreadyExists(path.to_path_buf()));
     }
     if data.column("sym").is_none() || data.column("time").is_none() {
         return Err(CoreError::Invalid("dataset input requires sym and time columns".into()));
     }
+    // ① META 单线程先行：一次扫描完成全局校验（排序 / 连续子区间 / 容量网格）+ 构建；
+    //    失败时不落任何盘上痕迹
+    let meta = MetaBuilder::build(&data.as_view())?;
+    // ② 抽走非 sym/time 列（owned 移动，零拷贝）——Field 之间完全独立，是并行创建的基本单元
+    let mut data = data;
+    let names: Vec<String> = data.schema.fields.iter().map(|f| f.name.to_string()).collect();
+    let types: Vec<DataType> = data.schema.fields.iter().map(|f| f.data_type).collect();
+    let columns = std::mem::take(&mut data.columns);
+    let field_cols: Vec<(String, DataType, Column)> = names
+        .into_iter()
+        .zip(types)
+        .zip(columns)
+        .filter(|((name, _), _)| !is_reserved(name))
+        .map(|((name, data_type), col)| (name, data_type, col))
+        .collect();
+
+    // ③ 临时目录保证最终原子发布
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -706,19 +745,46 @@ pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError> {
     fs::create_dir_all(&tmp).map_err(|e| map_io_path(&tmp, e))?;
 
     let result = (|| {
-        let view = data.as_view();
-        create_meta_file(&tmp.join(META_FILE_NAME), &view)?;
-            for field in &view.schema.fields {
-            if is_reserved(&field.name) {
-                continue;
+        // ④ META 字节直写（已构建，不二次扫描）+ fsync
+        {
+            let mut f = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&tmp.join(META_FILE_NAME))?;
+            f.write_all(&meta)?;
+            f.sync_all()?;
+        }
+        // ⑤ Field 并行创建：桶内顺序、桶间并行；P = min(max_parallelism, 字段数)
+        let p = options.max_parallelism.max(1).min(field_cols.len()).max(1);
+        if p <= 1 {
+            for (name, data_type, col) in field_cols {
+                create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col))?;
             }
-            let col = data.column(&field.name).expect("schema iteration guarantees");
-            create_field_file(
-                &tmp.join(field.name.as_ref()),
-                field.data_type,
-                FieldInit::Data(col.clone()),
-            )?;
+        } else {
+            // round-robin 分桶（列大小不均时负载更均匀）；列所有权移动，零拷贝
+            let mut buckets: Vec<Vec<(String, DataType, Column)>> = vec![Vec::new(); p];
+            for (i, item) in field_cols.into_iter().enumerate() {
+                buckets[i % p].push(item);
+            }
+            std::thread::scope(|s| -> Result<(), CoreError> {
+                let mut handles = Vec::new();
+                for bucket in buckets {
+                    let tmp = &tmp;
+                    handles.push(s.spawn(move || -> Result<(), CoreError> {
+                        for (name, data_type, col) in bucket {
+                            create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col))?;
+                        }
+                        Ok(())
+                    }));
                 }
+                for h in handles {
+                    h.join()
+                        .map_err(|_| CoreError::InvalidState("field writer thread panicked".into()))??;
+                }
+                Ok(())
+            })?;
+        }
         Ok(())
     })();
     if let Err(e) = result {
