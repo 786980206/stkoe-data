@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 use splayed_format::{
-    Buffer, BufferView, ColumnSegment, ColumnView, DataView, FieldSchema, MetaHeader, Schema,
+    BufferView, ColumnSegment, ColumnView, DataView, FieldSchema, MetaHeader, Schema,
     SymIndexRecord, TimeType, DataType, DATA_OFFSET, HEADER_SIZE,
 };
 
@@ -467,36 +467,65 @@ impl MetaHandle {
     }
 
     pub fn scan_index_handle(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
-        let time_window = self.extract_time_window(request.predicate.as_ref());
-        let sym_ids = self.extract_sym_filter(request.predicate.as_ref())?;
-        let candidates: Vec<u32> = match sym_ids {
-            SymFilter::All => (0..self.header.sym_count).collect(),
-            SymFilter::Ids(ids) => ids,
-        };
+        // 1) 编译谓词 → (sym_ids, time_lo, time_hi)
+        let (sym_ids, time_lo, time_hi) = self.compile_predicate(request.predicate.as_ref())?;
+
+        // 2) 单次线性扫描 SYM INDEX → 直接生成 RowRange
         let mut ranges: Vec<RowRange> = Vec::new();
-        let mut produced: u64 = 0;
-        for id in candidates {
-            if request.limit.is_some_and(|l| produced >= l) {
-                break;
+        let mut produced: u64 = 0u64;
+
+        match &sym_ids {
+            Some(ids) => {
+                for &id in ids {
+                    if request.limit.is_some_and(|l| produced >= l) { break; }
+                    let rec = self.sym_record(id)?;
+                    let axis_lo = rec.time_start as u64;
+                    let axis_hi = axis_lo + rec.time_count as u64;
+                    let wlo = time_lo.max(axis_lo).min(axis_hi);
+                    let whi = time_hi.max(axis_lo).min(axis_hi);
+                    if whi <= wlo { continue; }
+                    ranges.push(RowRange::new(
+                        rec.row_start as u64 + (wlo - axis_lo), whi - wlo,
+                    ));
+                    produced += whi - wlo;
+                }
             }
-            let rec = self.sym_record(id)?;
-            let axis_lo = rec.time_start as u64;
-            let axis_hi = axis_lo + rec.time_count as u64;
-            let (lo, hi) = time_window;
-            let wlo = lo.max(axis_lo).min(axis_hi);
-            let whi = hi.max(axis_lo).min(axis_hi);
-            if whi <= wlo {
-                continue;
-            }
-            let range = RowRange::new(rec.row_start as u64 + (wlo - axis_lo), whi - wlo);
-            for r in clamp_ranges(&request.ranges, self.header.row_count as u64) {
-                if let Some(inter) = r.intersect(&range) {
-                    produced += inter.length;
-                    ranges.push(inter);
+            None => {
+                for id in 0..self.header.sym_count {
+                    if request.limit.is_some_and(|l| produced >= l) { break; }
+                    let rec = self.sym_record(id)?;
+                    let axis_lo = rec.time_start as u64;
+                    let axis_hi = axis_lo + rec.time_count as u64;
+                    let wlo = time_lo.max(axis_lo).min(axis_hi);
+                    let whi = time_hi.max(axis_lo).min(axis_hi);
+                    if whi <= wlo { continue; }
+                    ranges.push(RowRange::new(
+                        rec.row_start as u64 + (wlo - axis_lo), whi - wlo,
+                    ));
+                    produced += whi - wlo;
                 }
             }
         }
-        Ok(IndexScanner { ranges: merge_ranges(ranges), pos: 0, limit: request.limit })
+
+        // 3) 与 request.ranges 求交（一次）
+        let merged = merge_ranges(ranges);
+        let ranges = if request.ranges.is_empty() {
+            merged
+        } else {
+            let clamped = clamp_ranges(&request.ranges, self.header.row_count as u64);
+            // 双指针归并求交 O(a + b)
+            let mut out = Vec::new();
+            let (mut i, mut j) = (0usize, 0usize);
+            while i < merged.len() && j < clamped.len() {
+                let lo = merged[i].offset.max(clamped[j].offset);
+                let hi = merged[i].end().min(clamped[j].end());
+                if hi > lo { out.push(RowRange::new(lo, hi - lo)); }
+                if merged[i].end() <= clamped[j].end() { i += 1; } else { j += 1; }
+            }
+            out
+        };
+
+        Ok(IndexScanner { ranges, pos: 0, limit: request.limit })
     }
 
     /// `locate_index_handle`：`(sym, time)` 联合键批量定位。
@@ -564,102 +593,101 @@ impl MetaHandle {
         Ok(())
     }
 
-    // ------------------------------------------------- predicate 提取（内部）
+    // ------------------------------------------------- predicate 编译
 
-    /// 谓词中 sym 条件 → 候选 sym id 集合。无法静态求值的部分回退为 All（行级过滤兜底）。
-    fn extract_sym_filter(&self, pred: Option<&Predicate>) -> Result<SymFilter, CoreError> {
-        match pred {
-            None => Ok(SymFilter::All),
-            Some(p) => self.sym_filter_of(p),
+    /// 编译谓词 → (sym_ids, time_lo, time_hi)。
+    ///
+    /// - `sym_ids: None` = 全部 sym；`Some(sorted_ids)` = 特定 sym 集合
+    /// - `time_lo / time_hi`：TIME AXIS index 窗口 `[lo, hi)`
+    /// - And → sym 交集 + time 窗口收窄
+    /// - Or → 仅 sym Eq 并集；其余回退
+    /// - Not / 无法静态求值 → 回退（行级过滤由上层兜底）
+    fn compile_predicate(
+        &self,
+        pred: Option<&Predicate>,
+    ) -> Result<(Option<Vec<u32>>, u64, u64), CoreError> {
+        let mut result = (None::<Vec<u32>>, 0u64, self.header.time_count as u64);
+        if let Some(p) = pred {
+            self.compile_node(p, &mut result)?;
         }
+        Ok(result)
     }
 
-    fn sym_filter_of(&self, pred: &Predicate) -> Result<SymFilter, CoreError> {
+    fn compile_node(
+        &self,
+        pred: &Predicate,
+        acc: &mut (Option<Vec<u32>>, u64, u64),
+    ) -> Result<(), CoreError> {
         match pred {
             Predicate::And(children) => {
-                // AND = 各子过滤的交集
-                let mut acc: Option<SymFilter> = None;
                 for c in children {
-                    let f = self.sym_filter_of(c)?;
-                    acc = Some(match acc {
-                        None => f,
-                        Some(a) => a.intersect(f),
-                    });
+                    self.compile_node(c, acc)?;
                 }
-                Ok(acc.unwrap_or(SymFilter::All))
+                Ok(())
             }
             Predicate::Or(children) => {
-                // OR = 并集；任一子项回退 All → 整体 All
-                let mut acc: Option<SymFilter> = None;
+                // Or：仅支持全为 sym Eq 的并集
+                let mut ids: Vec<u32> = Vec::new();
                 for c in children {
-                    let f = self.sym_filter_of(c)?;
-                    acc = Some(match acc {
-                        None => f,
-                        Some(a) => a.union(f),
-                    });
+                    match c {
+                        Predicate::Cmp {
+                            field: Some(f), op: CmpOp::Eq, value: Scalar::Str(s),
+                        } if f.as_ref() == "sym" => {
+                            if let Some(id) = self.sym_id_of(s)? {
+                                ids.push(id as u32);
+                            }
+                        }
+                        _ => return Ok(()), // 回退
+                    }
                 }
-                Ok(acc.unwrap_or(SymFilter::All))
-            }
-            Predicate::Not(_) => Ok(SymFilter::All),
-            Predicate::Cmp { field: Some(f), op: CmpOp::Eq, value: Scalar::Str(s) }
-                if f.as_ref() == "sym" =>
-            {
-                match self.sym_id_of(s)? {
-                    Some(id) => Ok(SymFilter::Ids(vec![id])),
-                    None => Ok(SymFilter::Ids(Vec::new())),
+                ids.sort_unstable();
+                // 并集合并到 acc
+                match &mut acc.0 {
+                    None => acc.0 = Some(ids),
+                    Some(existing) => {
+                        existing.extend(ids);
+                        existing.sort_unstable();
+                        existing.dedup();
+                    }
                 }
+                Ok(())
             }
-            Predicate::Cmp {
-                field: Some(f),
-                op: CmpOp::Eq | CmpOp::Ne,
-                value: Scalar::Str(_),
-            } if f.as_ref() == "sym" => Ok(SymFilter::All), // Ne / 不等式回退
-            _ => Ok(SymFilter::All),
-        }
-    }
-
-    /// 谓词中 time 条件 → 轴 index 窗口 `[lo, hi)`（AND 收窄；OR / NOT 回退全轴）。
-    fn extract_time_window(&self, pred: Option<&Predicate>) -> (u64, u64) {
-        let full = (0u64, self.header.time_count as u64);
-        match pred {
-            None => full,
-            Some(p) => self.time_window_of(p, full),
-        }
-    }
-
-    fn time_window_of(&self, pred: &Predicate, window: (u64, u64)) -> (u64, u64) {
-        let full = (0u64, self.header.time_count as u64);
-        match pred {
-            Predicate::And(children) => {
-                let mut acc = window;
-                for c in children {
-                    acc = self.time_window_of(c, acc);
-                }
-                acc
-            }
-            Predicate::Or(_) | Predicate::Not(_) => full,
-            Predicate::Cmp { field: Some(f), op, value }
-                if f.as_ref() == "time" =>
-            {
-                // 标量 → 轴 index：TIME AXIS 有序，二分定位
-                let v: u64 = match value {
-                    Scalar::Int(i) => *i as u64,
-                    Scalar::UInt(u) => *u,
-                    Scalar::Float(f) => *f as u64,
-                    _ => return window,
-                };
-                let lower = self.axis_lower_bound(v);
-                let upper = self.axis_lower_bound(v.saturating_add(1));
-                match op {
-                    CmpOp::Eq => (lower.max(window.0), upper.min(window.1)),
-                    CmpOp::Ge => (lower.max(window.0), window.1),
-                    CmpOp::Gt => (upper.max(window.0), window.1),
-                    CmpOp::Lt => (window.0, lower.min(window.1)),
-                    CmpOp::Le => (window.0, upper.min(window.1)),
-                    CmpOp::Ne => full,
+            Predicate::Not(_) => Ok(()),
+            Predicate::Cmp { field: Some(f), op, value } => {
+                if f.as_ref() == "sym" {
+                    if let (CmpOp::Eq, Scalar::Str(s)) = (op, value) {
+                        match self.sym_id_of(s)? {
+                            Some(id) => match &mut acc.0 {
+                                None => acc.0 = Some(vec![id as u32]),
+                                Some(existing) => existing.retain(|&e| e == id as u32),
+                            },
+                            None => acc.0 = Some(Vec::new()), // 不存在 → 空集
+                        }
+                    }
+                    Ok(())
+                } else if f.as_ref() == "time" {
+                    let v: u64 = match value {
+                        Scalar::Int(i) => *i as u64,
+                        Scalar::UInt(u) => *u,
+                        Scalar::Float(f) => *f as u64,
+                        _ => return Ok(()),
+                    };
+                    let lower = self.axis_lower_bound(v);
+                    let upper = self.axis_lower_bound(v.saturating_add(1));
+                    match op {
+                        CmpOp::Eq => { acc.1 = acc.1.max(lower); acc.2 = acc.2.min(upper); }
+                        CmpOp::Ge => { acc.1 = acc.1.max(lower); }
+                        CmpOp::Gt => { acc.1 = acc.1.max(upper); }
+                        CmpOp::Le => { acc.2 = acc.2.min(upper); }
+                        CmpOp::Lt => { acc.2 = acc.2.min(lower); }
+                        CmpOp::Ne => {}
+                    }
+                    Ok(())
+                } else {
+                    Ok(())
                 }
             }
-            _ => window,
+            _ => Ok(()),
         }
     }
 
@@ -680,35 +708,7 @@ impl MetaHandle {
     }
 }
 
-#[derive(Debug, Clone)]
-enum SymFilter {
-    All,
-    Ids(Vec<u32>),
-}
 
-impl SymFilter {
-    fn intersect(self, other: SymFilter) -> SymFilter {
-        match (self, other) {
-            (SymFilter::All, f) | (f, SymFilter::All) => f,
-            (SymFilter::Ids(a), SymFilter::Ids(b)) => {
-                SymFilter::Ids(a.into_iter().filter(|x| b.contains(x)).collect())
-            }
-        }
-    }
-
-    fn union(self, other: SymFilter) -> SymFilter {
-        match (self, other) {
-            (SymFilter::All, _) | (_, SymFilter::All) => SymFilter::All,
-            (SymFilter::Ids(a), SymFilter::Ids(b)) => {
-                let mut ids = a;
-                ids.extend(b);
-                ids.sort_unstable();
-                ids.dedup();
-                SymFilter::Ids(ids)
-            }
-        }
-    }
-}
 
 /// META 自身结构化信息（`read_meta_handle` 返回）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -721,16 +721,7 @@ pub struct MetaInfo {
     pub row_count: u32,
 }
 
-/// 由 keys + 字典段组装 Utf8 字典列视图（keys 需已物化）。
-fn dict_column_view<'a>(
-    keys: BufferView<'a>,
-    dict_offsets: BufferView<'a>,
-    dict_strings: BufferView<'a>,
-    rows: usize,
-) -> Result<ColumnView<'a>, CoreError> {
-    let seg = ColumnSegment::new_dict(keys, dict_offsets, dict_strings, None, rows)?;
-    ColumnView::new(DataType::Utf8, vec![seg]).map_err(CoreError::from)
-}
+
 
 /// Index Scanner：逐个返回满足 SYM / TIME 条件的 FIELD row range（`next()` 一次一个）。
 pub struct IndexScanner {
