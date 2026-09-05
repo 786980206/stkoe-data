@@ -3,9 +3,10 @@
 ## 1. 定位
 
 `splayed-arrow` 是共享转换工具：把 core 的内存数据模型（`Column` / `ColumnView` /
-`Data` / `DataView`）映射为 Arrow 数组与 RecordBatch，供 DataFusion / DuckDB / Polars /
-ADBC 等适配层复用。依赖 `splayed-format`、`splayed-core` 与 arrow-rs（与 bench 的
-parquet 56 对齐，arrow-array/buffer/schema 56）。
+`Data` / `DataView`）映射为 Arrow 数组与 RecordBatch，供上层 Arrow 适配层
+（DuckDB / DataFusion / ADBC，见循环 7c / 7d）复用。依赖 `splayed-format`、
+`splayed-core` 与 arrow-rs（与 bench 的 parquet 56 对齐，arrow-array/buffer/schema 56）；
+Polars 适配层自带 arrowconv，不经此 crate。
 
 - 依赖方向：`format ← codec ← core ← arrow`；arrow 不反向依赖任何适配层。
 - 不触碰磁盘格式；一切输入来自 core 的内存表示。
@@ -95,14 +96,3 @@ impl<'t> TableArrowReader<'t> {
   是否含 NULL 变化。
 - 类型映射统一入口：`to_arrow_type` / `from_arrow_type`（Layer 1 / 2 / 反向共用，
   不复制映射逻辑）。
-
-## 6. 与 V1.0 能力对照
-
-| V1.0 能力 | V2.0 对应 | 状态 |
-| --- | --- | --- |
-| CoreBatch → Arrow 零拷贝 | `data_to_record_batch`（拷贝级 + Arc 兼容设计为优化路径） | ✅（拷贝级） |
-| NULL / NaN 语义保留 | validity bitmap 直接映射（无哨兵概念） | ✅ |
-| 类型映射 0–13 | 类型映射表（+UTF8 字典） | ✅ |
-| ArrayRef/RecordBatch 输出 | 同 | ✅ |
-| Arrow → core（写路径） | `record_batch_to_data` | ✅ 新增 |
-| Table 端到端 Arrow 流 | `read_table_as_arrow` → `TableArrowReader`（流式，不物化） | ✅ 新增 |
