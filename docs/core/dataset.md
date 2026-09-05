@@ -119,15 +119,22 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
 ```
 1. path.is_dir() 校验
 2. MetaHandle::open(path/.meta)  →  File::open + Mmap::map + header 校验
-3. build_schema(path, time_type)  →  read_dir 列出字段名（跳过 . 和 .tmp）
-                                    →  逐 field File::open + read 64B header → data_type
-4. 构造 DatasetHandle { meta, schema, fields: RefCell<HashMap>, mode }
+3. build_schema(path, time_type)  →  read_dir 列出字段名（过滤 starts_with('.') 与 *.tmp）
+                                    →  names.sort() → 逐 field File::open + read_exact 64B header → data_type
+4. 构造 DatasetHandle { meta, schema, fields: RefCell<HashMap>（空）, mode }
 ```
-- 不预打开 Field Handle——按需打开（首次访问时 ensure_field）
-- open 成本 = META mmap + N 次 field header 读取（N = 字段数）
 
-**说明**：
-- Schema 直接从返回的 DatasetHandle 获取（`read_dataset_schema`），不另设 `get_dataset_schema()`。
+**说明**（open_dataset 优化原则）：
+- 只打开 META，不打开 Field Handle——Field 全部 lazy open：`fields` 缓存初始为空，
+  `ensure_field` 首次 read/write/scan 访问时才 `open_field_file`。
+- Schema 只读取 Field Header（逐字段 64B `read_exact`，无 mmap、不读数据区）。
+- Schema 缓存到 `DatasetHandle`，open 后 `read_dataset_schema` 不再扫描目录；
+  Field 结构操作（create / delete / rename / cast）同步更新缓存。
+- 不引入并行参数：Field header I/O 很轻（N 次 64B 顺序读），并行没有收益。
+- 过滤 `starts_with('.') || ends_with(".tmp")`：比原则更宽——覆盖 `.meta`、`.meta.tmp`、
+  cast 的 `.cast.{pid}.{n}.tmp` 及一切隐藏文件；字段名排序保证 Schema 顺序确定。
+- 保持轻量化：open 全程零数据 I/O，mmap 与数据读取延迟到首次 read / write / scan。
+- 目录中混入非 Field 的非隐藏文件 / 子目录时 header 读取直接报错（fail-loud，符合目录布局契约）。
 
 ### 7.6 delete_dataset
 
