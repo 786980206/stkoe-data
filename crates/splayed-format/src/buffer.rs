@@ -30,6 +30,14 @@ impl Buffer {
         Buffer { raw, offset, len, alignment }
     }
 
+    /// 分配对齐区域并拷入字节（空数据给出空缓冲）。
+    pub fn zeroed_aligned_bytes(bytes: Vec<u8>, alignment: usize) -> Self {
+        let len = bytes.len();
+        let mut buf = Buffer::zeroed_aligned(len, alignment);
+        buf.as_mut_slice().copy_from_slice(&bytes);
+        buf
+    }
+
     /// 以拷贝方式从 typed 连续数据构造（Data 物化边界的预期拷贝）。
     pub fn from_slice_copy<T: bytemuck::NoUninit>(values: &[T]) -> Self {
         let bytes: &[u8] = bytemuck::cast_slice(values);

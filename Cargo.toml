@@ -5,6 +5,7 @@ members = [
     "crates/splayed-codec",
     "crates/splayed-core",
     "crates/splayed-table",
+    "crates/splayed-arrow",
 ]
 # V1 遗留 crate（V1.0 分支归档，待 2.0 模块对齐阶段重新设计后回归）
 exclude = [

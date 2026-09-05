@@ -1,457 +1,233 @@
-//! Integration tests: create_table → read → update_table → compact_field
-//! → delete_field, plus error-path tests.
+//! splayed-arrow 集成测试：类型映射、NULL 保留、字典列、端到端 Table → Arrow。
 
-use std::fs;
-use std::sync::Arc;
-
-use arrow_array::{
-    Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+use splayed_arrow::{
+    column_to_arrow, data_to_record_batch, data_view_to_batch, from_arrow_type,
+    record_batch_to_data, scan_to_arrow, to_arrow_type,
 };
-use arrow_schema::{DataType as ArrowDT, Field, Schema};
-use splayed_arrow::{create_meta, create_table, update_table};
-use splayed_core::{
-    compact_field, delete_field, open_dataset, FieldReader, UpdateError, UpdateItem,
+use splayed_core::{create_dataset, Mode};
+use arrow_array::Array as _;
+use std::path::Path;
+use splayed_core::{open_dataset as open_dataset_inner};
+use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
+
+fn open_dataset(root: &Path, mode: splayed_core::Mode) -> splayed_core::Result<splayed_core::DatasetHandle> {
+    open_dataset_inner(root, mode)
+}
+fn cleanup(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+use splayed_table::{
+    create_table, open_table, TableOptions, TableScanRequest,
 };
-use splayed_format::{Compression, DataType, RawValue};
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+fn temp_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("splayed_arrow_{}_{}", name, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
 
-fn make_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("time", ArrowDT::Date32, false),
-        Field::new("sym", ArrowDT::Utf8, false),
-        Field::new("close", ArrowDT::Float64, true),
-        Field::new("volume", ArrowDT::Int64, true),
-    ]));
-
-    // SYM01: days 0,1,2   close = 100.0, 101.0, 102.0   vol = 1000, 2000, 3000
-    // SYM02: days 0,1,2   close = 200.0, NULL, 202.0     vol = NULL, 5000, 6000
-    let time = Date32Array::from(vec![0, 1, 2, 0, 1, 2]);
-    let sym = StringArray::from(vec![
-        Some("SYM01"), Some("SYM01"), Some("SYM01"),
-        Some("SYM02"), Some("SYM02"), Some("SYM02"),
-    ]);
-    let close = Float64Array::from(vec![
-        Some(100.0), Some(101.0), Some(102.0),
-        Some(200.0), None, Some(202.0),
-    ]);
-    let volume = Int64Array::from(vec![
-        Some(1000), Some(2000), Some(3000),
-        None, Some(5000), Some(6000),
-    ]);
-
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(time),
-            Arc::new(sym),
-            Arc::new(close),
-            Arc::new(volume),
-        ],
+fn sample_data() -> Data {
+    // sym 字典列 + 定宽列（含 NULL）
+    let mut bits = Bitmap::ones(4);
+    bits.set(2, false); // price 第 3 行 NULL
+    let sym_col = Column::from_dict(
+        vec![0, 0, 1, 1],
+        vec![0, 4, 8],
+        b"AAPLMSFT".to_vec(),
+        None,
+    );
+    let time_col = Column {
+        data_type: DataType::Date32,
+        values: Buffer::from_slice_copy(&[100i32, 101, 100, 101]),
+        validity: None,
+        dict: None,
+    };
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&[10.0f64, 11.0, 0.0, 21.0]),
+        validity: Some(bits),
+        dict: None,
+    };
+    Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+            FieldSchema::new("price", DataType::Float64),
+        ]),
+        vec![sym_col, time_col, price_col],
     )
     .unwrap()
 }
 
-fn temp_dir(suffix: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("splayed_test_{suffix}_{}", std::process::id()))
-}
-
-// ---------------------------------------------------------------------------
-// Core roundtrip tests
-// ---------------------------------------------------------------------------
-
 #[test]
-fn create_table_and_read_back() {
-    let dir = temp_dir("crt");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    // Verify .meta and field files exist.
-    assert!(dir.join(".meta").exists(), ".meta file should exist");
-    assert!(dir.join("close").exists(), "close field should exist");
-    assert!(dir.join("volume").exists(), "volume field should exist");
-
-    // Open dataset and verify structure.
-    let dataset = open_dataset(&dir).expect("open_dataset failed");
-    assert_eq!(dataset.meta.symbols, vec!["SYM01", "SYM02"]);
-    assert_eq!(dataset.meta.sym_index.len(), 2);
-    assert_eq!(dataset.meta.sym_index[0].time_count, 3);
-    assert_eq!(dataset.meta.sym_index[0].row_start, 0);
-    assert_eq!(dataset.meta.sym_index[1].time_count, 3);
-    assert_eq!(dataset.meta.sym_index[1].row_start, 3);
-    assert_eq!(dataset.meta.total_rows(), 6);
-
-    // Read close field.
-    let reader = FieldReader::open(dir.join("close")).expect("open close reader failed");
-    assert_eq!(reader.data_type(), DataType::Float64);
-    assert_eq!(reader.row_count(), 6);
-
-    assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(100.0));
-    assert_eq!(reader.read_row(1).unwrap().as_f64(), Some(101.0));
-    assert_eq!(reader.read_row(2).unwrap().as_f64(), Some(102.0));
-    assert_eq!(reader.read_row(3).unwrap().as_f64(), Some(200.0));
-    assert!(reader.read_row(4).unwrap().is_null());
-    assert_eq!(reader.read_row(5).unwrap().as_f64(), Some(202.0));
-
-    // Read volume field.
-    let reader = FieldReader::open(dir.join("volume")).expect("open volume reader failed");
-    assert_eq!(reader.data_type(), DataType::Int64);
-    assert_eq!(reader.read_row(0).unwrap().as_i64(), Some(1000));
-    assert_eq!(reader.read_row(1).unwrap().as_i64(), Some(2000));
-    assert_eq!(reader.read_row(2).unwrap().as_i64(), Some(3000));
-    assert!(reader.read_row(3).unwrap().is_null());
-    assert_eq!(reader.read_row(4).unwrap().as_i64(), Some(5000));
-    assert_eq!(reader.read_row(5).unwrap().as_i64(), Some(6000));
-
-    let fields = dataset.list_fields().unwrap();
-    assert_eq!(fields, vec!["close", "volume"]);
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn update_table_modifies_values() {
-    let dir = temp_dir("upd");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("time", ArrowDT::Date32, false),
-        Field::new("sym", ArrowDT::Utf8, false),
-        Field::new("close", ArrowDT::Float64, true),
-    ]));
-    let update_batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Date32Array::from(vec![0, 1, 2])),
-            Arc::new(StringArray::from(vec![Some("SYM01"), Some("SYM01"), Some("SYM01")])),
-            Arc::new(Float64Array::from(vec![Some(500.0), Some(501.0), Some(502.0)])),
-        ],
-    )
-    .unwrap();
-
-    update_table(&dir, &update_batch, true, false).expect("update_table failed");
-
-    let reader = FieldReader::open(dir.join("close")).expect("open reader failed");
-    assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(500.0));
-    assert_eq!(reader.read_row(1).unwrap().as_f64(), Some(501.0));
-    assert_eq!(reader.read_row(2).unwrap().as_f64(), Some(502.0));
-    // SYM02 unchanged.
-    assert_eq!(reader.read_row(3).unwrap().as_f64(), Some(200.0));
-    assert!(reader.read_row(4).unwrap().is_null());
-    assert_eq!(reader.read_row(5).unwrap().as_f64(), Some(202.0));
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn read_range_raw_is_zero_copy_slice() {
-    let dir = temp_dir("range");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let reader = FieldReader::open(dir.join("close")).expect("open reader failed");
-    let slice = reader.read_range_raw(0, 3).expect("read_range_raw failed");
-    assert_eq!(slice.len(), 3 * 8);
-
-    let v0 = RawValue::read_le(slice, 0, DataType::Float64);
-    assert_eq!(v0.as_f64(), Some(100.0));
-    let v1 = RawValue::read_le(slice, 8, DataType::Float64);
-    assert_eq!(v1.as_f64(), Some(101.0));
-    let v2 = RawValue::read_le(slice, 16, DataType::Float64);
-    assert_eq!(v2.as_f64(), Some(102.0));
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-// ---------------------------------------------------------------------------
-// compact_field test
-// ---------------------------------------------------------------------------
-
-#[test]
-fn compact_field_then_decompress() {
-    let dir = temp_dir("compact");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let close_path = dir.join("close");
-
-    // Verify it's writable (NONE) before compaction.
-    {
-        let reader = FieldReader::open(&close_path).unwrap();
-        assert_eq!(reader.header().compression(), Ok(Compression::None));
-        assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(100.0));
-    } // reader (mmap) dropped here — file can be written on Windows.
-
-    // Compact with ZSTD.
-    compact_field(&close_path, Compression::Zstd).expect("compact_field failed");
-
-    // After compaction, header compression should be Zstd.
-    // We can't use FieldReader's read_row on compressed data (it assumes NONE),
-    // but we can decompress via the codec API.
-    use splayed_core::decompress_field_data;
-    let decompressed = decompress_field_data(&close_path).expect("decompress failed");
-
-    // Verify values are intact after decompression.
-    let v0 = RawValue::read_le(&decompressed, 0, DataType::Float64);
-    assert_eq!(v0.as_f64(), Some(100.0));
-    let v5 = RawValue::read_le(&decompressed, 5 * 8, DataType::Float64);
-    assert_eq!(v5.as_f64(), Some(202.0));
-
-    // Verify file structure (header + compressed payload).
-    let compressed_size = fs::metadata(&close_path).unwrap().len();
-    // Header(64) + 8 (uncompressed_len prefix) + compressed payload.
-    assert!(compressed_size > HEADER_SIZE_BYTES);
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn compact_field_lz4_then_decompress() {
-    let dir = temp_dir("compact_lz4");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let close_path = dir.join("close");
-
-    // Drop any reader before compacting (Windows mmap).
-    {
-        let _reader = FieldReader::open(&close_path).unwrap();
+fn type_mapping_roundtrip() {
+    // 正向：全部定宽类型 + Utf8
+    for (dt, expected) in [
+        (DataType::Bool, arrow_schema::DataType::Boolean),
+        (DataType::Int64, arrow_schema::DataType::Int64),
+        (DataType::UInt8, arrow_schema::DataType::UInt8),
+        (DataType::Float64, arrow_schema::DataType::Float64),
+        (DataType::Date32, arrow_schema::DataType::Date32),
+        (
+            DataType::TimestampUs,
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        ),
+        (
+            DataType::Utf8,
+            arrow_schema::DataType::Dictionary(
+                Box::new(arrow_schema::DataType::Int32),
+                Box::new(arrow_schema::DataType::Utf8),
+            ),
+        ),
+    ] {
+        assert_eq!(to_arrow_type(dt), expected);
+        assert_eq!(from_arrow_type(&expected).unwrap(), dt);
     }
-
-    // Compact with LZ4.
-    compact_field(&close_path, Compression::Lz4).expect("compact_field LZ4 failed");
-
-    // Decompress and verify values.
-    use splayed_core::decompress_field_data;
-    let decompressed = decompress_field_data(&close_path).expect("decompress LZ4 failed");
-
-    let v0 = RawValue::read_le(&decompressed, 0, DataType::Float64);
-    assert_eq!(v0.as_f64(), Some(100.0));
-    let v5 = RawValue::read_le(&decompressed, 5 * 8, DataType::Float64);
-    assert_eq!(v5.as_f64(), Some(202.0));
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-const HEADER_SIZE_BYTES: u64 = 64;
-
-// ---------------------------------------------------------------------------
-// delete_field test
-// ---------------------------------------------------------------------------
-
-#[test]
-fn delete_field_removes_file() {
-    let dir = temp_dir("delete");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    assert!(dir.join("close").exists());
-    assert!(dir.join("volume").exists());
-
-    // Delete close.
-    delete_field(dir.join("close")).expect("delete_field failed");
-    assert!(!dir.join("close").exists(), "close should be deleted");
-    assert!(dir.join("volume").exists(), "volume should still exist");
-
-    // Delete again — should be no-op (not an error).
-    delete_field(dir.join("close")).expect("delete_field idempotent");
-
-    // Delete non-existent file — no-op.
-    delete_field(dir.join("nonexistent")).expect("delete nonexistent no-op");
-
-    // Verify remaining fields.
-    let dataset = open_dataset(&dir).expect("open_dataset failed");
-    let fields = dataset.list_fields().unwrap();
-    assert_eq!(fields, vec!["volume"]);
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-// ---------------------------------------------------------------------------
-// create_meta standalone test
-// ---------------------------------------------------------------------------
-
-#[test]
-fn create_meta_standalone() {
-    let dir = temp_dir("metaonly");
-    let _ = fs::remove_dir_all(&dir);
-
-    // Batch with only TIME + SYM (no FIELD columns).
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("time", ArrowDT::Date32, false),
-        Field::new("sym", ArrowDT::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Date32Array::from(vec![0, 1, 2, 0, 1])),
-            Arc::new(StringArray::from(vec![
-                Some("AAPL"), Some("AAPL"), Some("AAPL"),
-                Some("MSFT"), Some("MSFT"),
-            ])),
-        ],
-    )
-    .unwrap();
-
-    let meta = create_meta(&dir, &batch, true).expect("create_meta failed");
-
-    assert!(dir.join(".meta").exists());
-    assert_eq!(meta.symbols, vec!["AAPL", "MSFT"]);
-    assert_eq!(meta.time_axis, vec![0, 1, 2]);
-    // AAPL: days 0,1,2 → time_start=0, time_count=3
-    assert_eq!(meta.sym_index[0].time_start, 0);
-    assert_eq!(meta.sym_index[0].time_count, 3);
-    // MSFT: days 0,1 → time_start=0, time_count=2
-    assert_eq!(meta.sym_index[1].time_start, 0);
-    assert_eq!(meta.sym_index[1].time_count, 2);
-    assert_eq!(meta.total_rows(), 5);
-
-    // Now we can create_field on this dataset.
-    use splayed_core::create_field;
-    create_field(dir.join("price"), DataType::Float64).expect("create_field after create_meta");
-    assert!(dir.join("price").exists());
-
-    // Verify it's all NULL.
-    let reader = FieldReader::open(dir.join("price")).unwrap();
-    assert_eq!(reader.row_count(), 5);
-    for i in 0..5 {
-        assert!(reader.read_row(i).unwrap().is_null(), "row {i} should be NULL");
-    }
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-// ---------------------------------------------------------------------------
-// Error path tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn update_field_out_of_range_rejected() {
-    let dir = temp_dir("oor");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let close_path = dir.join("close");
-    // total_rows = 6 (3 SYM01 + 3 SYM02)
-
-    // Try writing past the end: start_row=5, 2 values → [5,7) exceeds 6.
-    let item = UpdateItem::new(5, vec![0u8; 16]); // 2 Float64 values
-    let result = splayed_core::update_field(&close_path, &[item]);
-    assert!(matches!(result, Err(UpdateError::OutOfRange { .. })));
-
-    // Valid: start_row=5, 1 value → [5,6) is within bounds.
-    let item = UpdateItem::new(5, vec![0u8; 8]); // 1 Float64
-    let result = splayed_core::update_field(&close_path, &[item]);
-    assert!(result.is_ok());
-
-    fs::remove_dir_all(&dir).ok();
+    // 不支持的 Arrow 类型 → Error
+    assert!(from_arrow_type(&arrow_schema::DataType::Binary).is_err());
 }
 
 #[test]
-fn update_after_compact_rejected() {
-    let dir = temp_dir("ro_after_compact");
-    let _ = fs::remove_dir_all(&dir);
+fn data_to_arrow_preserves_values_and_nulls() {
+    let data = sample_data();
+    let batch = data_to_record_batch(&data).unwrap();
+    assert_eq!(batch.num_rows(), 4);
+    assert_eq!(batch.num_columns(), 3);
 
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
+    // NULL：price 第 3 行（index 2）为 null
+    let price = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    assert!(price.is_null(2));
+    assert_eq!(price.value(0), 10.0);
 
-    let close_path = dir.join("close");
+    // 字典列：sym 值保持
+    let sym = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow_array::DictionaryArray<arrow_array::types::Int32Type>>()
+        .unwrap();
+    let keys = sym.keys();
+    assert!(!keys.is_null(0));
+    assert_eq!(keys.value(0), keys.value(1)); // AAPL AAPL
 
-    // Compact → read-only.
-    compact_field(&close_path, Compression::Zstd).expect("compact_field failed");
-
-    // Attempt to update should be rejected.
-    let item = UpdateItem::new(0, vec![0u8; 8]);
-    let result = splayed_core::update_field(&close_path, &[item]);
-    assert!(
-        matches!(result, Err(UpdateError::ReadOnlyAfterCompress)),
-        "expected ReadOnlyAfterCompress, got: {result:?}"
+    // 反向：RecordBatch → Data → 值一致
+    let back = record_batch_to_data(&batch).unwrap();
+    assert_eq!(back.length(), 4);
+    assert_eq!(back.schema.data_type_of("price"), Some(DataType::Float64));
+    let price_back = back.column("price").unwrap();
+    assert_eq!(price_back.null_count(), 1);
+    assert!(!price_back.validity.as_ref().unwrap().is_valid(2));
+    assert_eq!(
+        f64::from_le_bytes(price_back.values.as_slice()[0..8].try_into().unwrap()),
+        10.0
     );
-
-    fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn read_row_out_of_range_rejected() {
-    let dir = temp_dir("read_oor");
-    let _ = fs::remove_dir_all(&dir);
-
-    let batch = make_batch();
-    create_table(&dir, &batch, true).expect("create_table failed");
-
-    let reader = FieldReader::open(dir.join("close")).unwrap();
-    // row_count = 6, row 6 is out of range.
-    let result = reader.read_row(6);
-    assert!(result.is_err());
-
-    // read_range_raw with too many rows.
-    let result = reader.read_range_raw(0, 7);
-    assert!(result.is_err());
-
-    fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn unsorted_input_produces_correct_meta() {
-    let dir = temp_dir("unsorted");
-    let _ = fs::remove_dir_all(&dir);
-
-    // Deliberately unsorted input.
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("time", ArrowDT::Date32, false),
-        Field::new("sym", ArrowDT::Utf8, false),
-        Field::new("close", ArrowDT::Float64, true),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema,
+fn multi_segment_view_to_batch() {
+    // 同一列的两个段（模拟跨 chunk / 跨分区拼接）
+    let a = Buffer::from_vec(bytemuck::cast_slice::<f64, u8>(&[1.0, 2.0]).to_vec());
+    let b = Buffer::from_vec(bytemuck::cast_slice::<f64, u8>(&[3.0]).to_vec());
+    let view = splayed_format::ColumnView::new(
+        DataType::Float64,
         vec![
-            Arc::new(Date32Array::from(vec![2, 0, 1, 0])),  // unsorted time
-            Arc::new(StringArray::from(vec![Some("MSFT"), Some("AAPL"), Some("AAPL"), Some("MSFT")])),  // unsorted sym
-            Arc::new(Float64Array::from(vec![Some(302.0), Some(100.0), Some(101.0), Some(300.0)])),
+            splayed_format::ColumnSegment::new(
+                DataType::Float64,
+                splayed_format::BufferView::from_buffer(&a),
+                None,
+                2,
+            )
+            .unwrap(),
+            splayed_format::ColumnSegment::new(
+                DataType::Float64,
+                splayed_format::BufferView::from_buffer(&b),
+                None,
+                1,
+            )
+            .unwrap(),
         ],
     )
     .unwrap();
+    let arr = splayed_arrow::column_view_to_arrow(&view).unwrap();
+    let arr = arr
+        .as_any()
+        .downcast_ref::<arrow_array::Float64Array>()
+        .unwrap();
+    assert_eq!(arr.values(), &[1.0, 2.0, 3.0]);
+    let _ = data_view_to_batch; // API 存在性
+}
 
-    // sorted=false → builder will sort internally.
-    create_table(&dir, &batch, false).expect("create_table with unsorted input");
+#[test]
+fn table_scan_to_arrow_end_to_end() {
+    let dir = temp_dir("e2e");
+    let root = dir.join("tbl");
+    let data = sample_data();
+    create_table(&root, data.clone(), splayed_table::PartitionScheme::None).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+    let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
+    assert!(!batches.is_empty());
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 4);
 
-    let dataset = open_dataset(&dir).expect("open_dataset failed");
-    // Symbols should be sorted.
-    assert_eq!(dataset.meta.symbols, vec!["AAPL", "MSFT"]);
+    // 经 parquet 写读对照（能力对齐验证：Arrow 生态互通）
+    use arrow_array::RecordBatchWriter;
+    let file = std::fs::File::create(dir.join("out.parquet")).unwrap();
+    let mut writer = parquet::arrow::ArrowWriter::try_new(
+        file,
+        batches[0].schema(),
+        None,
+    )
+    .unwrap();
+    for b in &batches {
+        writer.write(b).unwrap();
+    }
+    writer.close().unwrap();
+    let file = std::fs::File::open(dir.join("out.parquet")).unwrap();
+    let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .unwrap()
+        .build()
+        .unwrap();
+    let total: usize = reader.map(|b| b.unwrap().num_rows()).sum();
+    assert_eq!(total, 4);
 
-    // AAPL: days 0,1 → time_start=0, time_count=2
-    assert_eq!(dataset.meta.sym_index[0].time_start, 0);
-    assert_eq!(dataset.meta.sym_index[0].time_count, 2);
-    // MSFT: days 0,2 → time_start=0, time_count=3 (interval [0,2])
-    assert_eq!(dataset.meta.sym_index[1].time_start, 0);
-    assert_eq!(dataset.meta.sym_index[1].time_count, 3);
+    // core 读回验证
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+    assert_eq!(ds.read_dataset_statistics().unwrap().row_count, 4);
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
 
-    // Verify values landed in correct rows.
-    // AAPL row 0 = day 0 = 100.0, AAPL row 1 = day 1 = 101.0
-    // MSFT row 2 = day 0 = 300.0, MSFT row 3 = day 1 = NULL, MSFT row 4 = day 2 = 302.0
-    let reader = FieldReader::open(dir.join("close")).unwrap();
-    assert_eq!(reader.read_row(0).unwrap().as_f64(), Some(100.0)); // AAPL day 0
-    assert_eq!(reader.read_row(1).unwrap().as_f64(), Some(101.0)); // AAPL day 1
-    assert_eq!(reader.read_row(2).unwrap().as_f64(), Some(300.0)); // MSFT day 0
-    assert!(reader.read_row(3).unwrap().is_null());                 // MSFT day 1 (NULL)
-    assert_eq!(reader.read_row(4).unwrap().as_f64(), Some(302.0)); // MSFT day 2
+#[test]
+fn multi_segment_view_to_batch_and_table_e2e() {
+    // 多段（跨分区 batch 聚合）→ 单 Arrow 批
+    let dir = temp_dir("e2e_multi");
+    let root = dir.join("tbl");
+    create_table(&root, sample_data(), splayed_table::PartitionScheme::None).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+    let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
+    // 单 Dataset 全表扫描 = 单一连续 range → batch 聚合消费整个 range → 一批
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 4);
+    for b in &batches {
+        assert_eq!(b.num_columns(), 3);
+    }
+    drop(table);
+    cleanup(&dir);
+}
 
-    fs::remove_dir_all(&dir).ok();
+#[test]
+fn column_to_arrow_direct() {
+    let col = Column::zeroed(DataType::TimestampUs, 3, false);
+    let arr = column_to_arrow(&col).unwrap();
+    let arr = arr
+        .as_any()
+        .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(arr.len(), 3);
+    assert_eq!(arr.values(), &[0i64; 3]);
 }

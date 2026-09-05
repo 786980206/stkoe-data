@@ -1016,6 +1016,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
+name = "splayed-arrow"
+version = "0.2.0"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-schema",
+ "arrow-select",
+ "bytemuck",
+ "parquet",
+ "splayed-core",
+ "splayed-format",
+ "splayed-table",
+]
+
+[[package]]
 name = "splayed-codec"
 version = "0.2.0"
 dependencies = [
