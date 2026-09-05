@@ -55,3 +55,7 @@ close()  -> Result<()>           // 任何时刻可安全调用
   `row_start + time_start + time_count`；轴定位二分（无哈希表），span == 数据行数构建期校验。
 - 结构操作流式：close（compressed 收尾）/ cast / compress / decompress 均 tmp 顺序写 + `sync_all`
   后原子 rename，内存 O(批次 / 单个 chunk)，不全量物化、不全量解压；失败清理 tmp，原文件保持不变。
+- Dataset 三阶段并发模型：主线程完成校验 + `ensure_field`（缓存管理永不进入并行热路径）
+  → Field 级并行只做纯 I/O（`std::thread::scope` round-robin 分桶：write_dataset 总字节 ≥ 1 MiB、
+  scan_dataset 候选 ≥ 64K 行才并行，小负载走串行快路径）→ 主线程收尾（求交 / 合并 / 组装）；
+  `read_dataset` 为纯零拷贝切片恒单线程；并行度 `max_parallelism` 由最上层控制。

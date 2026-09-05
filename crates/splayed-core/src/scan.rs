@@ -65,7 +65,8 @@ pub fn clamp_ranges(ranges: &[RowRange], bound: u64) -> Vec<RowRange> {
 /// 扫描请求（docs/splayed-core.md §3.4）。
 ///
 /// - `ranges`：候选行范围（空 = 整个空间）；Dataset 级为逻辑行，Field 级为物理行（网格下等价）；
-/// - `projection`：仅 Dataset 级有效（Field / META 是单列 / 两列扫描）；
+/// - `projection`：预留字段——core 扫描路径（scan_index / scan_field / scan_dataset）
+///   不消费它，参与谓词求值的字段由谓词自身决定；读取列集由 read_dataset 的 `columns` 表达；
 /// - `limit`：最多产生的匹配行数，可提前结束；
 /// - 不含 `batch_size`：Scanner 一次 `next()` 只产出一个连续 RowRange，batch 聚合是 Reader 层职责。
 #[derive(Debug, Clone, Default)]

@@ -27,9 +27,9 @@
 
 已知优化项（当前实现为正确性优先的简化，行为符合本文档语义）：
 
-- compressed Field 打开即**全量解压**为工作表示；chunk 级惰性解码（只解码覆盖请求范围的 chunk）待实现。
+- compressed Field 打开即**全量解压**为工作表示；chunk 级惰性解码（只解码覆盖请求范围的 chunk）待实现——它同时是 `read_dataset` 引入 Field 级并行的前提（见 §9 read_dataset 单线程结论）。
 - ~~谓词求值逐行 `read_row_scalar` 标量分发~~ → 已解决：类型化批量比较循环 + 字节掩码 + word 级命中区提取（显式 SIMD intrinsics 仍为可选后续项）。
-- Handle 的 scratch 缓冲逐次累积（视图生命周期契约要求），长生命周期高频读场景的回收策略待定。
+- ~~Handle 的 scratch 缓冲逐次累积~~ → 已消除：读路径不再存在 scratch——uncompressed 直接切 mmap、compressed 切 working、META sym 列为 RepeatDict 零物化段，全部视图直接指向底层缓冲。
 - ~~`read_index_handle` 的 sym keys 逐行物化~~ → 已解决：`RepeatDict` 段（零存储）替代 keys 物化，scratch arena 已移除。
 
 ## 10. Benchmark vs Parquet
@@ -67,7 +67,13 @@
 - Dataset 层阶段计时（release profiler，64K 行）：`read_dataset` 483 µs、`scan_dataset` 谓词 685 µs、
   `create_table`（单分区）7.0 ms、`create_table`（12 月分区）44.6 ms、compress 13.8 ms、
   decompress 11.5 ms。
+- 后续增量：`create_dataset` 并行化（META 先行 + Field 并行创建 + 零拷贝列移动，
+  c864833）后写入中位 102 → 82 ms（≈ -19.5%）；`write_dataset` / `scan_dataset` 的
+  Field 级并行与小写快路径（6d3b809）已落地，对端到端建表的进一步收益取决于
+  Table 层跨分区并行（见下）。
 
 结论与定位：读取侧已反超 parquet（全表 2.0×、谓词 2.2×），谓词向量化已从「已知优化项」兑现；
-**写入是当前唯一显著落后项（≈ 4.2×）**，开销集中在每分区文件创建 / MetaBuilder / gather——
-下一优先级是写入路径批量化与并行化；chunk 级惰性解码与 scratch 回收仍为后续项。
+**写入是当前唯一显著落后项**——剩余瓶颈集中在 create_table 跨分区串行创建 / gather /
+MetaBuilder × 12，下一优先级是 Table 层 `create_table` 跨分区并行
+（`TableOptions.max_parallelism` 旋钮已下沉到 DatasetHandle，可直接复用）；
+chunk 级惰性解码（读路径 Field 级并行的前提）仍为后续项。

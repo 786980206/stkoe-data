@@ -10,7 +10,9 @@ use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeTy
 
 use crate::partition::{partition_name, partition_range, PartitionScheme};
 
-/// Table Options：`max_parallelism` 限制 Table 内部并行度上限（实现细节，v1 顺序执行）。
+/// Table Options：`max_parallelism` 下沉为每个 Partition `DatasetHandle` 的 Field 级
+/// 并行上限（驱动 write_dataset / scan_dataset 的并行分桶）；create_table 跨分区
+/// 创建目前仍为顺序执行。
 #[derive(Debug, Clone, Default)]
 pub struct TableOptions {
     pub max_parallelism: Option<usize>,

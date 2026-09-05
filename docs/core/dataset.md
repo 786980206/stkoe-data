@@ -404,7 +404,7 @@ impl DatasetScanner {
 | --- | --- | --- | --- |
 | `&self` | `&DatasetHandle` | 输入 | Handle（read / write mode 均可） |
 | `request.ranges` | `&[RowRange]` | 输入 | 逻辑行候选范围（空 = 整个 Dataset） |
-| `request.projection` | `&[Arc<str>]` | 输入 | 需要读取的字段集合（决定哪些 Field 参与谓词求值） |
+| `request.projection` | `&[Arc<str>]` | 输入 | 预留字段：core 扫描路径不消费（参与谓词求值的字段由谓词自身决定）；读取列集由 `read_dataset` 的 `columns` 表达 |
 | `request.predicate` | `Option<Predicate>` | 输入 | 字段值 / sym / time 条件；跨字段的 Or / Not 不支持（返回 Invalid）——行级过滤由上层兜底 |
 | `request.limit` | `Option<u64>` | 输入 | 最多产生的命中行数 |
 | 返回 scanner | `Result<DatasetScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个逻辑 RowRange，结束返回 `None` |

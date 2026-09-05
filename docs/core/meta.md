@@ -234,15 +234,18 @@ impl IndexScanner {
 
 **内部实现**：
 ```
-1. extract_sym_filter(predicate)   →  SymFilter::All | Ids(Vec<u32>)
-     And → 各子过滤交集；Or → 并集；Not → All 回退
-     sym = "X" → sym_id_of 二分 → Ids([id])；不存在 → Ids([])
-2. extract_time_window(predicate)  →  轴 index 窗口 [lo, hi)
-     And → 各子条件窗口收窄；Or/Not → 全轴回退
-     time >= t1 → axis_lower_bound(t1)（二分）
-     time < t2  → axis_lower_bound(t2)
-3. 遍历候选 sym → 与 time 窗口求交 → 与 request.ranges 求交
-     → merge_ranges → IndexScanner
+1. compile_predicate(request.predicate)  →  (sym_ids, time_lo, time_hi)
+     sym 条件 → SymFilter::All | Ids(Vec<u32>)
+       And → 各子过滤交集；Or → 并集；Not → All 回退
+       sym = "X" → sym_id_of 二分 → Ids([id])；不存在 → Ids([])
+     time 条件 → 轴 index 窗口 [lo, hi)
+       And → 各子条件窗口收窄；Or/Not → 全轴回退
+       time >= t1 → axis_lower_bound(t1)（二分）
+       time < t2  → axis_lower_bound(t2)
+2. 遍历候选 sym（Some(ids) 逐 id / None 全轴）→ 与 time 窗口求交 → RowRange
+     （limit 达到后提前结束）
+3. merge_ranges 合并 → 与 request.ranges 非空时双指针求交（O(a + b)）
+     → IndexScanner { ranges, pos, limit }
 ```
 - 无法静态求值的谓词（嵌套 NOT 等）回退 All → 行级过滤由上层兜底
 
@@ -258,7 +261,8 @@ SYM/TIME predicate → scan_index_handle → RowRanges
     → read_field_handle / read_dataset
 ```
 
-META / Field scan 不负责决定多 Field predicate 的执行顺序；顺序由上层 planner 决定。
+META / Field scan 各自只做单层过滤，不决定多 Field 谓词的执行顺序；
+该顺序由上层固化——Dataset 层 `scan_dataset` 为「META 先行 → 字段按名称序」（见 dataset.md §7.12）。
 
 ### 6.8 locate_index_handle
 

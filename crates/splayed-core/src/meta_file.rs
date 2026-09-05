@@ -401,8 +401,8 @@ impl MetaHandle {
 
     /// `read_index_handle`：按逻辑行区间返回 `(sym, time)` 两列 DataView。
     ///
-    /// time 列按 sym 区间切成多段（TIME AXIS 零拷贝切片）；sym 列的字典 keys 需物化
-    /// （缓存进 Handle 的 scratch，生命周期随 Handle）。
+    /// time 列按 sym 区间切成多段（TIME AXIS 零拷贝切片）；sym 列为 RepeatDict 段
+    /// （零存储、不物化 keys），段与切片都直接指向 mmap，生命周期随 Handle。
     pub fn read_index_handle(
         &self,
         offset: u64,

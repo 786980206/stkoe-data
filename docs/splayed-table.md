@@ -67,12 +67,12 @@ impl TableHandle {
     pub fn scheme(&self) -> PartitionScheme
     pub fn mode(&self) -> Mode
 }
-pub struct TableOptions { /* max_parallelism 预留 */ }
+pub struct TableOptions { /* max_parallelism: Option<usize> */ }
 ```
 
 **说明**：
 - `open_table` 只打开 Table 级元信息与 Partition 组织信息；Dataset 在实际 scan / read / write 时按需打开并可在内部缓存复用（实现细节，非 public API）。
-- Table 内部并行不得突破 `max_parallelism`，避免与上层执行线程池形成不可控并发放大。
+- `max_parallelism`（缺省 = 逻辑核数）在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动 `write_dataset` / `scan_dataset` 的 Field 级并行分桶；Table 内部并行不得突破该上限，避免与上层执行线程池形成不可控并发放大。`create_table` 跨分区创建目前仍为顺序执行。
 
 ### 3.2 TableScanRequest
 
@@ -271,7 +271,7 @@ impl TableHandle { pub fn close(mut self) -> Result<(), CoreError> }
 | --- | --- | --- | --- |
 | `table_path` | `&Path` | 输入 | Table 根目录（必须已存在） |
 | `mode` | `Mode` | 输入 | 访问意图（read / write） |
-| `options` | `TableOptions` | 输入 | Table 级选项（max_parallelism 预留） |
+| `options` | `TableOptions` | 输入 | Table 级选项；`max_parallelism` 下沉为各 Partition DatasetHandle 的 Field 级并行上限 |
 | 返回 | `Result<TableHandle, CoreError>` | 输出 | Table 生命周期 Handle |
 
 **说明**：
