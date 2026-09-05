@@ -13,7 +13,7 @@ use splayed_table::{
     create_table, open_table, query_table, TableOptions, TableScanRequest,
 };
 
-const SYMS: usize = 64;
+const SYMS: usize = 256;
 const ROWS_PER_SYM: usize = 250; // 容量网格：每 sym 的行容量
 const TOTAL: usize = SYMS * ROWS_PER_SYM;
 

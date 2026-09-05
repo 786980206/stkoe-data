@@ -235,6 +235,59 @@ pub(crate) fn time_value_at(time_col: &splayed_format::ColumnView<'_>, i: usize)
 /// 按行索引集从 Data 聚出子 Data（保持行序；sym/time/字段全部聚集）。
 pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreError> {
     let rows = indices.len();
+    // 快路径：indices 连续时按 buffer 切片（O(cols) 而非 O(rows × cols)）
+    let contiguous = indices.windows(2).all(|w| w[1] == w[0] + 1);
+    if contiguous && !indices.is_empty() {
+        let start = indices[0];
+        let mut columns = Vec::with_capacity(data.schema.fields.len());
+        for field in &data.schema.fields {
+            let col = data.column(&field.name).expect("schema iteration guarantees");
+            let column = match &col.dict {
+                Some(dict) => {
+                    // Utf8 字典列：切片 keys（共享字典不安全 → 重建局部字典）
+                    let view = col.as_view();
+                    let mut new_keys: Vec<u32> = Vec::with_capacity(rows);
+                    let mut new_dict: HashMap<String, u32> = HashMap::new();
+                    let mut new_order: Vec<String> = Vec::new();
+                    let mut new_offsets = vec![0u64];
+                    let mut new_strings: Vec<u8> = Vec::new();
+                    for i in start..start + rows {
+                        if let Some(sv) = view.string_at(i) {
+                            let id = *new_dict.entry(sv.to_owned()).or_insert_with(|| {
+                                new_order.push(sv.to_owned());
+                                new_order.len() as u32 - 1
+                            });
+                            new_keys.push(id);
+                        } else {
+                            new_keys.push(0);
+                        }
+                    }
+                    for s in &new_order {
+                        new_strings.extend_from_slice(s.as_bytes());
+                        new_offsets.push(new_strings.len() as u64);
+                    }
+                    Column::from_dict(new_keys, new_offsets, new_strings, col.validity.clone())
+                }
+                None => {
+                    let size = field.data_type.size_of();
+                    let byte_start = start * size;
+                    let byte_len = rows * size;
+                    let values = Buffer::from_vec(
+                        col.values.as_slice()[byte_start..byte_start + byte_len].to_vec(),
+                    );
+                    let validity = col.validity.as_ref().map(|bm| {
+                        let extracted = bm.extract_bits(start, rows).unwrap_or_else(|_| {
+                            splayed_format::Bitmap::zeros(rows).as_view().as_raw().to_vec()
+                        });
+                        splayed_format::Bitmap::from_bytes(extracted, rows)
+                    });
+                    Column { data_type: field.data_type, values, validity, dict: None }
+                }
+            };
+            columns.push(column);
+        }
+        return Data::new(data.schema.clone(), columns).map_err(CoreError::from);
+    }
     let mut columns = Vec::new();
     for field in &data.schema.fields {
         let col = data.column(&field.name).expect("schema iteration guarantees");

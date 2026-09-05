@@ -47,31 +47,56 @@ impl MetaBuilder {
             return Err(CoreError::Invalid("meta input must not be empty".into()));
         }
 
-        // 遍历 1：收集全部 time 值 → 全局去重有序 TIME AXIS（无字符串分配）
+        // 遍历 1：批量收集 time 值 → 全局去重有序 TIME AXIS（typed slice 零函数调用）
         let mut axis_set: Vec<u64> = Vec::with_capacity(rows);
         for seg in time.segments() {
             let bytes = seg
                 .fixed_bytes()
                 .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
-            let seg_rows = seg.rows();
-            for i in 0..seg_rows {
-                axis_set.push(read_time_bytes(bytes, i, time_type)?);
+            match time_type {
+                TimeType::Date32 => {
+                    let typed: &[i32] = bytemuck::cast_slice(bytes);
+                    axis_set.extend(typed.iter().map(|&v| v as u64));
+                }
+                TimeType::TimestampUs => {
+                    let typed: &[i64] = bytemuck::cast_slice(bytes);
+                    axis_set.extend(typed.iter().map(|&v| v as u64));
+                }
             }
         }
         axis_set.sort_unstable();
         axis_set.dedup();
         let axis: Vec<u64> = axis_set;
-        // 全局行号 → 轴 index（精确匹配；值必在轴上，因为遍历 1 已全量入轴）
         let axis_pos = |v: u64| -> usize { axis.partition_point(|&x| x < v) };
 
-        // 遍历 2：按 sym run 推进（run = 字典 key 相同的连续行）
+        // time 列批量 cast 为 u64 slices
+        let mut time_flat: Vec<u64> = Vec::with_capacity(rows);
+        for seg in time.segments() {
+            let bytes = seg
+                .fixed_bytes()
+                .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
+            match time_type {
+                TimeType::Date32 => {
+                    let typed: &[i32] = bytemuck::cast_slice(bytes);
+                    time_flat.extend(typed.iter().map(|&v| v as u64));
+                }
+                TimeType::TimestampUs => {
+                    let typed: &[i64] = bytemuck::cast_slice(bytes);
+                    time_flat.extend(typed.iter().map(|&v| v as u64));
+                }
+            }
+        }
+
+        // 遍历 2：sym keys 批量 cast + run 检测（u32 slice 直接比较）
         let mut syms: Vec<SymState> = Vec::new();
         let mut prev_name: Option<String> = None;
-        let mut prev_time: Option<u64> = None;
-        let mut row = 0usize; // 当前段之前累计的全局行数（段结束时 += seg_rows）
+        let mut prev_time: u64 = u64::MIN;
+        let mut global_offset = 0usize;
         for seg in sym.segments() {
-            let keys = match seg.values() {
-                splayed_format::ColumnValues::Dict { keys, .. } => keys.as_slice(),
+            let keys: &[u32] = match seg.values() {
+                splayed_format::ColumnValues::Dict { keys, .. } => {
+                    bytemuck::cast_slice(keys.as_slice())
+                }
                 _ => {
                     return Err(CoreError::Invalid(
                         "sym column must be dictionary-encoded".into(),
@@ -81,17 +106,16 @@ impl MetaBuilder {
             let seg_rows = seg.rows();
             let mut i = 0usize;
             while i < seg_rows {
-                let key = u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap());
+                let key = keys[i];
+                let run_start_global = global_offset + i;
                 let run_start = i;
-                while i < seg_rows
-                    && u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap()) == key
-                {
+                while i < seg_rows && keys[i] == key {
                     i += 1;
                 }
                 let run = i - run_start;
-                // run 边界解析一次字符串（跨段字典不同 → 以字符串为准）
+                // run 边界解析一次字符串
                 let name = sym
-                    .string_at(row + run_start)
+                    .string_at(run_start_global)
                     .ok_or_else(|| CoreError::Invalid("sym value at row is NULL".into()))?
                     .to_owned();
                 if let Some(prev) = &prev_name {
@@ -102,39 +126,34 @@ impl MetaBuilder {
                     }
                 }
                 let same_sym = prev_name.as_deref() == Some(name.as_str());
-                let mut last_t = if same_sym {
-                    prev_time.unwrap_or(u64::MIN)
-                } else {
-                    u64::MIN // 新 sym 的时间可从头开始
-                };
-                // run 内逐行：time 严格递增 + 轴双指针推进
-                let mut pos = axis_pos(read_time(time, row + run_start, time_type)?);
-                for k in 0..run {
-                    let t = read_time(time, row + run_start + k, time_type)?;
+                let run_first_t = time_flat[run_start_global];
+                let run_last_t = time_flat[run_start_global + run - 1];
+                let start_t_idx = axis_pos(run_first_t);
+                let end_t_idx = axis_pos(run_last_t) + 1;
+
+                // run 内 time 严格递增
+                let mut last_t = if same_sym { prev_time } else { u64::MIN };
+                for &t in &time_flat[run_start_global..run_start_global + run] {
                     if t <= last_t {
                         return Err(CoreError::Invalid(
                             "meta input must be sorted by (sym ASC, time ASC)".into(),
                         ));
                     }
-                    // t 必在轴上：单调推进（ amortized O(1) ）
-                    while pos < axis.len() && axis[pos] < t {
-                        pos += 1;
-                    }
-                    debug_assert_eq!(axis.get(pos), Some(&t));
                     last_t = t;
                 }
+
                 match syms.last_mut() {
-                    Some(state) if same_sym => state.last_pos = pos,
+                    Some(state) if same_sym => state.last_pos = end_t_idx - 1,
                     _ => syms.push(SymState {
-                        name: name.clone(),
-                        first_pos: axis_pos(read_time(time, row + run_start, time_type)?),
-                        last_pos: pos,
+                        name,
+                        first_pos: start_t_idx,
+                        last_pos: end_t_idx - 1,
                     }),
                 }
-                prev_name = Some(name);
-                prev_time = Some(last_t);
+                prev_name = Some(syms.last().unwrap().name.clone());
+                prev_time = run_last_t;
             }
-            row += seg_rows;
+            global_offset += seg_rows;
         }
 
         let sym_count = syms.len() as u32;
@@ -169,7 +188,6 @@ impl MetaBuilder {
             sym_index_offset,
             file_size,
         );
-
         let mut out = Vec::with_capacity(file_size as usize);
         out.extend_from_slice(&header.to_bytes());
         for t in &axis {
@@ -209,32 +227,9 @@ fn infer_time_type(dt: DataType) -> Result<TimeType, CoreError> {
     }
 }
 
-fn read_time(time: &ColumnView<'_>, row: usize, time_type: TimeType) -> Result<u64, CoreError> {
-    let mut offset = row;
-    for seg in time.segments() {
-        let seg_rows = seg.rows();
-        if offset < seg_rows {
-            let bytes = seg
-                .fixed_bytes()
-                .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
-            return read_time_bytes(bytes, offset, time_type);
-        }
-        offset -= seg_rows;
-    }
-    Err(CoreError::Invalid("time row out of range".into()))
-}
 
-fn read_time_bytes(bytes: &[u8], row: usize, time_type: TimeType) -> Result<u64, CoreError> {
-    let v = match time_type {
-        TimeType::Date32 => {
-            u32::from_le_bytes(bytes[row * 4..row * 4 + 4].try_into().unwrap()) as u64
-        }
-        TimeType::TimestampUs => {
-            u64::from_le_bytes(bytes[row * 8..row * 8 + 8].try_into().unwrap())
-        }
-    };
-    Ok(v)
-}
+
+
 
 /// 原子写出 META（临时文件 → fsync → rename）。
 pub(crate) fn write_meta_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {

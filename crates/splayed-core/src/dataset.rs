@@ -693,7 +693,7 @@ pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError> {
     let result = (|| {
         let view = data.as_view();
         create_meta_file(&tmp.join(META_FILE_NAME), &view)?;
-        for field in &view.schema.fields {
+            for field in &view.schema.fields {
             if is_reserved(&field.name) {
                 continue;
             }
@@ -703,7 +703,7 @@ pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError> {
                 field.data_type,
                 FieldInit::Data(col.clone()),
             )?;
-        }
+                }
         Ok(())
     })();
     if let Err(e) = result {
