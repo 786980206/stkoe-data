@@ -209,9 +209,10 @@ fn multi_segment_view_to_batch_and_table_e2e() {
     create_table(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
-    // 单 Dataset 全表扫描 = 单一连续 range → batch 聚合消费整个 range → 一批
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].num_rows(), 4);
+    // 单 Dataset 全表扫描 = 单一连续 range；batch_size=2 精确切分（截断头 + pending
+    // 剩余 range），每批恰好 2 行、不超发
+    assert_eq!(batches.len(), 2);
+    assert!(batches.iter().all(|b| b.num_rows() == 2));
     for b in &batches {
         assert_eq!(b.num_columns(), 3);
     }

@@ -808,3 +808,63 @@ fn scan_table_lazy_prune_limit_and_boundary() {
     assert_eq!(total, 12);
     cleanup(&dir);
 }
+
+/// read_table：聚合路径精确不超发（range 跨批次边界 → 截断头 + pending）；
+/// 原始路径（None）一 range 一批；Some(0) 拒绝。
+#[test]
+fn read_table_batch_semantics() {
+    let dir = temp_dir("reader_batch");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    // 1 sym × 3 月 × 3 行（prices 0..8 按时间序）；分区行数 3 与 batch 4 互质 → 跨界
+    let rows: Vec<(&str, i32, f64)> = (0..3usize)
+        .flat_map(|m| {
+            (0..3usize)
+                .map(move |k| ("AAPL", d((7 + m) as u32, (k + 1) as u32), (m * 3 + k) as f64))
+        })
+        .collect();
+    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+
+    // 聚合路径：batch = 4 → [4, 4, 1]（最后一批允许小）；跨界批次跨分区多段拼接
+    let mut reader = query_table(&table, TableScanRequest::default(), Some(4)).unwrap();
+    let mut lens = Vec::new();
+    let mut got: Vec<f64> = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        lens.push(view.length());
+        let price = view.column("price").unwrap();
+        // 跨界批次的列是多段（每段一个来源 range）——段拼接后值序正确
+        got.extend(
+            price
+                .segments()
+                .iter()
+                .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec()),
+        );
+    }
+    reader.close().unwrap();
+    assert_eq!(lens, vec![4, 4, 1]); // 精确不超发（旧实现会产出 [6, 6]）
+    assert_eq!(got, (0..9).map(|i| i as f64).collect::<Vec<_>>());
+
+    // 原始路径（None）：一 range 一批（每分区一个 range = 3 行），共 3 批
+    let mut reader = query_table(&table, TableScanRequest::default(), None).unwrap();
+    let mut lens = Vec::new();
+    let mut got: Vec<f64> = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        lens.push(view.length());
+        let price = view.column("price").unwrap();
+        got.extend(
+            price
+                .segments()
+                .iter()
+                .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec()),
+        );
+    }
+    reader.close().unwrap();
+    assert_eq!(lens, vec![3, 3, 3]);
+    assert_eq!(got, (0..9).map(|i| i as f64).collect::<Vec<_>>());
+
+    // Some(0) → Invalid（拒绝，不静默当 1）
+    let mut reader = query_table(&table, TableScanRequest::default(), Some(0)).unwrap();
+    assert!(reader.next().is_err());
+    cleanup(&dir);
+}

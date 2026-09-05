@@ -109,24 +109,45 @@ impl<'t> TableScanner<'t> {
     }
 }
 
-/// Table Reader：消费 Scanner 定位结果，按 `batch_size` 聚合为 `DataView` 输出
-/// （多 Partition 段通过 ColumnView 多 segment 拼接，零拷贝）。
+/// Table Reader（**流式**）：消费 Scanner 定位的 ranges，装配为 `DataView` 输出。
+/// 只做物理读取与 batch 装配，不重复任何查询逻辑（谓词 / 裁剪归 Scanner）。
+///
+/// 两条路径（`batch_size`）：
+/// - `None`（原始路径）：一次 `next()` 原样返回一个 `PartitionRowRange` 的 DataView，
+///   零聚合开销；
+/// - `Some(n)`（聚合路径）：跨分区跨 range 零拷贝装配恰好 n 行（多段 ColumnView 拼接，
+///   无 row-level memcpy）；range 超出剩余行数 → 按**截断头**读取、剩余 range 放回
+///   `pending`（range 不可变，延迟读等价，避免跨 `next()` 持有 DataView 借用）；
+///   最后一批允许小于 n。
 pub struct TableReader<'t> {
     table: &'t TableHandle,
     scanner: TableScanner<'t>,
     /// `Some(v)` 且 v 非空 = 已展开；`Some(vec![])` / `None` = 待首次 next() 展开。
     projection: Option<Vec<String>>,
-    batch_size: usize,
+    batch_size: Option<usize>,
+    /// 聚合路径的待消费剩余 range（分区 + 行范围）。
+    pending: Option<PartitionRowRange>,
     exhausted: bool,
 }
 
 impl<'t> TableReader<'t> {
-    /// 每次返回一批 `DataView`；结束返回 `None`。最后一批允许小于 `batch_size`。
+    /// 每次返回一批 `DataView`；结束返回 `None`（exhausted 后幂等）。
     pub fn next(&mut self) -> Result<Option<DataView<'_>>, splayed_core::CoreError> {
         if self.exhausted {
             return Ok(None);
         }
-        // 空投影 = 全字段（SELECT *）：首次 next() 时展开为最后 Partition Schema 的字段
+        match self.batch_size {
+            None => self.next_range_view(),
+            Some(0) => Err(splayed_core::CoreError::Invalid(
+                "batch_size must be non-zero".into(),
+            )),
+            Some(size) => self.next_batch(size),
+        }
+    }
+
+    /// 空投影 = 全字段（SELECT *）：首次 next() 时展开为最后 Partition Schema 的字段
+    /// （sym / time 恒由 read_dataset 返回，不进 projection）。
+    fn resolve_projection(&mut self) -> Result<Vec<String>, splayed_core::CoreError> {
         if self.projection.as_ref().is_none_or(|p| p.is_empty()) {
             let schema = self.table.read_table_schema()?;
             let full: Vec<String> = schema
@@ -137,63 +158,94 @@ impl<'t> TableReader<'t> {
                 .collect();
             self.projection = Some(full);
         }
-        let projection = self.projection.as_ref().unwrap();
-        let target = self.batch_size.max(1);
-        let mut total = 0usize;
-        let mut pulled: Vec<PartitionRowRange> = Vec::new();
-        while total < target {
-            match self.scanner.next()? {
-                Some(prr) => {
-                    total += prr.row_range.length as usize;
-                    pulled.push(prr);
-                }
-                None => {
-                    self.exhausted = true;
-                    break;
-                }
+        Ok(self.projection.as_ref().unwrap().clone())
+    }
+
+    /// 取下一个待读 range：pending 优先，否则 Scanner（Scanner 耗尽 → exhausted）。
+    fn pull_range(&mut self) -> Result<Option<PartitionRowRange>, splayed_core::CoreError> {
+        if let Some(p) = self.pending.take() {
+            return Ok(Some(p));
+        }
+        match self.scanner.next()? {
+            Some(prr) => Ok(Some(prr)),
+            None => {
+                self.exhausted = true;
+                Ok(None)
             }
         }
-        if pulled.is_empty() {
+    }
+
+    /// 读一个分区的行区间（零拷贝；Dataset 经 TableHandle 缓存复用）。
+    fn read_rows(
+        &self,
+        partition: &str,
+        offset: u64,
+        length: u64,
+        cols: &[&str],
+    ) -> Result<DataView<'t>, splayed_core::CoreError> {
+        let ds = self.table.dataset_for(partition)?;
+        ds.read_dataset(offset, length, Some(cols))
+    }
+
+    /// 原始路径：一个 range 原样返回。
+    fn next_range_view(&mut self) -> Result<Option<DataView<'_>>, splayed_core::CoreError> {
+        let Some(prr) = self.pull_range()? else {
             return Ok(None);
-        }
-        // 组装：以第一段 schema 为准
+        };
+        let cols = self.resolve_projection()?;
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        Ok(Some(self.read_rows(
+            &prr.partition,
+            prr.row_range.offset,
+            prr.row_range.length,
+            &cols,
+        )?))
+    }
+
+    /// 聚合路径：恰好装配 size 行；range 超出剩余 → 截断头读取 + pending 剩余；
+    /// Scanner 耗尽时允许最后一批小于 size。
+    fn next_batch(&mut self, size: usize) -> Result<Option<DataView<'_>>, splayed_core::CoreError> {
+        let cols = self.resolve_projection()?;
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
         let mut schema: Option<splayed_format::Schema> = None;
         let mut column_segments: Vec<Vec<splayed_format::ColumnSegment<'_>>> = Vec::new();
-        for prr in &pulled {
-            let ds = self.table.dataset_for(&prr.partition)?;
-            let cols: Vec<&str> = projection.iter().map(|s| s.as_str()).collect();
-            let view = ds.read_dataset(
-                prr.row_range.offset,
-                prr.row_range.length,
-                Some(&cols),
-            )?;
+        let mut total = 0usize;
+        while total < size {
+            let Some(prr) = self.pull_range()? else { break };
+            let take = (size - total).min(prr.row_range.length as usize) as u64;
+            let view = self.read_rows(&prr.partition, prr.row_range.offset, take, &cols)?;
             if schema.is_none() {
                 schema = Some(view.schema.clone());
-                column_segments = view
-                    .schema
-                    .fields
-                    .iter()
-                    .map(|_| Vec::new())
-                    .collect();
+                column_segments = view.schema.fields.iter().map(|_| Vec::new()).collect();
             }
             for (j, segs) in column_segments.iter_mut().enumerate() {
                 segs.extend(view.columns[j].segments().iter().copied());
             }
+            total += take as usize;
+            if take < prr.row_range.length {
+                self.pending = Some(PartitionRowRange {
+                    partition: prr.partition.clone(),
+                    row_range: RowRange::new(
+                        prr.row_range.offset + take,
+                        prr.row_range.length - take,
+                    ),
+                });
+            }
         }
-        let schema = schema.expect("pulled is non-empty");
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
         let mut columns = Vec::with_capacity(column_segments.len());
         for (j, segs) in column_segments.into_iter().enumerate() {
-            columns.push(splayed_format::ColumnView::new(
-                schema.fields[j].data_type,
-                segs,
-            )?);
+            columns.push(splayed_format::ColumnView::new(schema.fields[j].data_type, segs)?);
         }
-        let length = columns.first().map(|c| c.length()).unwrap_or(0);
-        let _ = length;
-        Ok(Some(DataView::new(schema, columns).map_err(splayed_core::CoreError::from)?))
+        Ok(Some(
+            DataView::new(schema, columns).map_err(splayed_core::CoreError::from)?,
+        ))
     }
 
-    /// 关闭：在任何时刻（正常结束 / LIMIT 提前结束 / 错误 / 取消）都可安全调用。
+    /// 关闭：任何时刻（正常结束 / LIMIT 提前结束 / 错误 / 取消）都可安全调用。
+    /// 只关闭当前实际打开的 DatasetScanner（Dataset 句柄归 TableHandle 缓存所有）。
     pub fn close(self) -> Result<(), splayed_core::CoreError> {
         self.scanner.close()
     }
@@ -291,7 +343,8 @@ pub fn read_table<'t>(
         table,
         scanner,
         projection,
-        batch_size: batch_size.unwrap_or(1024),
+        batch_size,
+        pending: None,
         exhausted: false,
     }
 }

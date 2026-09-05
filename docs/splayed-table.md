@@ -572,8 +572,12 @@ next()（惰性、串行）
 
 **接口定义**：
 ```rust
-pub fn read_table<'t>(table: &'t TableHandle, scanner: TableScanner,
+pub fn read_table<'t>(table: &'t TableHandle, scanner: TableScanner<'t>,
     batch_size: Option<usize>) -> TableReader<'t>
+impl TableReader<'t> {
+    pub fn next(&mut self) -> Result<Option<DataView>, CoreError>
+    pub fn close(self) -> Result<(), CoreError>
+}
 ```
 
 **参数**：
@@ -581,24 +585,44 @@ pub fn read_table<'t>(table: &'t TableHandle, scanner: TableScanner,
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `table` | `&TableHandle` | 输入 | 已打开的 Table Handle |
-| `scanner` | `TableScanner` | 输入 | `scan_table` 产出的定位器（按值消费） |
-| `batch_size` | `Option<usize>` | 输入 | 输出聚合粒度；`None` = 逐 range 输出；最后一批允许小于 `batch_size` |
-| 返回 | `TableReader` | 输出 | Reader；`next()` 每次返回一个批量 `DataView`，结束返回 `None` |
+| `scanner` | `TableScanner<'t>` | 输入 | `scan_table` 产出的定位器（按值消费） |
+| `batch_size` | `Option<usize>` | 输入 | `None` = 原始路径（一 range 一批）；`Some(n)` = 聚合路径（每批恰好 n 行，`Some(0)` → Invalid）；最后一批允许小于 n |
+| 返回 | `TableReader<'t>` | 输出 | 流式 Reader；构造 O(1)，不打开任何 Dataset |
 
-**内部实现**：
+**内部实现流程**：
 ```
-TableScanner.next() → PartitionRowRange
-        → locate Dataset（none → 根 Dataset）→ read_dataset() → DataView
-        → batch 聚合（ColumnView 多 segment 拼接，零拷贝）→ TableReader.next()
+next()
+├── batch_size = None（原始路径）
+│     pull_range → read_dataset(offset, length) → 原样返回一个 range 的 DataView
+└── batch_size = Some(n)（聚合路径）
+      循环直至凑满 n 行（Scanner 耗尽 → 最后一批小于 n）：
+        pull_range（pending 优先，否则 Scanner.next()）
+        → take = min(剩余行数, range 行数)
+        → read_dataset(offset, take)（截断头读取）
+        → 多段 ColumnView 拼接（零拷贝，无 row-level memcpy）
+        → take < range 行数 → 剩余 range 放回 pending
 ```
+
+**核心原则**：
+- **严格分层**：只做物理读取与 batch 装配，不重复任何查询逻辑（谓词 / pruning 归
+  Scanner）；`pending` 存 **range**（不可变，延迟读等价）而非 DataView——避免跨
+  `next()` 持有数据借用。
+- **零拷贝聚合**：跨分区跨 range 的多段 ColumnView 直接拼接，不进行 row-level memcpy；
+  超出部分按 range 级切分（`read_dataset` 本就是 mmap 零拷贝切片，截断头读取等价于
+  视图切分且更轻）。
+- **Dataset 缓存复用**：Dataset 句柄由 TableHandle 统一缓存（`dataset_for`），Reader
+  不自持句柄、构造不打开任何 Dataset（错误延迟到 `next()`）。
+- **顺序性**：完全遵循 Scanner 顺序（Partition ASC + 分区内 RowRange ASC）；跨分区
+  不并行读取。
+- `batch_size = Some(0)` → Invalid（拒绝，不静默当 1）。
 
 **说明**：
-- Reader 从 Scanner 逐个取 `PartitionRowRange`，对其中单个 `row_range` 直接调用 core `read_dataset`。
 - 不重新执行 predicate，不重新做 Partition pruning。
 - `batch_size` 是读取 / 输出层语义，不改变 Scanner 的 `next()` primitive。
 - 输出顺序遵循 Scanner：Partition ASC，Partition 内保持原序。
-
-为什么不提供 `read_table_partition`：`Partition = Dataset`，且 `PartitionRowRange` 已同时包含 Partition 与行范围；该 API 本质只是 `locate Partition → read_dataset(...)`，没有独立语义，不作为 public API。同理不提供 `scan_table_partition`。
+- 语义变更记录：旧实现 batch 聚合按「拉满为止」消费 range，**批次可能超出 batch_size**
+  （如 batch=2 拉入 4 行的 range）；现按截断 + pending 精确切分。`None` 语义从「默认
+  1024」改为原始路径。
 
 ### 4.12 query_table
 
