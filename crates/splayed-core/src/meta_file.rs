@@ -23,6 +23,9 @@ pub struct MetaBuilder;
 
 impl MetaBuilder {
     /// `data` 必须包含 `sym`（Utf8 字典视图）与 `time`（整数列），按 `(sym ASC, time ASC)` 排序。
+    ///
+    /// run-length 优化：字符串分配与比较发生在 sym run 边界（O(sym 段数)），
+    /// 行内只做数值比较；轴定位用单调双指针（run 内 time 递增）。
     pub fn build(data: &DataView<'_>) -> Result<Vec<u8>, CoreError> {
         let sym = data
             .column("sym")
@@ -44,48 +47,94 @@ impl MetaBuilder {
             return Err(CoreError::Invalid("meta input must not be empty".into()));
         }
 
-        // 两遍构建：先校验排序并收集全局去重有序 TIME AXIS，再定位各 sym 的
-        // 轴区间 [pos(first_time), pos(last_time)]（区间内不属于该 sym 的时间点由 NULL 表示）
-        let mut axis_set: Vec<u64> = Vec::new();
-        let mut rows_vec: Vec<(String, u64)> = Vec::with_capacity(rows);
-        let mut prev_sym: Option<String> = None;
-        let mut prev_time: Option<u64> = None;
-        for i in 0..rows {
-            let s = sym
-                .string_at(i)
-                .ok_or_else(|| CoreError::Invalid("sym value at row is NULL".into()))?
-                .to_owned();
-            let t = read_time(time, i, time_type)?;
-            if let (Some(ps), Some(pt)) = (&prev_sym, &prev_time) {
-                if ps.as_str() > s.as_str() || (ps == &s && *pt > t) {
-                    return Err(CoreError::Invalid(
-                        "meta input must be sorted by (sym ASC, time ASC)".into(),
-                    ));
-                }
+        // 遍历 1：收集全部 time 值 → 全局去重有序 TIME AXIS（无字符串分配）
+        let mut axis_set: Vec<u64> = Vec::with_capacity(rows);
+        for seg in time.segments() {
+            let bytes = seg
+                .fixed_bytes()
+                .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
+            let seg_rows = seg.rows();
+            for i in 0..seg_rows {
+                axis_set.push(read_time_bytes(bytes, i, time_type)?);
             }
-            rows_vec.push((s.clone(), t));
-            axis_set.push(t);
-            prev_sym = Some(s);
-            prev_time = Some(t);
         }
         axis_set.sort_unstable();
         axis_set.dedup();
         let axis: Vec<u64> = axis_set;
-        let lower = |v: u64| -> usize {
-            axis.partition_point(|&x| x < v)
-        };
+        // 全局行号 → 轴 index（精确匹配；值必在轴上，因为遍历 1 已全量入轴）
+        let axis_pos = |v: u64| -> usize { axis.partition_point(|&x| x < v) };
 
-        // 逐 sym（输入中连续出现）定位区间
+        // 遍历 2：按 sym run 推进（run = 字典 key 相同的连续行）
         let mut syms: Vec<SymState> = Vec::new();
-        for (s, t) in &rows_vec {
-            match syms.last_mut() {
-                Some(state) if state.name == *s => state.last_pos = lower(*t),
-                _ => syms.push(SymState {
-                    name: s.clone(),
-                    first_pos: lower(*t),
-                    last_pos: lower(*t),
-                }),
+        let mut prev_name: Option<String> = None;
+        let mut prev_time: Option<u64> = None;
+        let mut row = 0usize; // 当前段之前累计的全局行数（段结束时 += seg_rows）
+        for seg in sym.segments() {
+            let keys = match seg.values() {
+                splayed_format::ColumnValues::Dict { keys, .. } => keys.as_slice(),
+                _ => {
+                    return Err(CoreError::Invalid(
+                        "sym column must be dictionary-encoded".into(),
+                    ))
+                }
+            };
+            let seg_rows = seg.rows();
+            let mut i = 0usize;
+            while i < seg_rows {
+                let key = u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap());
+                let run_start = i;
+                while i < seg_rows
+                    && u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap()) == key
+                {
+                    i += 1;
+                }
+                let run = i - run_start;
+                // run 边界解析一次字符串（跨段字典不同 → 以字符串为准）
+                let name = sym
+                    .string_at(row + run_start)
+                    .ok_or_else(|| CoreError::Invalid("sym value at row is NULL".into()))?
+                    .to_owned();
+                if let Some(prev) = &prev_name {
+                    if prev.as_str() > name.as_str() {
+                        return Err(CoreError::Invalid(
+                            "meta input must be sorted by (sym ASC, time ASC)".into(),
+                        ));
+                    }
+                }
+                let same_sym = prev_name.as_deref() == Some(name.as_str());
+                let mut last_t = if same_sym {
+                    prev_time.unwrap_or(u64::MIN)
+                } else {
+                    u64::MIN // 新 sym 的时间可从头开始
+                };
+                // run 内逐行：time 严格递增 + 轴双指针推进
+                let mut pos = axis_pos(read_time(time, row + run_start, time_type)?);
+                for k in 0..run {
+                    let t = read_time(time, row + run_start + k, time_type)?;
+                    if t <= last_t {
+                        return Err(CoreError::Invalid(
+                            "meta input must be sorted by (sym ASC, time ASC)".into(),
+                        ));
+                    }
+                    // t 必在轴上：单调推进（ amortized O(1) ）
+                    while pos < axis.len() && axis[pos] < t {
+                        pos += 1;
+                    }
+                    debug_assert_eq!(axis.get(pos), Some(&t));
+                    last_t = t;
+                }
+                match syms.last_mut() {
+                    Some(state) if same_sym => state.last_pos = pos,
+                    _ => syms.push(SymState {
+                        name: name.clone(),
+                        first_pos: axis_pos(read_time(time, row + run_start, time_type)?),
+                        last_pos: pos,
+                    }),
+                }
+                prev_name = Some(name);
+                prev_time = Some(last_t);
             }
+            row += seg_rows;
         }
 
         let sym_count = syms.len() as u32;
@@ -168,19 +217,23 @@ fn read_time(time: &ColumnView<'_>, row: usize, time_type: TimeType) -> Result<u
             let bytes = seg
                 .fixed_bytes()
                 .ok_or_else(|| CoreError::Invalid("time column must be fixed-width".into()))?;
-            let v = match time_type {
-                TimeType::Date32 => u32::from_le_bytes(
-                    bytes[offset * 4..offset * 4 + 4].try_into().unwrap(),
-                ) as u64,
-                TimeType::TimestampUs => u64::from_le_bytes(
-                    bytes[offset * 8..offset * 8 + 8].try_into().unwrap(),
-                ),
-            };
-            return Ok(v);
+            return read_time_bytes(bytes, offset, time_type);
         }
         offset -= seg_rows;
     }
     Err(CoreError::Invalid("time row out of range".into()))
+}
+
+fn read_time_bytes(bytes: &[u8], row: usize, time_type: TimeType) -> Result<u64, CoreError> {
+    let v = match time_type {
+        TimeType::Date32 => {
+            u32::from_le_bytes(bytes[row * 4..row * 4 + 4].try_into().unwrap()) as u64
+        }
+        TimeType::TimestampUs => {
+            u64::from_le_bytes(bytes[row * 8..row * 8 + 8].try_into().unwrap())
+        }
+    };
+    Ok(v)
 }
 
 /// 原子写出 META（临时文件 → fsync → rename）。
@@ -303,11 +356,18 @@ impl MetaHandle {
             .map_err(|e| CoreError::InvalidState(format!("sym dictionary is not utf-8: {e}")))
     }
 
-    /// 字典查找（线性；字典按首现序 = 排序序，可直接二分优化）。
+    /// 字典查找：字典按首现序 = 排序序，二分 O(log S)。
     pub fn sym_id_of(&self, name: &str) -> Result<Option<u32>, CoreError> {
-        for id in 0..self.header.sym_count {
-            if self.sym_str(id)? == name {
-                return Ok(Some(id));
+        let count = self.header.sym_count;
+        let mut lo = 0u32;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let s = self.sym_str(mid)?;
+            match s.as_bytes().cmp(name.as_bytes()) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Ok(Some(mid)),
             }
         }
         Ok(None)

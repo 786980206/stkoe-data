@@ -565,17 +565,24 @@ impl DatasetScanner {
     }
 }
 
-/// 两个 range 列表求交（各自有序合并）。
+/// 两个有序合并后的 range 列表求交：双指针归并 O(a + b)。
 fn intersect_range_lists(a: &[RowRange], b: &[RowRange]) -> Vec<RowRange> {
     let mut out = Vec::new();
-    for ra in a {
-        for rb in b {
-            if let Some(inter) = ra.intersect(rb) {
-                out.push(inter);
-            }
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        let lo = a[i].offset.max(b[j].offset);
+        let hi = a[i].end().min(b[j].end());
+        if hi > lo {
+            out.push(RowRange::new(lo, hi - lo));
+        }
+        // 推进先结束的一侧
+        if a[i].end() <= b[j].end() {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
-    merge_ranges(out)
+    out
 }
 
 /// 把 Dataset 级谓词按字段分组：(字段名, 该字段的子谓词)。
