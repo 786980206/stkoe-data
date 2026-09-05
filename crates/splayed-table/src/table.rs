@@ -370,7 +370,9 @@ pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreEr
 }
 
 /// 创建完整 Table（`none` → 根目录 Dataset；year/month/date → 按 time 切分 Partition）。
-/// 不同 Partition 可并行创建（本实现顺序执行）；不改变 Partition 内数据顺序。
+/// 分区创建并行执行（每分区一个线程，尚未接入 `max_parallelism` 上限，与
+/// `create_dataset` 内部的 Field 级并行嵌套）；gather 在主线程串行执行；
+/// 不改变 Partition 内数据顺序。
 pub fn create_table(
     table_path: &Path,
     data: &Data,

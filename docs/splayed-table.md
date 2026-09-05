@@ -72,7 +72,7 @@ pub struct TableOptions { /* max_parallelism: Option<usize> */ }
 
 **说明**：
 - `open_table` 只打开 Table 级元信息与 Partition 组织信息；Dataset 在实际 scan / read / write 时按需打开并可在内部缓存复用（实现细节，非 public API）。
-- `max_parallelism`（缺省 = 逻辑核数）在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动 `write_dataset` / `scan_dataset` 的 Field 级并行分桶；Table 内部并行不得突破该上限，避免与上层执行线程池形成不可控并发放大。`create_table` 跨分区创建目前仍为顺序执行。
+- `max_parallelism`（缺省 = 逻辑核数）在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动 `write_dataset` / `scan_dataset` 的 Field 级并行分桶；Table 内部并行不得突破该上限，避免与上层执行线程池形成不可控并发放大。`create_table` 的分区创建已并行（每分区一个线程，见 §4.1），但尚未接入该上限——与 `create_dataset` 内部 Field 级并行形成无上界嵌套，是 Table 层优化的待修正项。
 
 ### 3.2 TableScanRequest
 

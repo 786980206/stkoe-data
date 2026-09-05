@@ -69,11 +69,13 @@
   decompress 11.5 ms。
 - 后续增量：`create_dataset` 并行化（META 先行 + Field 并行创建 + 零拷贝列移动，
   c864833）后写入中位 102 → 82 ms（≈ -19.5%）；`write_dataset` / `scan_dataset` 的
-  Field 级并行与小写快路径（6d3b809）已落地，对端到端建表的进一步收益取决于
-  Table 层跨分区并行（见下）。
+  Field 级并行与小写快路径（6d3b809）已落地。另查明：`create_table` 分区创建
+  **已并行**（6d71ae8，每分区一个线程，未接 max_parallelism 上限，与 create_dataset
+  内部 Field 级并行嵌套）——此前"跨分区串行"的记载系函数注释失实所致。
 
 结论与定位：读取侧已反超 parquet（全表 2.0×、谓词 2.2×），谓词向量化已从「已知优化项」兑现；
-**写入是当前唯一显著落后项**——剩余瓶颈集中在 create_table 跨分区串行创建 / gather /
-MetaBuilder × 12，下一优先级是 Table 层 `create_table` 跨分区并行
-（`TableOptions.max_parallelism` 旋钮已下沉到 DatasetHandle，可直接复用）；
-chunk 级惰性解码（读路径 Field 级并行的前提）仍为后续项。
+**写入是当前唯一显著落后项**——create_table 的剩余串行瓶颈 = 主线程 gather_data
+（非连续索引逐行拷贝 + validity 逐 bit 写，违反批量位操作原则）+ 逐行 partition_name
+字符串构造 + MetaBuilder × 12（META 单线程为设计约束）；Table 层优化的候选方向：
+gather 批量化（连续 run 拼接 + 批量位操作）、分区并行接入 `max_parallelism`
+（消除无上界嵌套）、Table 级 tmp + 原子发布；chunk 级惰性解码（读路径 Field 级并行的前提）仍为后续项。
