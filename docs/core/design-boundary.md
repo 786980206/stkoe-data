@@ -102,7 +102,24 @@
   **已并行**（6d71ae8，每分区一个线程，未接 max_parallelism 上限，与 create_dataset
   内部 Field 级并行嵌套）——此前"跨分区串行"的记载系函数注释失实所致。
 
-结论与定位：读取侧已反超 parquet（全表 2.0×、谓词 2.2×），谓词向量化已从「已知优化项」兑现；
+### 10.3 Table 层优化轮复测（2026-09-05，64K 行 / 12 月分区，criterion 最新中位数）
+
+| 路径 | splayed | parquet | 差距 |
+| --- | --- | --- | --- |
+| 写入（端到端建表） | **30.3 ms** | 23.0 ms | **≈ 1.3×**（此前 4.2× → 2.6× → 1.3×） |
+| 全表读取（Table 层，open 复用） | **0.935 ms** | 1.825 ms | **splayed 快 ≈ 2.0×** |
+| 谓词扫描（price > 15，open 复用） | **1.059 ms** | 2.152 ms | **splayed 快 ≈ 2.0×** |
+
+- 写入 82 → 30.3 ms（≈ -63%）：本轮 Table 层优化的直接成效——create_table 分区
+  片段化 gather（连续片段 memcpy + validity word 级拼接 + 字典 remap，去逐行拷贝 /
+  逐 bit 位写）+ 预算切分并行（P_part × P_field ≤ max_parallelism）；写入基准的
+  迭代体即端到端建表。与 parquet 的剩余差距主要在 12 × Dataset 的 META 构建与
+  文件创建（Windows 文件系统开销）。
+- 读取 / 谓词扫描 0.94 / 1.06 ms：与上轮 0.90 / 1.03 ms 持平（噪声级波动）——
+  惰性 scan_table 与双路径 read_table 重写未引入回归。
+
+结论与定位：读取侧已反超 parquet（全表 ≈ 2.0×、谓词 ≈ 2.0×），谓词向量化已从「已知优化项」兑现；
+写入经 Table 层优化后与 parquet 差距缩至 ≈ 1.3×（§10.3）；
 **写入侧 create_table 已完成批量化 + 并行预算治理**（一次线性扫描产出分区连续片段 →
 gather_runs 连续片段 memcpy + validity word 级拼接 + 字典 remap 零逐行字符串分配 →
 `P_part × P_field ≤ max_parallelism` 预算切分并行，TableOptions 直达 create_table）；
