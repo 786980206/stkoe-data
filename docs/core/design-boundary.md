@@ -77,7 +77,7 @@
 > core 层的 mmap 零拷贝路径本身接近 parquet。
 > 写入 7× 差距来自 gather_data 逐行拷贝 + 多文件创建，后续可批量化。
 
-### 10.2 64K 行复测（2026-09，256 sym × 250 行，12 月分区；优化批次后）
+### 10.2 64K 行复测（2026-09，256 sym × 250 行，9 月分区；优化批次后）
 
 | 路径 | splayed | parquet | 对比 |
 | --- | --- | --- | --- |
@@ -91,10 +91,10 @@
   + word 级命中区）的直接成效；splayed 由落后 parquet 反超为**快 2.2×**。
 - 全表读取 0.97 ms → 0.90 ms（≈ -7%）；**splayed 快 ≈ 2.0×**（首轮基线时落后 1.4×）。
 - 写入 102 ms vs 109 ms 基本持平（迭代区间 [68, 146] ms 方差大，criterion 迭代内含
-  `remove_dir_all`）；仍 ≈ 4.2× 慢于 parquet——瓶颈 = 12 分区 × 4 field 文件创建 +
+  `remove_dir_all`）；仍 ≈ 4.2× 慢于 parquet——瓶颈 = 9 分区 ×（META + 2 field 文件）创建 +
   MetaBuilder × 12 + gather，即 §8 已知优化项（写入批量化 / 并行化）。
 - Dataset 层阶段计时（release profiler，64K 行）：`read_dataset` 483 µs、`scan_dataset` 谓词 685 µs、
-  `create_table`（单分区）7.0 ms、`create_table`（12 月分区）44.6 ms、compress 13.8 ms、
+  `create_table`（单分区）7.0 ms、`create_table`（9 月分区）44.6 ms、compress 13.8 ms、
   decompress 11.5 ms。
 - 后续增量：`create_dataset` 并行化（META 先行 + Field 并行创建 + 零拷贝列移动，
   c864833）后写入中位 102 → 82 ms（≈ -19.5%）；`write_dataset` / `scan_dataset` 的
@@ -102,7 +102,13 @@
   **已并行**（6d71ae8，每分区一个线程，未接 max_parallelism 上限，与 create_dataset
   内部 Field 级并行嵌套）——此前"跨分区串行"的记载系函数注释失实所致。
 
-### 10.3 Table 层优化轮复测（2026-09-05，64K 行 / 12 月分区，criterion 最新中位数）
+### 10.3 Table 层优化轮复测（2026-09-05，64K 行 / 9 月分区，criterion 最新中位数）
+
+> 基准写入对比的结构性差异：parquet 侧为**单个文件**（bench.parquet，单 RecordBatch）；
+> splayed 侧为 **9 分区 ×（.meta + price + volume）= 27 个文件** + 9 目录（sym / time 由
+> META 管理，不单独成文件），且每分区经 tmp 目录 + sync_all + 原子 rename 发布。
+> 按「每文件成本」计：splayed ≈ 1.1 ms/文件（含 META 构建 + gather + fsync），
+> parquet 23 ms / 1 文件——1.3× 的端到端差距在该文件数差异下是合理的。
 
 | 路径 | splayed | parquet | 差距 |
 | --- | --- | --- | --- |

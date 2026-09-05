@@ -126,7 +126,7 @@ fn perf_profiler() {
     let root2 = temp_dir("profiler_month");
     let t7 = Instant::now();
     create_table(&root2, data.clone(), splayed_table::PartitionScheme::Month, splayed_table::TableOptions::default()).unwrap();
-    times.push(("create_table (month, 12 partitions)", t7.elapsed()));
+    times.push(("create_table (month, 9 partitions)", t7.elapsed()));
     let _ = std::fs::remove_dir_all(&root2);
 
     // ---- 9. rename_table_field ----
