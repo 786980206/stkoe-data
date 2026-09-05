@@ -40,6 +40,14 @@
   → 全部定位与校验先于任何写入（key 缺失不产生部分写入——强于旧实现的逐分区
   先写后验）→ 分区级并行写（P_part × P_field ≤ max_parallelism 预算切分，Field 级
   预算临时下调 join 后恢复；per-range 字段 Schema 复用 + slice_rows 零拷贝切片）。
+- **创建即压缩**（create_field_file + CreateFieldOptions{compression, chunk_offsets}）：
+  Data → 单遍 chunked 直接创建（逐 chunk encode_chunk 顺序直写，内存 O(单 chunk)，
+  无 tmp / 无二次读；与 compress_field_file 输出字节级一致——测试锁定）；Length →
+  chunked 全 NULL（后续 write 生命周期保持压缩）；Stream → 组合路径（两阶段 reader
+  协议使单遍编码需物化全列：流式写未压缩 + 原地压缩）。分层透传：CreateDatasetOptions
+  {compression, chunk_syms}（sym 对齐边界由输入 sym run 推导，全 Field 复用）、
+  TableOptions{compression, chunk_syms}、create_table_partition 按分区覆盖（冷热分层）、
+  DatasetHandle::sym_aligned_chunk_offsets 公开。
 - Table 元数据读 API 统一缓存模型（另见 splayed-table §3.1）：scan_table 惰性化——
   scan_table 只做裁剪与构造（不打开 Dataset，tt 经 64B META header 直读），分区在
   next() 时按序惰性打开；时间裁剪按 time_min 排序后二分（不依赖分区名字典序——年号

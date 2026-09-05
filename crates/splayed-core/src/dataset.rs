@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use splayed_format::{
-    Column, ColumnValues, ColumnView, Data, DataView, DataType, FieldSchema, Schema, TimeType,
+    Column, ColumnValues, Compression, ColumnView, Data, DataView, DataType, FieldSchema,
+    Schema, TimeType,
 };
 
 use crate::error::{map_io_path, CoreError, Mode};
@@ -14,6 +15,7 @@ use crate::field_file::{
     cast_field_file, compress_field_file, decompress_field_file, FieldChunkReader, FieldHandle,
     FieldInit, StreamValues,
 };
+use crate::field_file::CreateFieldOptions;
 use crate::meta_file::{create_meta_file, MetaBuilder, MetaHandle};
 use crate::scan::{clamp_ranges, merge_ranges, Predicate, RowRange, ScanRequest};
 
@@ -499,6 +501,7 @@ impl DatasetHandle {
         name: &str,
         data_type: DataType,
         init: DatasetFieldInit,
+        field_options: CreateFieldOptions,
     ) -> Result<(), CoreError> {
         validate_field_name(name)?;
         if self.schema.position(name).is_some() {
@@ -526,7 +529,7 @@ impl DatasetHandle {
                 reader: Box::new(LengthCheckReader { inner: reader, expected: l, got_values: 0, got_validity: 0 }),
             },
         };
-        if let Err(e) = create_field_file(&self.field_path(name), data_type, init) {
+        if let Err(e) = create_field_file(&self.field_path(name), data_type, init, field_options) {
             // 失败清理半成品：create 直接写最终路径，残留文件带零填充占位 header，
             // 会污染后续 build_schema / open_dataset（Schema 尚未同步，文件必须不落痕）
             let _ = fs::remove_file(self.field_path(name));
@@ -600,7 +603,7 @@ impl DatasetHandle {
             return Err(CoreError::NotFound(self.field_path(name)));
         }
         self.fields.borrow_mut().remove(name);
-        let offsets = self.sym_aligned_offsets(8, 64 * 1024);
+        let offsets = self.sym_aligned_chunk_offsets(8, CHUNK_ROW_CAP);
         compress_field_file(&self.field_path(name), Some(offsets))?;
         Ok(())
     }
@@ -632,23 +635,25 @@ impl DatasetHandle {
         self.meta.locate_index_handle(pairs)
     }
 
-    fn sym_aligned_offsets(&self, k: usize, cap: u32) -> Vec<u64> {
+    /// sym 对齐的压缩 chunk 边界（创建即压缩 / compress 共用）：每
+    /// `syms_per_chunk` 个连续 sym 一个边界；行数超过 `row_cap` 的 sym 按 cap 劈开。
+    pub fn sym_aligned_chunk_offsets(&self, syms_per_chunk: usize, row_cap: u64) -> Vec<u64> {
         let mut boundaries: Vec<u64> = vec![0];
         let mut syms_in_chunk = 0usize;
         for id in 0..self.meta.header().sym_count {
             let Ok(rec) = self.meta.sym_record(id) else { break };
             let (start, len) = (rec.row_start as u64, rec.time_count as u64);
-            if syms_in_chunk == k {
+            if syms_in_chunk == syms_per_chunk {
                 boundaries.push(start);
                 syms_in_chunk = 0;
             }
             syms_in_chunk += 1;
-            if len > cap as u64 {
+            if len > row_cap {
                 boundaries.push(start);
-                let mut p = start + cap as u64;
+                let mut p = start + row_cap;
                 while p < start + len {
                     boundaries.push(p);
-                    p += cap as u64;
+                    p += row_cap;
                 }
                 syms_in_chunk = 0;
             }
@@ -868,19 +873,84 @@ fn strip_all_fields(pred: &Predicate) -> Predicate {
 
 // ------------------------------------------------------------------ File API
 
-/// `create_dataset` 的并行选项。
+/// 压缩 chunk 的 sym 行数上限：超过该行数的 sym 按上限劈开（与
+/// `compress_dataset_field` 默认一致）。
+pub const CHUNK_ROW_CAP: u64 = 64 * 1024;
+
+/// `create_dataset` 的选项。
 #[derive(Debug, Clone)]
 pub struct CreateDatasetOptions {
     /// Field 文件并行创建的线程上限（1 = 串行）；默认 = 逻辑核数。
     pub max_parallelism: usize,
+    /// 新建 Field 的 chunk 压缩算法（默认 None = 未压缩）。
+    pub compression: Compression,
+    /// 压缩 chunk 的 sym 分组数（每 chunk 覆盖的连续 sym 数；行数超过
+    /// `CHUNK_ROW_CAP` 的 sym 按 cap 劈开）。默认 8。
+    pub chunk_syms: usize,
 }
 
 impl Default for CreateDatasetOptions {
     fn default() -> Self {
         CreateDatasetOptions {
             max_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            compression: Compression::None,
+            chunk_syms: 8,
         }
     }
+}
+
+/// 由输入 sym 列（字典 keys）的 run 结构推导 sym 对齐 chunk 边界：
+/// 每 `chunk_syms` 个连续 sym 一个边界，行数超过 `row_cap` 的 sym 按 cap 劈开。
+/// 输入 (sym ASC, time ASC) ⇒ sym run 行数 = 该 sym 的容量网格行数，
+/// 边界与 META 网格一致（供创建即压缩时逐 Field 复用）。
+fn sym_chunk_offsets_from_data(
+    view: &splayed_format::Column,
+    chunk_syms: usize,
+    row_cap: u64,
+) -> Result<Vec<u64>, CoreError> {
+    let view = view.as_view();
+    let seg = view.segments().first().ok_or_else(|| {
+        CoreError::Invalid("sym column is empty".into())
+    })?;
+    let keys: &[u8] = match seg.values() {
+        splayed_format::ColumnValues::Dict { keys, .. } => keys.as_slice(),
+        _ => {
+            return Err(CoreError::Invalid(
+                "sym column must be dictionary encoded".into(),
+            ))
+        }
+    };
+    let n = keys.len() / 4;
+    let mut offsets = vec![0u64];
+    let (mut syms_in_chunk, mut i) = (0usize, 0usize);
+    while i < n {
+        let k = u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap());
+        let mut len = 1usize;
+        while i + len < n
+            && u32::from_le_bytes(keys[(i + len) * 4..(i + len) * 4 + 4].try_into().unwrap()) == k
+        {
+            len += 1;
+        }
+        let start = i as u64;
+        if syms_in_chunk == chunk_syms {
+            offsets.push(start);
+            syms_in_chunk = 0;
+        }
+        syms_in_chunk += 1;
+        if len as u64 > row_cap {
+            offsets.push(start);
+            let mut p = start + row_cap;
+            while p < start + len as u64 {
+                offsets.push(p);
+                p += row_cap;
+            }
+            syms_in_chunk = 0;
+        }
+        i += len;
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    Ok(offsets)
 }
 
 /// 创建完整 Dataset：META 单线程先行（一次扫描完成全局合法性校验），
@@ -900,7 +970,21 @@ pub fn create_dataset(
     // ① META 单线程先行：一次扫描完成全局校验（排序 / 连续子区间 / 容量网格）+ 构建；
     //    失败时不落任何盘上痕迹
     let meta = MetaBuilder::build(&data.as_view())?;
-    // ② 抽走非 sym/time 列（owned 移动，零拷贝）——Field 之间完全独立，是并行创建的基本单元
+    // ② 创建即压缩：compression != None 时由输入 sym run 推导 sym 对齐 chunk 边界
+    //    （全部 Field 复用同一网格边界），随 CreateFieldOptions 下发
+    let field_options = if matches!(options.compression, Compression::None) {
+        CreateFieldOptions::default()
+    } else {
+        CreateFieldOptions {
+            compression: options.compression,
+            chunk_offsets: Some(sym_chunk_offsets_from_data(
+                data.column("sym").unwrap(),
+                options.chunk_syms.max(1),
+                CHUNK_ROW_CAP,
+            )?),
+        }
+    };
+    // ③ 抽走非 sym/time 列（owned 移动，零拷贝）——Field 之间完全独立，是并行创建的基本单元
     let mut data = data;
     let names: Vec<String> = data.schema.fields.iter().map(|f| f.name.to_string()).collect();
     let types: Vec<DataType> = data.schema.fields.iter().map(|f| f.data_type).collect();
@@ -937,7 +1021,12 @@ pub fn create_dataset(
         let p = options.max_parallelism.max(1).min(field_cols.len()).max(1);
         if p <= 1 {
             for (name, data_type, col) in field_cols {
-                create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col))?;
+                create_field_file(
+                    &tmp.join(&name),
+                    data_type,
+                    FieldInit::Data(col),
+                    field_options.clone(),
+                )?;
             }
         } else {
             // round-robin 分桶（列大小不均时负载更均匀）；列所有权移动，零拷贝
@@ -949,9 +1038,15 @@ pub fn create_dataset(
                 let mut handles = Vec::new();
                 for bucket in buckets {
                     let tmp = &tmp;
+                    let fo = &field_options;
                     handles.push(s.spawn(move || -> Result<(), CoreError> {
                         for (name, data_type, col) in bucket {
-                            create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col))?;
+                            create_field_file(
+                                &tmp.join(&name),
+                                data_type,
+                                FieldInit::Data(col),
+                                fo.clone(),
+                            )?;
                         }
                         Ok(())
                     }));

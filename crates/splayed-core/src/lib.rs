@@ -12,13 +12,14 @@ pub mod scan;
 
 pub use dataset::{
     create_dataset, create_dataset_index, delete_dataset, open_dataset, CreateDatasetOptions,
-    DatasetFieldInit,
-    DatasetHandle, DatasetScanner, DatasetStatistics, RESERVED_FIELD_NAMES,
+    DatasetFieldInit, DatasetHandle, DatasetScanner, DatasetStatistics,
+    RESERVED_FIELD_NAMES, CHUNK_ROW_CAP,
 };
 pub use error::{CoreError, Mode};
 pub use field_file::{
     cast_field_file, close_field_handle, compress_field_file, create_field_file,
-    delete_field_file, decompress_field_file, open_field_file, rename_field_file, FieldChunkReader,
+    CreateFieldOptions, delete_field_file, decompress_field_file, open_field_file,
+    rename_field_file, FieldChunkReader,
     FieldHandle, FieldInit, FieldScanner, StreamValues,
 };
 pub use meta_file::{create_meta_file, delete_meta_file, MetaBuilder, MetaHandle, MetaInfo};

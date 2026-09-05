@@ -18,9 +18,17 @@ use crate::partition::{civil_from_days, partition_name, partition_range, value_t
 /// `P_part × P_field ≤ max_parallelism` 在「分区并行 × Field 并行」之间切分，
 /// 并下沉为每个 Partition `DatasetHandle` 的 Field 级并行上限（驱动
 /// write_dataset / scan_dataset 的并行分桶），避免多层并发无上界叠加。
+/// `compression` / `chunk_syms` 为**创建即压缩**策略：create_table /
+/// create_table_field 按 sym 对齐 chunk 边界（每 chunk_syms 个连续 sym 一组，
+/// 行数超过 64K 的 sym 劈开）直接创建压缩 Field；create_table_partition 可按
+/// 分区覆盖（新旧分区差异化压缩）。
 #[derive(Debug, Clone, Default)]
 pub struct TableOptions {
     pub max_parallelism: Option<usize>,
+    /// 新建 Field 的 chunk 压缩算法（None / 缺省 = 未压缩）。
+    pub compression: Option<splayed_format::Compression>,
+    /// 压缩 chunk 的 sym 分组数（缺省 = 8）。
+    pub chunk_syms: Option<usize>,
 }
 
 /// Table 的打开态对象（partition discovery + 按需打开的 Dataset 缓存）。
@@ -441,9 +449,15 @@ pub fn create_table(
         fs::create_dir_all(table_path).map_err(CoreError::Io)?;
         return Ok(());
     }
+    // 创建即压缩策略（sym 对齐 chunk 边界由 core 从输入 sym run 推导）
+    let ds_options = CreateDatasetOptions {
+        max_parallelism: max_p,
+        compression: options.compression.unwrap_or(splayed_format::Compression::None),
+        chunk_syms: options.chunk_syms.unwrap_or(8),
+    };
     if scheme == PartitionScheme::None {
         // 单 Dataset 快速路径：列所有权直接移动，不克隆
-        return create_dataset(table_path, data, CreateDatasetOptions { max_parallelism: max_p });
+        return create_dataset(table_path, data, ds_options);
     }
     // ① 主线程：一次线性扫描 → 每分区连续行片段（分区名仅换段时构造）
     let buckets = partition_spans(&data, scheme, tt)?;
@@ -453,11 +467,7 @@ pub fn create_table(
         // 单分区 / 并行度 1：串行创建，Field 级并行拿满预算
         for (name, runs) in buckets {
             let sub = gather_runs(&data, &runs)?;
-            create_dataset(
-                &table_path.join(&name),
-                sub,
-                CreateDatasetOptions { max_parallelism: max_p },
-            )?;
+            create_dataset(&table_path.join(&name), sub, ds_options.clone())?;
         }
         return Ok(());
     }
@@ -468,6 +478,7 @@ pub fn create_table(
     }
     // 共享引用先行绑定：move 闭包只捕获 &Data，不移动本体
     let data_ref = &data;
+    let ds_options_ref = &ds_options;
     std::thread::scope(|s| {
         let mut handles = Vec::new();
         for group in groups {
@@ -478,7 +489,10 @@ pub fn create_table(
                     create_dataset(
                         &table_path.join(&name),
                         sub,
-                        CreateDatasetOptions { max_parallelism: p_field },
+                        CreateDatasetOptions {
+                            max_parallelism: p_field,
+                            ..ds_options_ref.clone()
+                        },
                     )?;
                 }
                 Ok(())
@@ -510,6 +524,7 @@ pub fn create_table_partition(
     table_path: &Path,
     partition_name: &str,
     data: Data,
+    options: CreateDatasetOptions,
 ) -> Result<(), CoreError> {
     // ① 主线程轻量校验：Table 根必须存在（不隐式引导建表）
     if !table_path.is_dir() {
@@ -540,9 +555,10 @@ pub fn create_table_partition(
     if data.length() == 0 {
         return Err(CoreError::Invalid("partition data must not be empty".into()));
     }
-    // ③ 委托 Dataset 层：列所有权直接移交（无 gather / 克隆）；
+    // ③ 委托 Dataset 层：列所有权直接移交（无 gather / 克隆）；options 携带该
+    //    分区的创建即压缩策略（可与既有分区差异化——冷热分层）；
     //    失败语义与 create_table 一致——不回滚，已写入文件保留
-    create_dataset(&partition_path, data, CreateDatasetOptions::default())
+    create_dataset(&partition_path, data, options)
 }
 
 /// 删除整个 Table（根目录及全部 Partition Dataset）。
@@ -884,8 +900,29 @@ impl TableHandle {
                 )));
             }
         }
+        let compression = self
+            .options
+            .compression
+            .unwrap_or(splayed_format::Compression::None);
+        let chunk_syms = self.options.chunk_syms.unwrap_or(8);
         self.structural_for_each(|ds| {
-            ds.create_dataset_field(field, data_type, splayed_core::DatasetFieldInit::AllNull)
+            // 创建即压缩：按各分区自身的 META 网格推导 sym 对齐 chunk 边界
+            let field_options = if matches!(compression, splayed_format::Compression::None) {
+                splayed_core::CreateFieldOptions::default()
+            } else {
+                splayed_core::CreateFieldOptions {
+                    compression,
+                    chunk_offsets: Some(
+                        ds.sym_aligned_chunk_offsets(chunk_syms, splayed_core::CHUNK_ROW_CAP),
+                    ),
+                }
+            };
+            ds.create_dataset_field(
+                field,
+                data_type,
+                splayed_core::DatasetFieldInit::AllNull,
+                field_options,
+            )
         })
     }
 

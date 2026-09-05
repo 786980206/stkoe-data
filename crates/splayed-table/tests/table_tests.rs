@@ -271,13 +271,13 @@ fn partition_and_table_lifecycle() {
 
     // create_table_partition：新增 09 分区（scheme 从已有分区推断）
     let sep_sample = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 1) as i32, 12.0)]);
-    create_table_partition(&root, "month=2026-09", sep_sample).unwrap();
+    create_table_partition(&root, "month=2026-09", sep_sample, splayed_core::CreateDatasetOptions::default()).unwrap();
     // 冲突 scheme → Error
     let sep_sample2 = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 2) as i32, 13.0)]);
-    assert!(create_table_partition(&root, "year=2026", sep_sample2).is_err());
+    assert!(create_table_partition(&root, "year=2026", sep_sample2, splayed_core::CreateDatasetOptions::default()).is_err());
     // 已存在 → Error
     let dup = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 2) as i32, 13.0)]);
-    assert!(create_table_partition(&root, "month=2026-09", dup).is_err());
+    assert!(create_table_partition(&root, "month=2026-09", dup, splayed_core::CreateDatasetOptions::default()).is_err());
 
     // rename_table
     rename_table(&root, "tbl_v2").unwrap();
@@ -501,9 +501,9 @@ fn create_table_parallel_options_equivalent() {
     let (data1, expected) = parallel_opts_sample();
     let (data2, _) = parallel_opts_sample();
     let root1 = dir.join("serial");
-    create_table(&root1, data1, PartitionScheme::Month, TableOptions { max_parallelism: Some(1) }).unwrap();
+    create_table(&root1, data1, PartitionScheme::Month, TableOptions { max_parallelism: Some(1), ..Default::default() }).unwrap();
     let root2 = dir.join("par");
-    create_table(&root2, data2, PartitionScheme::Month, TableOptions { max_parallelism: Some(8) }).unwrap();
+    create_table(&root2, data2, PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
 
     let rows1 = read_rows(&root1);
     let rows2 = read_rows(&root2);
@@ -549,13 +549,13 @@ fn partition_entry_validation() {
     let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
     let sample = make_data(&[("AAPL", d803, 10.0)]);
     assert!(matches!(
-        create_table_partition(&root, "month=2026-08", sample.clone()),
+        create_table_partition(&root, "month=2026-08", sample.clone(), splayed_core::CreateDatasetOptions::default()),
         Err(splayed_core::CoreError::NotFound(_))
     ));
 
     // create：分区名不符合 scheme → Invalid
     std::fs::create_dir_all(&root).unwrap();
-    assert!(create_table_partition(&root, "not-a-partition", sample.clone()).is_err());
+    assert!(create_table_partition(&root, "not-a-partition", sample.clone(), splayed_core::CreateDatasetOptions::default()).is_err());
 
     // create：缺 sym/time 列 → Invalid（在任何盘上落痕之前失败）
     let bare = Data::new(
@@ -563,7 +563,7 @@ fn partition_entry_validation() {
         vec![Column { data_type: DataType::Float64, values: Buffer::from_slice_copy(&[1.0]), validity: None, dict: None }],
     )
     .unwrap();
-    assert!(create_table_partition(&root, "month=2026-08", bare).is_err());
+    assert!(create_table_partition(&root, "month=2026-08", bare, splayed_core::CreateDatasetOptions::default()).is_err());
 
     // create：空数据 → Invalid（禁止空 Dataset）
     let empty = Data::new(
@@ -577,7 +577,7 @@ fn partition_entry_validation() {
         ],
     )
     .unwrap();
-    assert!(create_table_partition(&root, "month=2026-08", empty).is_err());
+    assert!(create_table_partition(&root, "month=2026-08", empty, splayed_core::CreateDatasetOptions::default()).is_err());
 
     // delete：非 scheme 命名子目录拒绝删除（防误删任意目录）
     std::fs::create_dir_all(root.join("random_dir")).unwrap();
@@ -595,7 +595,7 @@ fn partition_entry_validation() {
     ));
 
     // 委托 happy path：create + delete 全链路
-    create_table_partition(&root, "month=2026-08", sample).unwrap();
+    create_table_partition(&root, "month=2026-08", sample, splayed_core::CreateDatasetOptions::default()).unwrap();
     assert!(root.join("month=2026-08").is_dir());
     delete_table_partition(&root, "month=2026-08").unwrap();
     assert!(!root.join("month=2026-08").exists());
@@ -617,7 +617,7 @@ fn table_field_struct_ops_parallel_and_state_checks() {
             }
         }
     }
-    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions { max_parallelism: Some(8) }).unwrap();
+    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
 
     let read_prices = |root: &Path| -> Vec<f64> {
         let table = open_table(root, Mode::Read, TableOptions::default()).unwrap();
@@ -633,7 +633,7 @@ fn table_field_struct_ops_parallel_and_state_checks() {
     let before = read_prices(&root);
     assert_eq!(before.len(), 12);
 
-    let table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(8) }).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
     // create：并行全分区新增（全 NULL = 稀疏 set_len，非逐行写入）
     table.create_table_field("volume", DataType::Int64).unwrap();
     assert_eq!(table.read_table_schema().unwrap().data_type_of("volume"), Some(DataType::Int64));
@@ -714,7 +714,7 @@ fn metadata_read_apis_cache_semantics() {
 
     // 缓存新鲜度（关键）：handle 打开期间**外部**新建分区 → 统计/元数据自动纳入
     let sep = make_data(&[("AAPL", d(9, 1), 1.0), ("MSFT", d(9, 2), 2.0)]);
-    create_table_partition(&root, "month=2026-09", sep).unwrap();
+    create_table_partition(&root, "month=2026-09", sep, splayed_core::CreateDatasetOptions::default()).unwrap();
     let st2 = table.read_table_statistics().unwrap();
     assert_eq!(st2.partition_count, 3);
     assert_eq!(st2.row_count, 10);
@@ -910,7 +910,7 @@ fn write_table_parallel_equivalence() {
     let root2 = dir.join("par");
     for (root, mp) in [(&root1, Some(1usize)), (&root2, Some(8usize))] {
         create_table(root, initial.clone(), PartitionScheme::Month, TableOptions::default()).unwrap();
-        let table = open_table(root, Mode::Write, TableOptions { max_parallelism: mp }).unwrap();
+        let table = open_table(root, Mode::Write, TableOptions { max_parallelism: mp, ..Default::default() }).unwrap();
         write_table(&table, &patch).unwrap();
         table.close().unwrap();
     }
@@ -947,5 +947,55 @@ fn write_table_locate_all_before_write() {
     reader.close().unwrap();
     assert_eq!(got, vec![10.0, 20.0]);
     table.close().unwrap();
+    cleanup(&dir);
+}
+
+/// 创建即压缩贯通 Table 层：create_table 压缩 + create_table_partition 差异化
+/// （新分区未压缩、旧分区压缩共存，读路径透明）。
+#[test]
+fn create_table_compression_and_partition_override() {
+    let dir = temp_dir("tbl_compress");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let initial = make_data(&[
+        ("AAPL", d(7, 1), 10.0),
+        ("AAPL", d(7, 2), 11.0),
+        ("MSFT", d(7, 1), 20.0),
+        ("MSFT", d(7, 2), 21.0),
+    ]);
+    create_table(
+        &root,
+        initial,
+        PartitionScheme::Month,
+        TableOptions {
+            compression: Some(splayed_format::Compression::Zstd),
+            chunk_syms: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // 差异化：新分区以默认选项（未压缩）创建
+    let aug = make_data(&[("AAPL", d(8, 1), 30.0), ("MSFT", d(8, 1), 40.0)]);
+    create_table_partition(&root, "month=2026-08", aug, splayed_core::CreateDatasetOptions::default()).unwrap();
+
+    // 07 分区 chunked（压缩创建）、08 分区未压缩
+    let fh07 = splayed_core::open_field_file(&root.join("month=2026-07").join("price"), Mode::Read).unwrap();
+    assert!(fh07.is_chunked());
+    splayed_core::close_field_handle(fh07).unwrap();
+    let fh08 = splayed_core::open_field_file(&root.join("month=2026-08").join("price"), Mode::Read).unwrap();
+    assert!(!fh08.is_chunked());
+    splayed_core::close_field_handle(fh08).unwrap();
+
+    // 读回跨两种物理表示，值一致
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut got = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        got.extend(f64s(view.column("price").unwrap()));
+    }
+    reader.close().unwrap();
+    assert_eq!(got, vec![10.0, 11.0, 20.0, 21.0, 30.0, 40.0]);
     cleanup(&dir);
 }

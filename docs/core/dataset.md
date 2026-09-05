@@ -46,8 +46,10 @@ Dataset（目录）
 ```rust
 pub struct CreateDatasetOptions {
     pub max_parallelism: usize,   // Field 文件并行创建的线程上限（1 = 串行）；默认 = 逻辑核数
+    pub compression: Compression, // 新建 Field 的 chunk 压缩算法（默认 None = 未压缩）
+    pub chunk_syms: usize,        // 压缩 chunk 的 sym 分组数（默认 8；行数超 64K 的 sym 按 cap 劈开）
 }
-impl Default for CreateDatasetOptions { /* std::thread::available_parallelism() */ }
+impl Default for CreateDatasetOptions { /* available_parallelism() + None + 8 */ }
 
 pub fn create_dataset(path: &Path, data: Data, options: CreateDatasetOptions) -> Result<(), CoreError>
 ```
@@ -58,7 +60,7 @@ pub fn create_dataset(path: &Path, data: Data, options: CreateDatasetOptions) ->
 | --- | --- | --- | --- |
 | `path` | `&Path` | 输入 | Dataset 目录路径；必须不存在 |
 | `data` | `Data` | 输入 | 拥有数据所有权的完整表数据（Schema + 全部列值）；必须含 `sym` 与 `time`，按 `(sym ASC, time ASC)` 排序 |
-| `options` | `CreateDatasetOptions` | 输入 | 并行选项：`max_parallelism` 控制 Field 并行创建线程数 |
+| `options` | `CreateDatasetOptions` | 输入 | `max_parallelism` 并行上限；`compression` / `chunk_syms` 创建即压缩策略（sym 对齐 chunk 边界由输入 sym run 推导，全 Field 复用） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Dataset 创建完成 |
 
 **内部实现**：
@@ -175,7 +177,7 @@ pub fn delete_dataset(path: &Path) -> Result<(), CoreError>
 ```rust
 impl DatasetHandle {
     pub fn create_dataset_field(&mut self, name: &str, data_type: DataType,
-        init: DatasetFieldInit) -> Result<(), CoreError>
+        init: DatasetFieldInit, field_options: CreateFieldOptions) -> Result<(), CoreError>
     pub fn delete_dataset_field(&mut self, name: &str) -> Result<(), CoreError>
     pub fn rename_dataset_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError>
     pub fn update_dataset_field_header(&self, name: &str, header: FieldHeader) -> Result<(), CoreError>

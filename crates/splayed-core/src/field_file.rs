@@ -35,6 +35,184 @@ pub struct StreamValues {
     pub rows: usize,
 }
 
+/// 创建即压缩的默认 chunk 行数（与 `compress_field_file` 均匀分块一致）。
+const CREATE_CHUNK_ROWS: usize = 8192;
+
+/// 拥有型 Data 的**单遍 chunked 直接创建**（压缩创建主路径）：
+/// 占位 header → 按 `CREATE_CHUNK_ROWS` 行切 chunk、逐 chunk `encode_chunk`
+/// 顺序直写（values 零拷贝切片、validity 按位切片重打包）→ 回填 header。
+/// header 约定与 `compress_field_file_encoded` 输出一致：chunked、
+/// has_validity = false（chunk 自描述携带 validity）、data_length = 逻辑字节数；
+/// null_count 精确（打开时会从解压位图重建，写值仅为一致性）。
+fn create_field_file_chunked(
+    path: &Path,
+    data_type: DataType,
+    init: FieldInit,
+    options: &CreateFieldOptions,
+) -> Result<(), CoreError> {
+    let compression = options.compression;
+    // chunk 边界：显式 offsets（sym 对齐）或均匀 8192 行（与 compress 均匀分块一致）
+    let rows_total: usize = match &init {
+        FieldInit::Data(col) => col.length(),
+        FieldInit::Length(n) => *n as usize,
+        FieldInit::Stream { .. } => {
+            return Err(CoreError::Invalid("chunked creation requires Data/Length init".into()))
+        }
+    };
+    let boundaries: Vec<(usize, usize)> = match &options.chunk_offsets {
+        Some(list) => {
+            if list.first() != Some(&0) {
+                return Err(CoreError::Invalid("chunk offsets must start at 0".into()));
+            }
+            let mut list = list.clone();
+            list.sort_unstable();
+            list.dedup();
+            if list.windows(2).any(|w| w[0] >= w[1])
+                || list.iter().any(|&o| o >= rows_total as u64)
+            {
+                return Err(CoreError::Invalid(
+                    "chunk offsets must be strictly ascending within [0, row_count)".into(),
+                ));
+            }
+            let mut ranges: Vec<(usize, usize)> = list
+                .windows(2)
+                .map(|w| (w[0] as usize, w[1] as usize))
+                .collect();
+            let last = *list.last().unwrap() as usize;
+            if last < rows_total {
+                ranges.push((last, rows_total));
+            }
+            ranges
+        }
+        None => (0..rows_total)
+            .step_by(CREATE_CHUNK_ROWS)
+            .map(|o| (o, (o + CREATE_CHUNK_ROWS).min(rows_total)))
+            .collect(),
+    };
+    match init {
+        FieldInit::Data(col) => {
+            create_field_file_chunked_data(path, data_type, col, compression, &boundaries)
+        }
+        FieldInit::Length(n) => {
+            create_field_file_chunked_all_null(path, data_type, n as usize, compression, &boundaries)
+        }
+        FieldInit::Stream { .. } => unreachable!("handled at entry"),
+    }
+}
+
+/// 拥有型 Data 的**单遍 chunked 直接创建**（压缩创建主路径）：
+/// 占位 header → 按边界切 chunk、逐 chunk `encode_chunk` 顺序直写（values 零拷贝
+/// 切片、validity 按位切片重打包）→ 回填 header。header 约定与
+/// `compress_field_file_encoded` 输出一致：chunked、has_validity = false（chunk
+/// 自描述携带 validity）、data_length = 逻辑字节数；null_count 精确（打开时会从
+/// 解压位图重建，写值仅为一致性）。
+fn create_field_file_chunked_data(
+    path: &Path,
+    data_type: DataType,
+    col: Column,
+    compression: Compression,
+    boundaries: &[(usize, usize)],
+) -> Result<(), CoreError> {
+    if col.data_type != data_type {
+        return Err(CoreError::Invalid(format!(
+            "init data type {:?} does not match requested {data_type:?}",
+            col.data_type
+        )));
+    }
+    let rows = col.length();
+    // 每行字节数：定宽 = size_of；Utf8 = 4（字典 keys）
+    let per_row = if rows > 0 { col.values.len() / rows } else { 0 };
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io(path, e))?;
+
+    // Phase 1: 占位 HEADER
+    f.write_all(&[0u8; HEADER_SIZE])?;
+
+    // Phase 2: 逐 chunk 编码直写（values 零拷贝切片；validity 按位切片重打包）
+    let bits = col.validity.as_ref().map(|b| b.as_view());
+    for &(lo, hi) in boundaries {
+        let take = hi - lo;
+        let values = &col.values.as_slice()[lo * per_row..hi * per_row];
+        let validity = bits.as_ref().map(|b| {
+            // chunk 起点非字节对齐：按位切片后重新打包
+            b.slice(lo, take).and_then(|v| Ok(v.to_packed_bytes()))
+        }).transpose()?;
+        let chunk = encode_chunk(
+            Encoding::Plain,
+            compression,
+            data_type,
+            values,
+            validity.as_deref(),
+            take,
+        )?;
+        f.write_all(&chunk)?;
+    }
+
+    // Phase 3: HEADER 回填（与 compress_field_file_encoded 输出约定一致）
+    let mut header = FieldHeader::new_uncompressed(
+        data_type,
+        1,
+        rows as u32,
+        col.null_count() as u32,
+        false,
+    );
+    header.compression = compression.id();
+    header.data_length = col.values.len() as u64;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&header.to_bytes())?;
+    Ok(())
+}
+
+/// 全 NULL 字段的 chunked 创建（`Length` + 压缩）：每 chunk 的 values 为零填充、
+/// validity 为全 0 位（行级 NULL 由位图表达，压缩后全零 chunk 体积极小）。
+/// 后续 `write_dataset` 写入走 working 表示、close 按原 chunk 分组重压缩——
+/// 字段生命周期保持压缩。
+fn create_field_file_chunked_all_null(
+    path: &Path,
+    data_type: DataType,
+    rows: usize,
+    compression: Compression,
+    boundaries: &[(usize, usize)],
+) -> Result<(), CoreError> {
+    let size = data_type.size_of();
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io(path, e))?;
+
+    // Phase 1: 占位 HEADER
+    f.write_all(&[0u8; HEADER_SIZE])?;
+
+    // Phase 2: 逐 chunk 编码直写（values 零填充、validity 全 0 位）
+    for &(lo, hi) in boundaries {
+        let take = hi - lo;
+        let zeros = vec![0u8; take * size];
+        let zero_bits = vec![0u8; validity_size(take as u32)];
+        let chunk = encode_chunk(
+            Encoding::Plain,
+            compression,
+            data_type,
+            &zeros,
+            Some(&zero_bits),
+            take,
+        )?;
+        f.write_all(&chunk)?;
+    }
+
+    // Phase 3: HEADER 回填（row_count = n、null_count = n、data_length = 逻辑字节数）
+    let mut header = FieldHeader::new_uncompressed(data_type, 1, rows as u32, rows as u32, false);
+    header.compression = compression.id();
+    header.data_length = rows as u64 * size as u64;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&header.to_bytes())?;
+    Ok(())
+}
+
+
 /// `create_field_file` 的初始化方式（docs/splayed-core.md §5.1）：
 /// 分配与写值一步完成，不做先预分配再写值的二次写入。
 pub enum FieldInit {
@@ -74,14 +252,62 @@ fn map_io(path: &Path, e: std::io::Error) -> CoreError {
 /// 统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填。
 /// 不拷贝、不拼接、不预构造大 Buffer。
 #[allow(unused_assignments)] // match arms 内赋值后由 HEADER 回填统一读取
+/// 创建 Field 文件的选项（`CreateFieldOptions::default()` = 未压缩 + 均匀分块）。
+#[derive(Debug, Clone)]
+pub struct CreateFieldOptions {
+    /// chunk 压缩算法（默认 None = 未压缩 PLAIN + NONE 路径）。
+    pub compression: Compression,
+    /// chunk 起始行号：升序、首项 0、末块隐含延伸到 row_count；用于按 sym 边界
+    /// 对齐 chunk（上层由 META 网格推导）。`None` = 按 8192 行均匀分块。
+    /// 仅 `compression != None` 时生效。
+    pub chunk_offsets: Option<Vec<u64>>,
+}
+
+impl Default for CreateFieldOptions {
+    fn default() -> Self {
+        CreateFieldOptions { compression: Compression::None, chunk_offsets: None }
+    }
+}
+
+/// 创建 Field 文件。
+///
+/// `compression = None` → 未压缩（PLAIN + NONE）路径；`Length`（全 NULL）+ 压缩 →
+/// chunked 全 NULL（后续 write 生命周期保持压缩，行级 NULL 由 validity 位图表达）；
+/// `Data` + 压缩 → **单遍 chunked 直接创建**（逐 chunk `encode_chunk` 顺序直写，
+/// 内存 O(单 chunk)，无 tmp / 无二次读）；`Stream` + 压缩 → 组合路径（两阶段
+/// reader 协议使单遍编码需物化全列：流式写未压缩 O(1) 内存 +
+/// `compress_field_file_encoded` 原地压缩 O(单 chunk)）。
 pub fn create_field_file(
     path: &Path,
     data_type: DataType,
     init: FieldInit,
+    options: CreateFieldOptions,
 ) -> Result<(), CoreError> {
     if path.exists() {
         return Err(CoreError::AlreadyExists(path.to_path_buf()));
     }
+    if matches!(options.compression, Compression::None) {
+        return create_field_file_plain(path, data_type, init);
+    }
+    if matches!(init, FieldInit::Data(_) | FieldInit::Length(_)) {
+        return create_field_file_chunked(path, data_type, init, &options);
+    }
+    create_field_file_plain(path, data_type, init)?;
+    compress_field_file_encoded(
+        path,
+        options.chunk_offsets,
+        Encoding::Plain,
+        options.compression,
+    )
+}
+
+/// 未压缩（PLAIN + NONE）创建路径：Length 稀疏 / Data 直写 / Stream 直写，
+/// 调用方保证 path 不存在。
+fn create_field_file_plain(
+    path: &Path,
+    data_type: DataType,
+    init: FieldInit,
+) -> Result<(), CoreError> {
     let mut f = File::options()
         .write(true)
         .create_new(true)
@@ -91,10 +317,10 @@ pub fn create_field_file(
     // Phase 1: 占位 HEADER
     f.write_all(&[0u8; HEADER_SIZE])?;
 
-    let mut row_count: u32 = 0;
+    let row_count: u32;
     let mut data_length: u64 = 0;
     let mut null_count: u32 = 0;
-    let mut has_validity = false;
+    let has_validity;
 
     match init {
         FieldInit::Length(n) => {
@@ -114,7 +340,6 @@ pub fn create_field_file(
                 )));
             }
             row_count = col.length() as u32;
-            data_length = col.values.len() as u64;
             has_validity = col.validity.is_some();
 
             // Phase 2: DATA 顺序写
@@ -814,7 +1039,12 @@ pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreErr
             };
             // 批次流式写出目标 Field（values → validity 三阶段顺序写；
             // reader 拥有源 Handle，结束即释放）
-            create_field_file(&tmp, target_type, FieldInit::Stream { reader: Box::new(reader) })?;
+            create_field_file(
+                &tmp,
+                target_type,
+                FieldInit::Stream { reader: Box::new(reader) },
+                CreateFieldOptions::default(),
+            )?;
             info
         };
 

@@ -97,10 +97,10 @@ impl FieldChunkReader for VecReader {
 fn create_length_gives_all_null_field() {
     let dir = temp_dir("length");
     let path = dir.join("price");
-    create_field_file(&path, DataType::Float64, FieldInit::Length(10)).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Length(10), splayed_core::CreateFieldOptions::default()).unwrap();
     // 重复创建 → AlreadyExists
     assert!(matches!(
-        create_field_file(&path, DataType::Float64, FieldInit::Length(10)),
+        create_field_file(&path, DataType::Float64, FieldInit::Length(10), splayed_core::CreateFieldOptions::default()),
         Err(splayed_core::CoreError::AlreadyExists(_))
     ));
 
@@ -121,7 +121,7 @@ fn data_init_and_positional_overwrite() {
     let dir = temp_dir("overwrite");
     let path = dir.join("price");
     let values: Vec<f64> = (0..8).map(|i| i as f64 * 1.5).collect();
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
 
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
     let view = handle.read_field_handle(0, 8).unwrap();
@@ -153,7 +153,7 @@ fn write_validity_batch_and_null_count_delta() {
     for i in (0..16).step_by(2) {
         bm.set(i, false);
     }
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
 
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
     assert_eq!(handle.header().null_count, 8);
@@ -226,6 +226,7 @@ fn validity_roundtrip_and_null_write() {
             validity: Some(bits),
             dict: None,
         }),
+        splayed_core::CreateFieldOptions::default(),
     )
     .unwrap();
 
@@ -254,10 +255,11 @@ fn stream_init_matches_data_init() {
                 phase: 0,
             }),
         },
+        splayed_core::CreateFieldOptions::default(),
     )
     .unwrap();
     let data_path = dir.join("data");
-    create_field_file(&data_path, DataType::Float64, FieldInit::Data(f64_column(&values, None))).unwrap();
+    create_field_file(&data_path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
 
     let a = open_field_file(&stream_path, Mode::Read).unwrap();
     let b = open_field_file(&data_path, Mode::Read).unwrap();
@@ -274,7 +276,7 @@ fn scan_with_predicate_and_limit() {
     let dir = temp_dir("scan");
     let path = dir.join("price");
     let values: Vec<f64> = [10.0, 55.0, 20.0, 60.0, 5.0, 70.0].to_vec();
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
 
     // 无谓词：全表
@@ -351,7 +353,7 @@ fn scan_null_excluded_at_root() {
     let mut bm = Bitmap::ones(5);
     bm.set(1, false);
     bm.set(3, false);
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
 
     // Ne 999：真实值与 NULL 行的值掩码全为 1 —— NULL 行只能由根部 validity 排除
@@ -403,7 +405,7 @@ fn scan_typed_int_ranges_order_and_merge() {
     let dir = temp_dir("scan_int");
     let path = dir.join("qty");
     let values: Vec<i32> = vec![1, 7, 3, 9, 2];
-    create_field_file(&path, DataType::Int32, FieldInit::Data(i32_column(&values))).unwrap();
+    create_field_file(&path, DataType::Int32, FieldInit::Data(i32_column(&values)), splayed_core::CreateFieldOptions::default()).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
 
     // 有符号列 × UInt 目标（跨域加宽语义）：Gt UInt(3) → 行 1, 3
@@ -451,7 +453,7 @@ fn compress_decompress_roundtrip() {
     let dir = temp_dir("compress");
     let path = dir.join("price");
     let values: Vec<f64> = (0..100).map(|i| (i % 17) as f64 * 1.25).collect();
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
 
     // 对称 offsets [0, 37] → chunks [0,37), [37,100)
     compress_field_file(&path, Some(vec![0, 37])).unwrap();
@@ -509,7 +511,7 @@ fn compress_decompress_streamed_with_validity() {
     for &r in &[5usize, 9, 16] {
         bm.set(r, false);
     }
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
 
     compress_field_file(&path, Some(vec![0, 7])).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
@@ -542,7 +544,7 @@ fn cast_converts_values_in_place() {
     let dir = temp_dir("cast");
     let path = dir.join("price");
     let values: Vec<f64> = [1.0, 2.5, -3.0].to_vec();
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
 
     cast_field_file(&path, DataType::Int64).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
@@ -570,7 +572,7 @@ fn cast_preserves_validity_generation_and_compression() {
     let mut bm = Bitmap::ones(5);
     bm.set(1, false);
     bm.set(3, false);
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
     handle.write_field_handle(0, &f64_column(&[10.0], None).as_view()).unwrap();
     close_field_handle(handle).unwrap();
@@ -616,7 +618,7 @@ fn cast_streams_across_batches() {
     for &r in &[0usize, 262143, 262144, N - 1] {
         bm.set(r, false);
     }
-    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
 
     cast_field_file(&path, DataType::Int64).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
@@ -642,12 +644,12 @@ fn cast_streams_across_batches() {
 fn rename_field_file_moves_atomically() {
     let dir = temp_dir("rename");
     let path = dir.join("old");
-    create_field_file(&path, DataType::Int32, FieldInit::Length(4)).unwrap();
+    create_field_file(&path, DataType::Int32, FieldInit::Length(4), splayed_core::CreateFieldOptions::default()).unwrap();
     rename_field_file(&path, "new").unwrap();
     assert!(!path.exists());
     assert!(dir.join("new").exists());
     // 目标已存在 → Error
-    create_field_file(&path, DataType::Int32, FieldInit::Length(4)).unwrap();
+    create_field_file(&path, DataType::Int32, FieldInit::Length(4), splayed_core::CreateFieldOptions::default()).unwrap();
     assert!(rename_field_file(&path, "new").is_err());
     cleanup(&dir);
 }
@@ -656,7 +658,7 @@ fn rename_field_file_moves_atomically() {
 fn read_out_of_bounds_rejected() {
     let dir = temp_dir("bounds");
     let path = dir.join("price");
-    create_field_file(&path, DataType::Float64, FieldInit::Length(5)).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Length(5), splayed_core::CreateFieldOptions::default()).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert!(handle.read_field_handle(3, 3).is_err());
     assert!(handle.read_field_handle(5, 1).is_err());
@@ -692,7 +694,7 @@ fn cast_f64_f32_roundtrip_preserves_values() {
         validity: None,
         dict: None,
     };
-    create_field_file(&path, DataType::Float64, FieldInit::Data(col)).unwrap();
+    create_field_file(&path, DataType::Float64, FieldInit::Data(col), splayed_core::CreateFieldOptions::default()).unwrap();
     cast_field_file(&path, DataType::Float32).unwrap();
     cast_field_file(&path, DataType::Float64).unwrap();
 
@@ -710,4 +712,108 @@ fn cast_f64_f32_roundtrip_preserves_values() {
     }
     drop(h);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 创建即压缩：Data + Zstd 单遍 chunked 创建 ≡ 创建未压缩 + compress_field_file
+/// （字节级一致，含显式 chunk_offsets 的 sym 对齐边界）；全 NULL（Length）+ 压缩
+/// 产出 chunked 全 NULL 字段。
+#[test]
+fn create_compressed_field_equivalence_and_offsets() {
+    let dir = temp_dir("create_c");
+    let values: Vec<f64> = (0..20_000).map(|i| (i % 977) as f64).collect();
+    let mut bm = Bitmap::ones(values.len());
+    bm.set(3, false);
+    bm.set(9_000, false);
+
+    // 显式 chunk offsets（模拟 sym 对齐边界）
+    let direct = dir.join("direct");
+    create_field_file(
+        &direct,
+        DataType::Float64,
+        FieldInit::Data(f64_column(&values, Some(bm.clone()))),
+        splayed_core::CreateFieldOptions {
+            compression: splayed_format::Compression::Zstd,
+            chunk_offsets: Some(vec![0, 7_000, 13_000]),
+        },
+    )
+    .unwrap();
+    // 对照：未压缩创建 + compress_field_file（同 offsets）
+    let compose = dir.join("compose");
+    create_field_file(
+        &compose,
+        DataType::Float64,
+        FieldInit::Data(f64_column(&values, Some(bm.clone()))),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+    compress_field_file(
+        &compose,
+        Some(vec![0, 7_000, 13_000]),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(&direct).unwrap(),
+        std::fs::read(&compose).unwrap(),
+        "创建即压缩与 create+compress 应字节级一致"
+    );
+
+    // 回读：值 + NULL 位图保持
+    let h = open_field_file(&direct, Mode::Read).unwrap();
+    assert!(h.is_chunked());
+    assert_eq!(h.row_count(), values.len() as u64);
+    let view = h.read_field_handle(0, values.len() as u64).unwrap();
+    assert_eq!(view.null_count(), 2);
+    let got: Vec<f64> = view
+        .segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec())
+        .collect();
+    assert_eq!(got, values);
+    close_field_handle(h).unwrap();
+
+    // 均匀分块（无显式 offsets）与 compress 默认分块字节级一致
+    let uniform_a = dir.join("uniform_a");
+    let uniform_b = dir.join("uniform_b");
+    create_field_file(
+        &uniform_a,
+        DataType::Float64,
+        FieldInit::Data(f64_column(&values, None)),
+        splayed_core::CreateFieldOptions {
+            compression: splayed_format::Compression::Zstd,
+            chunk_offsets: None,
+        },
+    )
+    .unwrap();
+    create_field_file(
+        &uniform_b,
+        DataType::Float64,
+        FieldInit::Data(f64_column(&values, None)),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+    compress_field_file(&uniform_b, None).unwrap();
+    assert_eq!(
+        std::fs::read(&uniform_a).unwrap(),
+        std::fs::read(&uniform_b).unwrap()
+    );
+
+    // 全 NULL（Length）+ 压缩 → chunked 全 NULL 字段
+    let all_null = dir.join("all_null");
+    create_field_file(
+        &all_null,
+        DataType::Float64,
+        FieldInit::Length(100),
+        splayed_core::CreateFieldOptions {
+            compression: splayed_format::Compression::Zstd,
+            chunk_offsets: None,
+        },
+    )
+    .unwrap();
+    let h = open_field_file(&all_null, Mode::Read).unwrap();
+    assert!(h.is_chunked());
+    assert_eq!(h.row_count(), 100);
+    let view = h.read_field_handle(0, 100).unwrap();
+    assert_eq!(view.null_count(), 100);
+    close_field_handle(h).unwrap();
+    cleanup(&dir);
 }

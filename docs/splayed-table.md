@@ -67,11 +67,19 @@ impl TableHandle {
     pub fn scheme(&self) -> PartitionScheme
     pub fn mode(&self) -> Mode
 }
-pub struct TableOptions { /* max_parallelism: Option<usize> */ }
+pub struct TableOptions {
+    pub max_parallelism: Option<usize>,                    // 并行总预算（缺省 = 逻辑核数）
+    pub compression: Option<splayed_format::Compression>,  // 创建即压缩（缺省 None）
+    pub chunk_syms: Option<usize>,                         // 压缩 chunk 的 sym 分组数（缺省 8）
+}
 ```
 
 **说明**：
 - `open_table` 只打开 Table 级元信息与 Partition 组织信息；Dataset 在实际 scan / read / write 时按需打开并可在内部缓存复用（实现细节，非 public API）。
+- **创建即压缩策略**：`compression` / `chunk_syms` 由 create_table / create_table_field
+  下沉——create_table 按 sym 对齐 chunk 边界（由输入 sym run 推导）直接创建压缩 Field，
+  create_table_field 按各分区自身的 META 网格推导；create_table_partition 可按分区覆盖
+  （新旧分区差异化压缩）。
 - **统一缓存模型（元数据读路径）**：`TableHandle` 内缓存两类不可变状态——
   ① `datasets`：按需打开的 `DatasetHandle`（META mmap + Schema，重复调用零 I/O）；
   ② `stats_cache`：逐分区 `DatasetStatistics`（按名 memo；逐分区统计不可变，永不失效）。
@@ -247,7 +255,8 @@ pub fn create_table(table_path: &Path, data: Data, scheme: PartitionScheme,
 
 **接口定义**：
 ```rust
-pub fn create_table_partition(table_path: &Path, partition_name: &str, data: Data) -> Result<(), CoreError>
+pub fn create_table_partition(table_path: &Path, partition_name: &str, data: Data,
+    options: CreateDatasetOptions) -> Result<(), CoreError>
 pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result<(), CoreError>
 ```
 
@@ -258,6 +267,7 @@ pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result
 | `table_path` | `&Path` | 输入 | Table 根目录；create / delete 均要求已存在（不存在 → `NotFound`，不隐式引导建表） |
 | `partition_name` | `&str` | 输入 | 必须符合当前 scheme；create 时必须不存在（已存在 → Error）；delete 时非 scheme 命名一律拒绝（防误删任意子目录） |
 | `data`（create） | `Data` | 输入 | 该 Partition 的完整 Dataset 数据（**列所有权直接移交**，无 gather / 克隆）；必须含 sym / time；空数据拒绝（禁止空 Dataset） |
+| `options`（create） | `CreateDatasetOptions` | 输入 | 该 Partition 的创建选项（`compression` / `chunk_syms` / `max_parallelism`）——**可按分区差异化压缩**（冷热分层） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Partition 创建 / 删除完成 |
 
 **内部实现流程**：
@@ -435,10 +445,13 @@ impl TableHandle {
 各 API 语义：
 
 - `create_table_field(field, data_type)`：所有 Partition 新增**全 NULL** 字段
-  （`DatasetFieldInit::AllNull` → core `FieldInit::Length`，DATA/VALIDITY 区由 OS `set_len`
-  稀疏零填充——成本 O(64B header + 稀疏扩展)/分区，非 O(total rows) 写入）。带数据
-  （data / stream）初始化形式为设计预留——要求总行数等于 `Σ L_p` 且按 Table 自然顺序排列、
-  从第一个 Partition 顺序填充——**当前未实现**。
+  （`DatasetFieldInit::AllNull` → core `FieldInit::Length`）。压缩策略（`TableOptions.compression`
+  非缺省）时产出 **chunked 全 NULL** 字段（每 chunk values 零填充 + validity 全 0 位，
+  chunk 边界按各分区自身的 META 网格 sym 对齐推导）——后续 `write_dataset` 写入走
+  working 表示、close 按原分组重压缩，字段生命周期保持压缩；缺省策略下 DATA/VALIDITY
+  区由 OS `set_len` 稀疏零填充（成本 O(64B header)/分区）。带数据（data / stream）
+  初始化形式为设计预留——要求总行数等于 `Σ L_p` 且按 Table 自然顺序排列、从第一个
+  Partition 顺序填充——**当前未实现**。
 - `delete_table_field`：直接删除物理文件，不打开 Field；META 与 sym / time 不受影响。
 - `rename_table_field`：本质是每分区一次文件 rename（纯元数据操作）。
 - `cast_table_field`：已为目标类型的 Partition 再次转换是无害 no-op；中途失败会造成

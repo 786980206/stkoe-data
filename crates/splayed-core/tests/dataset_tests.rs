@@ -3,8 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
-    create_dataset, create_dataset_index, delete_dataset, open_dataset, CoreError, CmpOp,
-    DatasetFieldInit, FieldChunkReader, Mode, Predicate, Scalar, ScanRequest, StreamValues,
+    close_field_handle, create_dataset, create_dataset_index, delete_dataset, open_dataset,
+    open_field_file, CoreError, CmpOp, DatasetFieldInit, FieldChunkReader, Mode, Predicate,
+    Scalar, ScanRequest, StreamValues,
 };
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
 
@@ -225,13 +226,13 @@ fn dataset_struct_ops_and_compression() {
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
 
     // create：全 NULL 字段
-    ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull).unwrap();
+    ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).unwrap();
     assert_eq!(ds.read_dataset_schema().data_type_of("volume"), Some(DataType::Int64));
     let view = ds.read_dataset(0, 8, Some(&["volume"])).unwrap();
     assert_eq!(view.column("volume").unwrap().null_count(), 8);
     // 重复创建 → Error；保留名 → Error
-    assert!(ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull).is_err());
-    assert!(ds.create_dataset_field( "sym", DataType::Utf8, DatasetFieldInit::AllNull).is_err());
+    assert!(ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).is_err());
+    assert!(ds.create_dataset_field( "sym", DataType::Utf8, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).is_err());
 
     // create：带数据初始化（长度必须 == L）
     let col = Column {
@@ -240,13 +241,13 @@ fn dataset_struct_ops_and_compression() {
         validity: None,
         dict: None,
     };
-    ds.create_dataset_field( "qty", DataType::Int64, DatasetFieldInit::Data(col)).unwrap();
-    assert!(ds.create_dataset_field( "qty2", DataType::Int64, DatasetFieldInit::Data(Column {
+    ds.create_dataset_field("qty", DataType::Int64, DatasetFieldInit::Data(col), splayed_core::CreateFieldOptions::default()).unwrap();
+    assert!(ds.create_dataset_field("qty2", DataType::Int64, DatasetFieldInit::Data(Column {
         data_type: DataType::Int64,
         values: Buffer::from_slice_copy(&vec![1i64; 3]),
         validity: None,
         dict: None,
-    })).is_err());
+    }), splayed_core::CreateFieldOptions::default()).is_err());
 
     // rename
     ds.rename_dataset_field( "qty", "quantity").unwrap();
@@ -369,7 +370,12 @@ fn create_dataset_field_failure_leaves_no_residue() {
 
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
     let err = ds
-        .create_dataset_field("vol", DataType::Int64, DatasetFieldInit::Stream { reader: Box::new(FailReader) })
+        .create_dataset_field(
+            "vol",
+            DataType::Int64,
+            DatasetFieldInit::Stream { reader: Box::new(FailReader) },
+            splayed_core::CreateFieldOptions::default(),
+        )
         .unwrap_err();
     assert!(matches!(err, CoreError::Invalid(_)));
     // 半成品不落痕：文件不存在、Schema 不含该字段
@@ -409,10 +415,10 @@ fn create_dataset_parallel_options() {
 
     // 串行（max_parallelism = 1）
     let root1 = dir.join("serial");
-    create_dataset(&root1, data.clone(), splayed_core::CreateDatasetOptions { max_parallelism: 1 }).unwrap();
+    create_dataset(&root1, data.clone(), splayed_core::CreateDatasetOptions { max_parallelism: 1, ..Default::default() }).unwrap();
     // 并行（max_parallelism = 8 > 字段数 → P = 2）
     let root2 = dir.join("par");
-    create_dataset(&root2, data, splayed_core::CreateDatasetOptions { max_parallelism: 8 }).unwrap();
+    create_dataset(&root2, data, splayed_core::CreateDatasetOptions { max_parallelism: 8, ..Default::default() }).unwrap();
 
     for root in [&root1, &root2] {
         let ds = open_dataset(&root, Mode::Read).unwrap();
@@ -644,6 +650,43 @@ fn read_dataset_projection_request_order_and_validation() {
         ds.read_dataset(0, 4, Some(&["nope"])),
         Err(CoreError::Invalid(_))
     ));
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
+
+/// 创建即压缩贯通 Dataset 层：compression + chunk_syms → 字段以 sym 对齐 chunk
+/// 直接创建（is_chunked），读回值不变。
+#[test]
+fn create_dataset_with_compression() {
+    let dir = temp_dir("ds_compress");
+    let root = dir.join("ds");
+    create_dataset(
+        &root,
+        two_field_data(),
+        splayed_core::CreateDatasetOptions {
+            compression: splayed_format::Compression::Zstd,
+            chunk_syms: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // 字段文件为 chunked 物理表示（sym 对齐：2 sym → 2 chunk）
+    let fh = open_field_file(&root.join("price"), Mode::Read).unwrap();
+    assert!(fh.is_chunked());
+    close_field_handle(fh).unwrap();
+
+    // 读回值一致
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+    let view = ds.read_dataset(0, 4, Some(&["price"])).unwrap();
+    let prices: Vec<f64> = view
+        .column("price")
+        .unwrap()
+        .segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec())
+        .collect();
+    assert_eq!(prices, vec![10.0, 11.0, 20.0, 21.0]);
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }

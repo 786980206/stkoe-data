@@ -51,45 +51,64 @@ impl FieldHandle {
 
 **接口定义**：
 ```rust
-pub fn create_field_file(path: &Path, data_type: DataType, init: FieldInit) -> Result<(), CoreError>
+pub struct CreateFieldOptions {
+    pub compression: Compression,        // chunk 压缩算法（默认 None = PLAIN + NONE）
+    pub chunk_offsets: Option<Vec<u64>>, // chunk 起始行（升序、首项 0）；None = 均匀 8192 行
+}
+impl Default for CreateFieldOptions { /* None + None */ }
+
+pub fn create_field_file(path: &Path, data_type: DataType, init: FieldInit,
+    options: CreateFieldOptions) -> Result<(), CoreError>
 ```
 
 **参数**：
 
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `path` | `&Path` | 输入 | Field 文件路径（文件名即字段名） |
+| `path` | `&Path` | 输入 | Field 文件路径（文件名即字段名）；已存在 → Error |
 | `data_type` | `DataType` | 输入 | 列数据类型 |
 | `init` | `FieldInit` | 输入 | 初始化方式，见下表 |
+| `options` | `CreateFieldOptions` | 输入 | 创建选项：`compression`（默认 None）+ `chunk_offsets`（**sym 对齐边界**，由上层从 META 网格 / 输入 sym run 推导；None = 均匀 8192 行；仅压缩时生效） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 创建完成；此后才可被 `open_field_file` 打开（create 不返回 Handle） |
 
 `FieldInit` 变体：
 
 | 变体 | 载荷 | 说明 |
 | --- | --- | --- |
-| `Length(u64)` | 行数 `n` | 全 NULL 占位 Field（validity 全 0） |
+| `Length(u64)` | 行数 `n` | 全 NULL 占位 Field（validity 全 0）；**压缩时**产出 chunked 全 NULL 字段（每 chunk values 零填充 + validity 全 0 位，后续 write 生命周期保持压缩） |
 | `Data(Column)` | 拥有型列 | 带数据初始化；`row_count` = 数据长度；数据全有效时不写 validity 区 |
 | `Stream { reader: Box<dyn FieldChunkReader> }` | 流式读取器 | 两相迭代：先 `next_values()` 消费全部 values，再 `next_validity()` 消费 validity 位；最终长度无需预先知道 |
 
-**内部实现**（统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填）：
+**内部实现流程（按 options 分派）**：
 ```
-占位      →  写 64B 零填充 HEADER
-DATA      →  length(n)：set_len(64+data+validity)，DATA + VALIDITY 由 OS 零填充（全 NULL）
-              data(col) / stream(r)：循环 write_all(values)（stream 经两相迭代 next_values）
-VALIDITY  →  data(col)：write_all(validity_bits)（全有效不写 validity 区）
-              stream(r)：seek 至 VALIDITY 起 → 循环 next_validity 顺序写
-              → set_len 规整（不足零填充 = NULL；批尾越界填充字节截断）
-回填      →  seek(0) 回填 HEADER（row_count / data_length / null_count；
-              stream 的 null_count 由 validity 位 word 批量 popcount 精确统计）
+compression = None            →  未压缩路径（PLAIN + NONE；三阶段顺序写：
+                                 HEADER 占位 → DATA/VALIDITY 顺序写 → HEADER 回填；
+                                 length(n) 走 set_len 稀疏零填充，O(1) 不触碰数据页）
+compression != None：
+  Length(n)                   →  chunked 全 NULL：逐 chunk encode_chunk（values 零填充 +
+                                 validity 全 0 位）——后续 write 生命周期保持压缩
+  Data(col)                   →  **单遍 chunked 直接创建**（主路径）：
+                                 占位 header → 按边界切 chunk、逐 chunk encode_chunk
+                                 顺序直写（values 零拷贝切片、validity 按位切片重打包）
+                                 → 回填 header；内存 O(单 chunk)，无 tmp / 无二次读
+  Stream(reader)              →  组合路径：未压缩流式创建（O(1) 内存，两相协议）
+                                 + compress_field_file_encoded 原地压缩（O(单 chunk)）；
+                                 两相协议（先全部 values 后全部 validity）使单遍
+                                 chunked 编码需物化全列，故不走直接路径
+chunked header 回填约定       →  与 compress_field_file 输出一致：chunked、
+                                 has_validity = false（validity 在 chunk 内自描述）、
+                                 data_length = 逻辑字节数、null_count 精确
+                                 （打开时会从解压位图重建，写值仅为一致性）
 ```
-- 三种 init 共用 `File::options().write(true).create_new(true)` 防止覆盖已有文件
-- data 形态全有效时 `has_validity = 0`（不写 validity 区，文件更小）
 
 **说明**：
-- `header` 不要求调用方完整构造；可从 `path / data_type / init` 推断的信息由 core 生成。
+- **统一编码出口**：压缩创建与 `compress_field_file` 复用同一 `encode_chunk` 与 chunk
+  格式，二者对同一输入 + 同一边界的输出**字节级一致**（测试锁定）。
+- `header` 不要求调用方完整构造；可从 `path / data_type / init / options` 推断的信息由 core 生成。
 - 必须包含 `sym` 与 `time` 的约定属于 Dataset / Table 层；Field 层不关心字段名语义。
 - 创建完成前由调用方决定是否 fsync；配合上层（Dataset / Table）的临时文件 + 原子 rename。
 - 带数据初始化时写真实 `null_count`；stream 初始化由 validity 位 word 批量 popcount 精确统计。
+- `create_field_file` 内部不开启线程；并行度由上层（Dataset / Table）控制。
 
 ### 5.3 open_field_file
 

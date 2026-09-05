@@ -182,7 +182,7 @@ META 创建后 layout 固定、进入只读状态；不提供 update / compress 
 | 28 | 4 | `null_count` | uint32 | NULL 数；无 validity 区时为 0 |
 | 32 | 4 | reserved | uint32 | 预留 |
 | 36 | 4 | reserved | uint32 | 预留 |
-| 40 | 8 | `data_length` | uint64 | DATA 区字节长度 |
+| 40 | 8 | `data_length` | uint64 | DATA 区字节长度（未压缩语义；chunked 文件不消费该字段——物理大小由 chunk 自描述头承载，取值保持逻辑字节数以与 compress 输出一致） |
 | 48 | 8 | `validity_offset` | uint64 | VALIDITY 区起始；0 表示无 validity 区 |
 | 56 | 8 | reserved | uint64 | 预留 |
 | 64 |  | HEADER END |  | 固定 64 字节 |
