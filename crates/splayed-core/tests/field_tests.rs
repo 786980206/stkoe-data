@@ -5,7 +5,7 @@ use std::path::Path;
 use splayed_core::{
     cast_field_file, close_field_handle, compress_field_file, create_field_file,
     decompress_field_file, delete_field_file, open_field_file, rename_field_file, FieldChunkReader,
-    FieldHandle, FieldInit, Mode, Predicate, RowRange, Scalar, ScanRequest, StreamChunk,
+    FieldHandle, FieldInit, Mode, Predicate, RowRange, Scalar, ScanRequest, StreamValues,
 };
 use splayed_format::{Bitmap, Buffer, BufferView, Column, ColumnView, DataType};
 
@@ -47,23 +47,41 @@ struct VecReader {
     chunk_rows: usize,
     size: usize,
     pos: usize,
+    phase: u8, // 0 = values, 1 = validity, 2 = done
 }
 
 impl FieldChunkReader for VecReader {
-    fn next_chunk(&mut self) -> splayed_core::Result<Option<StreamChunk>> {
+    fn next_values(&mut self) -> splayed_core::Result<Option<StreamValues>> {
+        if self.phase != 0 {
+            return Ok(None);
+        }
         if self.pos * self.size >= self.values.len() {
+            self.phase = 1;
             return Ok(None);
         }
         let rows = self
             .chunk_rows
             .min((self.values.len() / self.size) - self.pos);
-        let chunk = StreamChunk {
+        let chunk = StreamValues {
             values: self.values[self.pos * self.size..(self.pos + rows) * self.size].to_vec(),
-            validity: None,
             rows,
         };
         self.pos += rows;
         Ok(Some(chunk))
+    }
+
+    fn next_validity(&mut self) -> splayed_core::Result<Option<Vec<u8>>> {
+        if self.phase == 0 {
+            self.phase = 1;
+        }
+        if self.phase == 1 {
+            self.phase = 2;
+            // 全有效
+            let total = self.values.len() / self.size;
+            Ok(Some(vec![0xFFu8; (total + 7) / 8]))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -154,12 +172,12 @@ fn stream_init_matches_data_init() {
         &stream_path,
         DataType::Float64,
         FieldInit::Stream {
-            chunk_rows: 7,
             reader: Box::new(VecReader {
                 values: bytemuck::cast_slice::<f64, u8>(&values).to_vec(),
                 chunk_rows: 7,
                 size: 8,
                 pos: 0,
+                phase: 0,
             }),
         },
     )

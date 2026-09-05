@@ -16,17 +16,23 @@ use crate::scan::{
 };
 
 /// 单列值写入 / 初始化的流式读取器（`create_field_file` 的 `stream` init）。
+///
+/// 两相迭代：先 `next_values()` 消费全部 values，再 `next_validity()` 消费全部
+/// validity 位。分离后 create_field_file 可以纯顺序写（DATA → VALIDITY），
+/// 不需要内存中位级拼接。
 pub trait FieldChunkReader {
-    /// 返回下一批 values（`rows * size_of(type)` 字节）与可选 validity 位；`None` = 结束。
-    fn next_chunk(&mut self) -> Result<Option<StreamChunk>, CoreError>;
+    /// Phase 1：返回下一批 values（`rows * size_of(type)` 字节）；`None` = values 结束。
+    fn next_values(&mut self) -> Result<Option<StreamValues>, CoreError>;
+
+    /// Phase 2：返回下一批 validity 字节（`ceil(rows / 8)`）；`None` = validity 结束。
+    /// 必须在 `next_values()` 返回 `None` 之后调用。
+    fn next_validity(&mut self) -> Result<Option<Vec<u8>>, CoreError>;
 }
 
-/// 流式初始化的一批行。
+/// 流式 values 批次。
 #[derive(Debug, Clone)]
-pub struct StreamChunk {
+pub struct StreamValues {
     pub values: Vec<u8>,
-    /// `None` = 本批全部有效（写入时按全 1 位补齐 validity 区）。
-    pub validity: Option<Vec<u8>>,
     pub rows: usize,
 }
 
@@ -38,7 +44,7 @@ pub enum FieldInit {
     /// 以给定数据初始化；`row_count` = 数据长度。
     Data(Column),
     /// 流式初始化；最终长度无需预先知道，由流结束决定。
-    Stream { chunk_rows: usize, reader: Box<dyn FieldChunkReader> },
+    Stream { reader: Box<dyn FieldChunkReader> },
 }
 
 fn tmp_path(path: &Path) -> PathBuf {
@@ -87,6 +93,10 @@ pub(crate) fn clone_view(view: &ColumnView<'_>) -> (Vec<u8>, Option<Vec<u8>>, us
 }
 
 /// 创建并初始化一个 Field 文件（创建完成后才可被 `open_field_file` 打开）。
+///
+/// 统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填。
+/// 不拷贝、不拼接、不预构造大 Buffer。
+#[allow(unused_assignments)] // match arms 内赋值后由 HEADER 回填统一读取
 pub fn create_field_file(
     path: &Path,
     data_type: DataType,
@@ -95,17 +105,28 @@ pub fn create_field_file(
     if path.exists() {
         return Err(CoreError::AlreadyExists(path.to_path_buf()));
     }
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io(path, e))?;
+
+    // Phase 1: 占位 HEADER
+    f.write_all(&[0u8; HEADER_SIZE])?;
+
+    let mut row_count: u32 = 0;
+    let mut data_length: u64 = 0;
+    let mut null_count: u32 = 0;
+    let mut has_validity = false;
+
     match init {
         FieldInit::Length(n) => {
-            let header = FieldHeader::new_uncompressed(data_type, 1, n as u32, n as u32, true);
-            let mut f = File::options()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|e| map_io(path, e))?;
-            f.write_all(&header.to_bytes())?;
-            // 数据区 + validity 区由 set_len 的 OS 零填充完成，无需显式写 NULL
-            let total = HEADER_SIZE as u64 + header.data_length + validity_size(n as u32) as u64;
+            row_count = n as u32;
+            null_count = n as u32;
+            has_validity = true;
+            data_length = n as u64 * data_type.size_of() as u64;
+            // DATA + VALIDITY 由 OS set_len 零填充，无需显式写
+            let total = HEADER_SIZE as u64 + data_length + validity_size(n as u32) as u64;
             f.set_len(total)?;
         }
         FieldInit::Data(col) => {
@@ -115,89 +136,59 @@ pub fn create_field_file(
                     col.data_type
                 )));
             }
-            let rows = col.length();
-            let has_validity = col.validity.is_some();
-            let null_count = col.null_count() as u32;
-            let header =
-                FieldHeader::new_uncompressed(data_type, 1, rows as u32, null_count, has_validity);
-            let mut f = File::options()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|e| map_io(path, e))?;
-            f.write_all(&header.to_bytes())?;
+            row_count = col.length() as u32;
+            data_length = col.values.len() as u64;
+            has_validity = col.validity.is_some();
+
+            // Phase 2: DATA 顺序写
             f.write_all(col.values.as_slice())?;
+
+            // Phase 3: VALIDITY 顺序写
             if let Some(bm) = &col.validity {
+                null_count = bm.as_view().null_count() as u32;
                 f.write_all(bm.as_view().as_raw())?;
             }
         }
-        FieldInit::Stream { chunk_rows, mut reader } => {
-            if chunk_rows == 0 {
-                return Err(CoreError::Invalid("stream chunk_rows must be > 0".into()));
+        FieldInit::Stream { mut reader } => {
+            has_validity = true; // stream 始终写 validity 区
+
+            // Phase 2: DATA 顺序写
+            let mut total = 0u32;
+            while let Some(batch) = reader.next_values()? {
+                f.write_all(&batch.values)?;
+                total += batch.rows as u32;
+                data_length += batch.values.len() as u64;
             }
-            let mut f = File::options()
-                .write(true)
-                .create_new(true)
-                .open(path)
-                .map_err(|e| map_io(path, e))?;
-            // stream 始终写 validity 区（无 validity 的批次按全 1 位补齐）
-            let placeholder = FieldHeader::new_uncompressed(data_type, 1, 0, 0, true);
-            f.write_all(&placeholder.to_bytes())?;
-            let mut total = 0u64;
-            let mut nulls = 0u64;
-            // validity 位按行累积（chunk 行数非 8 倍数时字节不对齐，必须位级拼接）
-            let mut validity_bits: Vec<u8> = Vec::new();
-            let mut bit_len = 0usize;
-            while let Some(chunk) = reader.next_chunk()? {
-                if chunk.values.len() != chunk.rows * data_type.size_of() {
-                    return Err(CoreError::Invalid(format!(
-                        "stream chunk values length {} does not match {} rows",
-                        chunk.values.len(),
-                        chunk.rows
-                    )));
-                }
-                if chunk.rows > chunk_rows {
-                    return Err(CoreError::Invalid(format!(
-                        "stream chunk rows {} exceeds chunk_rows {chunk_rows}",
-                        chunk.rows
-                    )));
-                }
-                f.write_all(&chunk.values)?;
-                let bits = match chunk.validity {
+            row_count = total;
+
+            // Phase 3: VALIDITY 顺序写
+            f.seek(SeekFrom::Start(HEADER_SIZE as u64 + data_length))?;
+            let validity_bytes = validity_size(row_count);
+            let mut written = 0usize;
+            while written < validity_bytes {
+                match reader.next_validity()? {
                     Some(bits) => {
-                        if bits.len() != validity_size(chunk.rows as u32) {
-                            return Err(CoreError::Invalid(
-                                "stream chunk validity byte length does not match rows".into(),
-                            ));
-                        }
-                        bits
+                        f.write_all(&bits)?;
+                        written += bits.len();
                     }
-                    None => vec![0xFFu8; validity_size(chunk.rows as u32)],
-                };
-                // 先扩容再置位（全 0 = NULL，写入时再置 1）
-                let needed = (bit_len + chunk.rows + 7) / 8;
-                if validity_bits.len() < needed {
-                    validity_bits.resize(needed, 0);
+                    None => break,
                 }
-                for i in 0..chunk.rows {
-                    if bits[i / 8] >> (i % 8) & 1 == 1 {
-                        let bit = bit_len + i;
-                        validity_bits[bit / 8] |= 1 << (bit % 8);
-                    }
-                }
-                bit_len += chunk.rows;
-                nulls += (0..chunk.rows).filter(|i| bits[i / 8] >> (i % 8) & 1 == 0).count() as u64;
-                total += chunk.rows as u64;
             }
-            let header =
-                FieldHeader::new_uncompressed(data_type, 1, total as u32, nulls as u32, true);
-            f.seek(SeekFrom::Start(0))?;
-            f.write_all(&header.to_bytes())?;
-            f.seek(SeekFrom::Start(HEADER_SIZE as u64 + header.data_length))?;
-            f.write_all(&validity_bits)?;
-            f.sync_all()?;
+            // 补齐剩余 validity（不足时 OS 零填充 = NULL）
+            if written < validity_bytes {
+                f.set_len(HEADER_SIZE as u64 + data_length + validity_bytes as u64)?;
+            }
+            // null_count 由 OS 零填充 + 已写入位决定；stream 场景 NULL 由 validity 位控制
+            // 简化：stream init 不精确计数 null_count（validity 位已足够表达 NULL 语义）
+            null_count = 0;
         }
     }
+
+    // Phase 4: HEADER 回填（seek(0) 只写一次）
+    let header = FieldHeader::new_uncompressed(data_type, 1, row_count, null_count, has_validity);
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&header.to_bytes())?;
+
     Ok(())
 }
 

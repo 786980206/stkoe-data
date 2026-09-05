@@ -9,7 +9,7 @@ use crate::error::{map_io_path, CoreError, Mode};
 use crate::field_file::{
     close_field_handle, create_field_file, delete_field_file, open_field_file, rename_field_file,
     cast_field_file, compress_field_file, decompress_field_file, FieldChunkReader, FieldHandle,
-    FieldInit, StreamChunk,
+    FieldInit, StreamValues,
 };
 use crate::meta_file::{create_meta_file, MetaHandle};
 use crate::scan::{clamp_ranges, Predicate, RowRange, ScanRequest};
@@ -46,28 +46,39 @@ pub enum DatasetFieldInit {
     /// 带数据初始化；行数必须恰为 `L`。
     Data(Column),
     /// 流式初始化；累计行数必须恰为 `L`。
-    Stream { chunk_rows: usize, reader: Box<dyn FieldChunkReader> },
+    Stream { reader: Box<dyn FieldChunkReader> },
 }
 
 /// 校验流式总长度恰为 L 的包装 reader。
 struct LengthCheckReader {
     inner: Box<dyn FieldChunkReader>,
     expected: u64,
-    got: u64,
+    got_values: u64,
+    got_validity: u64,
 }
 
 impl FieldChunkReader for LengthCheckReader {
-    fn next_chunk(&mut self) -> Result<Option<StreamChunk>, CoreError> {
-        match self.inner.next_chunk()? {
-            Some(chunk) => {
-                self.got += chunk.rows as u64;
-                Ok(Some(chunk))
+    fn next_values(&mut self) -> Result<Option<StreamValues>, CoreError> {
+        match self.inner.next_values()? {
+            Some(v) => {
+                self.got_values += v.rows as u64;
+                Ok(Some(v))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn next_validity(&mut self) -> Result<Option<Vec<u8>>, CoreError> {
+        match self.inner.next_validity()? {
+            Some(bits) => {
+                self.got_validity += bits.len() as u64 * 8;
+                Ok(Some(bits))
             }
             None => {
-                if self.got != self.expected {
+                if self.got_values != self.expected {
                     return Err(CoreError::Invalid(format!(
-                        "stream produced {0} rows, expected {1}",
-                        self.got, self.expected
+                        "stream produced {} rows, expected {}",
+                        self.got_values, self.expected
                     )));
                 }
                 Ok(None)
@@ -349,9 +360,8 @@ impl DatasetHandle {
                 }
                 FieldInit::Data(col)
             }
-            DatasetFieldInit::Stream { chunk_rows, reader } => FieldInit::Stream {
-                chunk_rows,
-                reader: Box::new(LengthCheckReader { inner: reader, expected: l, got: 0 }),
+            DatasetFieldInit::Stream { reader } => FieldInit::Stream {
+                reader: Box::new(LengthCheckReader { inner: reader, expected: l, got_values: 0, got_validity: 0 }),
             },
         };
         create_field_file(&self.field_path(name), data_type, init)?;

@@ -18,7 +18,7 @@ pub use error::{CoreError, Mode};
 pub use field_file::{
     cast_field_file, close_field_handle, compress_field_file, create_field_file,
     delete_field_file, decompress_field_file, open_field_file, rename_field_file, FieldChunkReader,
-    FieldHandle, FieldInit, FieldScanner, StreamChunk,
+    FieldHandle, FieldInit, FieldScanner, StreamValues,
 };
 pub use meta_file::{create_meta_file, delete_meta_file, MetaBuilder, MetaHandle, MetaInfo};
 pub use scan::{merge_ranges, CmpOp, Predicate, RowRange, Scalar, ScanRequest};
