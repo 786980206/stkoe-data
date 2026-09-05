@@ -364,7 +364,12 @@ impl DatasetHandle {
                 reader: Box::new(LengthCheckReader { inner: reader, expected: l, got_values: 0, got_validity: 0 }),
             },
         };
-        create_field_file(&self.field_path(name), data_type, init)?;
+        if let Err(e) = create_field_file(&self.field_path(name), data_type, init) {
+            // 失败清理半成品：create 直接写最终路径，残留文件带零填充占位 header，
+            // 会污染后续 build_schema / open_dataset（Schema 尚未同步，文件必须不落痕）
+            let _ = fs::remove_file(self.field_path(name));
+            return Err(e);
+        }
         self.reload_schema();
         Ok(())
     }

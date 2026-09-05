@@ -3,8 +3,8 @@
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
-    create_dataset, create_dataset_index, delete_dataset, open_dataset, CmpOp, DatasetFieldInit,
-    Mode, Predicate, Scalar, ScanRequest,
+    create_dataset, create_dataset_index, delete_dataset, open_dataset, CoreError, CmpOp,
+    DatasetFieldInit, FieldChunkReader, Mode, Predicate, Scalar, ScanRequest, StreamValues,
 };
 use splayed_format::{Buffer, Column, Data, DataType, FieldSchema, Schema};
 
@@ -343,4 +343,43 @@ fn dataset_index_rebuild() {
     delete_dataset(&root).unwrap();
     assert!(!root.exists());
     cleanup(&dir);
+}
+
+/// 立即失败的流式 reader（模拟源数据中断）。
+struct FailReader;
+impl FieldChunkReader for FailReader {
+    fn next_values(&mut self) -> splayed_core::Result<Option<StreamValues>> {
+        Err(CoreError::Invalid("stream source aborted".into()))
+    }
+    fn next_validity(&mut self) -> splayed_core::Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn create_dataset_field_failure_leaves_no_residue() {
+    let dir = temp_dir("create_field_fail");
+    let root = dir.join("ds");
+    let data = make_data(
+        &["A", "A", "A", "A", "B", "B", "B", "B"],
+        &[1, 2, 3, 4, 1, 2, 3, 4],
+        &[10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0],
+    );
+    create_dataset(&root, data).unwrap();
+
+    let mut ds = open_dataset(&root, Mode::Write).unwrap();
+    let err = ds
+        .create_dataset_field("vol", DataType::Int64, DatasetFieldInit::Stream { reader: Box::new(FailReader) })
+        .unwrap_err();
+    assert!(matches!(err, CoreError::Invalid(_)));
+    // 半成品不落痕：文件不存在、Schema 不含该字段
+    assert!(!root.join("vol").exists());
+    assert!(ds.read_dataset_schema().position("vol").is_none());
+    ds.close_dataset().unwrap();
+
+    // 重新 open 不受残留影响（这是修复前的失败场景：零填充占位 header 破坏 build_schema）
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+    assert!(ds.read_dataset_schema().position("vol").is_none());
+    ds.close_dataset().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

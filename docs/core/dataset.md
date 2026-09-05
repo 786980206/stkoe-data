@@ -192,14 +192,32 @@ compress →  释放缓存 → 由 META 的 SYM INDEX 生成 chunk 边界（k �
 decompress → 释放缓存 → decompress_field_file（chunk 流式）
 ```
 
-**说明**：
+**说明**（Dataset Field 结构操作九原则）：
+1. **统一复用 Field 层 API**：Dataset 层只负责校验、缓存管理和 Schema 同步。
+2. **操作前释放缓存 Handle**（`fields.borrow_mut().remove(name)`）：避免文件替换 / rename 后
+   持有旧 mmap（Windows 关键）；update_header 例外——原地 header 写经缓存 Handle 直接生效。
+3. **create / delete / rename / cast / compress / decompress 全部原子完成**，失败不破坏原文件。
+4. **create 直接写入最终数据**：AllNull → set_len 零填充；Data → values 直写；Stream → 三阶段
+   顺序写，无中间 Buffer 拷贝。
+5. **cast / compress / decompress 全部流式处理**，内存控制在批次 / chunk 级。
+6. **compress 的 chunk 边界优先复用 META 的 sym 边界**（`sym_aligned_offsets(k=8, cap=64K)`，
+   从 SYM INDEX 累计 row_start，零数据扫描；超长 sym 按 cap 劈开）。
+7. **update_header 只修改允许修改的物理属性**：`data_type / row_count` 由 Core 强制保持一致，
+   `null_count` 为派生统计保持现值。
+8. **结构操作完成后立即同步 Schema**（`reload_schema()`）；compress / decompress / update_header
+   不改逻辑 Schema（data_type 不变），无需 reload。
+9. **这些 API 不引入并行参数**；批量操作的并行由更高层（Table / 执行层）统一调度。
+
+**核心原则：Dataset 层不重复做数据处理，只做"校验 → 调 Field → 更新 Schema"，性能优化全部下沉到 Field 层。**
+
 - 共同语义：
   - `sym / time` 不作为普通 Field 操作；其身份由 META 管理。
   - 新增：名称不得与已有 Field 重复；字段长度必须等于当前逻辑长度 `L`；不改变 sym / time 范围；完成后 Schema 同步增长。
+  - create 失败（如 Stream 源数据中断）立即删除半成品文件——直接写最终路径的残留会带零填充
+    占位 header，污染后续 build_schema / open_dataset（Schema 未同步，文件必须不落痕）。
   - 删除：META 不受影响；Schema 同步移除。
   - rename：原子完成，失败时原字段名保持不变；完成后 Schema 同步更新。
   - cast：完成后 Schema 中该 Field 类型更新。
-  - compress 的 chunk 边界来自 META 网格（sym 对齐），decompress 直接转发；批量 = 多次调用。
 
 ### 7.8 read_dataset_schema
 
