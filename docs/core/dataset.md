@@ -85,8 +85,20 @@ pub fn create_dataset_index(path: &Path, data: &DataView<'_>) -> Result<(), Core
 | `data` | `&DataView<'_>` | 输入 | sym / time 两列逻辑数据（要求同 `MetaBuilder::build`） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = `.meta` 创建 / 重建完成 |
 
+**内部实现**：
+```
+create_meta_file(&path.join(".meta"), data)
+    → MetaBuilder::build（单遍扫描 → TIME AXIS sort+dedup → SYM INDEX 连续子区间校验）
+    → write_meta_atomic（tmp + sync_all + rename，失败清理）
+```
+
 **说明**：
-- Dataset 层对 `create_meta_file(path/.meta, data)` 的封装；只创建 / 重建 `.meta`，不创建 Field。用于 META 重建场景。
+- **薄封装原则**：本接口只是 Dataset → META 的一行委托，性能优化全部放在 `MetaBuilder`；
+  这一层不重复扫描、不拷贝 sym/time、不引入并行（`data` 以借用 `&DataView` 直传，无所有权/拷贝要求）。
+- 只创建 / 重建 `.meta`，不创建 Field。用于 META 重建场景。
+- 重建期间不应持有该 `.meta` 的打开 Handle（含 open 着的 DatasetHandle）：原子 rename 替换时
+  Windows 上会因文件被占用而失败——先 `close_dataset` 再重建。
+- 路径校验委托 META 层：目录不存在时返回底层 IO/NotFound 错误，本层不重复校验。
 
 ### 7.5 open_dataset
 
