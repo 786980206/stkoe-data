@@ -533,59 +533,90 @@ impl MetaHandle {
     /// `pairs` 按 `(sym ASC, time ASC)` 排序且唯一；返回合并后的连续 RowRanges，
     /// `sum(length) == pairs.len()` 是定位成功的充要条件；key 不存在 → Error。
     pub fn locate_index_handle(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
-        // 1) 输入 sym → 字典 id（不存在 → Error）
-        let mut ids: Vec<(u32, i64)> = Vec::with_capacity(pairs.len());
-        for (sym, t) in pairs {
-            match self.sym_id_of(sym)? {
-                Some(id) => ids.push((id, *t)),
-                None => {
-                    return Err(CoreError::Invalid(format!(
-                        "locate: sym '{sym}' does not exist in META"
-                    )))
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut ranges: Vec<RowRange> = Vec::new();
+        let mut sym_cursor = 0usize;   // SYM INDEX 游标（单调，只前进）
+        let mut time_cursor = 0usize;  // TIME AXIS 游标（sym 切换时重置到 time_start）
+        let mut cached_rec = SymIndexRecord { time_start: 0, time_count: 0, row_start: 0 };
+        let mut cached_sym_id = usize::MAX;
+
+        for i in 0..pairs.len() {
+            let (sym, time) = &pairs[i];
+            let time_u = *time as u64;
+
+            // 排序校验（内联，无额外遍历）
+            if i > 0 {
+                let (ps, pt) = &pairs[i - 1];
+                if ps.as_str() > sym.as_str() || (ps == sym && *pt >= *time) {
+                    return Err(CoreError::Invalid(
+                        "locate input must be sorted and unique by (sym ASC, time ASC)".into(),
+                    ));
                 }
             }
-        }
-        // 2) 校验有序唯一
-        for w in ids.windows(2) {
-            if w[0] >= w[1] {
-                return Err(CoreError::Invalid(
-                    "locate input must be sorted and unique by (sym, time)".into(),
-                ));
+
+            // sym 游标单调推进（O(S) 总计，两指针）
+            while sym_cursor < self.header.sym_count as usize {
+                let s = self.sym_str(sym_cursor as u32)?;
+                match s.as_bytes().cmp(sym.as_bytes()) {
+                    std::cmp::Ordering::Less => { sym_cursor += 1; }
+                    std::cmp::Ordering::Equal => break,
+                    std::cmp::Ordering::Greater => {
+                        return Err(CoreError::Invalid(format!(
+                            "locate: sym '{sym}' does not exist in META"
+                        )));
+                    }
+                }
             }
-        }
-        // 3) 逐 key 定位：时间值 → 轴 index → sym 区间内判存 → 连续行合并
-        let mut raw: Vec<RowRange> = Vec::with_capacity(ids.len());
-        let mut current_sym: Option<u32> = None;
-        let mut record = SymIndexRecord { time_start: 0, time_count: 0, row_start: 0 };
-        for (id, t) in &ids {
-            if current_sym != Some(*id) {
-                record = self.sym_record(*id)?;
-                current_sym = Some(*id);
-            }
-            // 时间值 → 轴 index（精确匹配；不在轴上 = key 不存在）
-            let Some(t_idx) = self.axis_index_of(*t as u64) else {
+            if sym_cursor >= self.header.sym_count as usize {
                 return Err(CoreError::Invalid(format!(
-                    "locate: (sym, time) key does not exist: time {t} for sym '{}'",
-                    self.sym_str(*id)?
+                    "locate: sym '{sym}' does not exist in META"
                 )));
-            };
-            let Some(row) = record.global_row(t_idx) else {
+            }
+
+            // sym 切换时刷新 record 缓存 + 重置 time 游标
+            if cached_sym_id != sym_cursor {
+                cached_rec = self.sym_record(sym_cursor as u32)?;
+                cached_sym_id = sym_cursor;
+                time_cursor = cached_rec.time_start as usize;
+            }
+
+            // time 游标单调推进（sym 区间内 O(1) amortized）
+            let interval_end = cached_rec.time_start as usize + cached_rec.time_count as usize;
+            while time_cursor < interval_end {
+                let axis_t = self.time_at(time_cursor as u32)?;
+                if axis_t >= time_u { break; }
+                time_cursor += 1;
+            }
+
+            // 精确匹配
+            if time_cursor >= interval_end
+                || self.time_at(time_cursor as u32)? != time_u
+            {
                 return Err(CoreError::Invalid(format!(
-                    "locate: (sym, time) key does not exist: time {t} for sym '{}'",
-                    self.sym_str(*id)?
+                    "locate: (sym, time) key does not exist: time {time} for sym '{}'",
+                    self.sym_str(sym_cursor as u32)?
                 )));
-            };
-            match raw.last_mut() {
-                Some(last) if last.end() == row as u64 => last.length += 1,
-                _ => raw.push(RowRange::new(row as u64, 1)),
+            }
+
+            let row = cached_rec.row_start as u64
+                + (time_cursor as u64 - cached_rec.time_start as u64);
+
+            // 边走边合并连续行
+            match ranges.last_mut() {
+                Some(last) if last.end() == row => last.length += 1,
+                _ => ranges.push(RowRange::new(row, 1)),
             }
         }
-        let merged = merge_ranges(raw);
-        let total: u64 = merged.iter().map(|r| r.length).sum();
+
+        let total: u64 = ranges.iter().map(|r| r.length).sum();
         if total != pairs.len() as u64 {
             return Err(CoreError::InvalidState("locate total mismatch".into()));
         }
-        Ok(merged)
+
+        Ok(ranges)
     }
 
     /// 关闭 Handle（META 无任何写回）。

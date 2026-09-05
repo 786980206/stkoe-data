@@ -132,18 +132,20 @@ META / Field scan 不负责决定多 Field predicate 的执行顺序；顺序由
 locate_index_handle(handle, data: DataView) -> Result<RowRange[]>
 ```
 
-**内部实现**：
+**内部实现**（双指针单调推进，O(S + N)）：
 ```
-1. 输入 sym 字符串 → sym_id_of 二分（O(log S)）→ 不存在 → Error
-2. 校验输入 (sym, time) 有序唯一（windows(2) 比较）
-3. 逐 key 定位：
-     current_sym 切换时 → sym_record(sym_id) 读 SYM INDEX record
-     axis_index_of(time) → TIME AXIS 二分 → 精确匹配
-     record.global_row(t_idx) → row_start + (t_idx - time_start)
-     连续行合并（last.end() == row → length += 1）
-4. merge_ranges → 校验 sum(length) == input.len()
+sym_cursor（SYM INDEX 游标）──→ 单调前进，O(S) 总计
+time_cursor（TIME AXIS 游标）──→ sym 切换时重置到 time_start，run 内单调前进
+        │
+        ↓
+row = row_start + (time_cursor - time_start)
+        │
+        ↓
+边走边合并连续行（last.end() == row → length += 1）
 ```
-- 输入 (sym ASC, time ASC) 有序 → 每个 sym 的定位在 SYM INDEX 上单调推进
+- 排序校验内联（每行与前行比较，无额外遍历）
+- sym 不存在 / time 不在区间内 / time 不在轴上 → Error
+- 总量校验 sum(length) == input.len()
 
 - `data` 至少包含 sym / time 两列，按行一一配对组成联合键 `(sym, time)`；输入按 `(sym ASC, time ASC)` 排序。
 - META 利用输入有序性 × SYM INDEX / TIME AXIS 有序性做双指针扫描，避免逐行查找。
