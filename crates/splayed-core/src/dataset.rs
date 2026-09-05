@@ -125,6 +125,11 @@ impl DatasetHandle {
         self.max_parallelism = max_parallelism.max(1);
     }
 
+    /// 当前 Field 级并行上限（供上层在临时下调 / 恢复时保存现场）。
+    pub fn max_parallelism(&self) -> usize {
+        self.max_parallelism
+    }
+
     fn field_path(&self, name: &str) -> PathBuf {
         self.root.join(name)
     }

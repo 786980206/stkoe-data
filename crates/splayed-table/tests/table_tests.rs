@@ -868,3 +868,84 @@ fn read_table_batch_semantics() {
     assert!(reader.next().is_err());
     cleanup(&dir);
 }
+
+/// write_table 并行等价性：分区含多个 run（sym 优先导致同名分区输入不相邻）时，
+/// max_parallelism = 1 与 8 写入结果一致。
+#[test]
+fn write_table_parallel_equivalence() {
+    let dir = temp_dir("write_par_eq");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    // 3 分区 × 2 sym：分区 07 含 2 个 run（A@7 与 M@7 在输入中不相邻）
+    let initial = make_data(&[
+        ("AAPL", d(7, 1), 10.0),
+        ("AAPL", d(8, 1), 20.0),
+        ("AAPL", d(9, 1), 30.0),
+        ("MSFT", d(7, 1), 40.0),
+        ("MSFT", d(8, 1), 50.0),
+        ("MSFT", d(9, 1), 60.0),
+    ]);
+    let patch_data = make_data(&[
+        ("AAPL", d(7, 1), 11.0),
+        ("AAPL", d(8, 1), 21.0),
+        ("AAPL", d(9, 1), 31.0),
+        ("MSFT", d(7, 1), 41.0),
+        ("MSFT", d(8, 1), 51.0),
+        ("MSFT", d(9, 1), 61.0),
+    ]);
+    let patch = patch_data.as_view();
+
+    let read_prices = |root: &Path| -> Vec<f64> {
+        let table = open_table(root, Mode::Read, TableOptions::default()).unwrap();
+        let req = TableScanRequest::default();
+        let mut reader = query_table(&table, req, None).unwrap();
+        let mut out = Vec::new();
+        while let Some(view) = reader.next().unwrap() {
+            out.extend(f64s(view.column("price").unwrap()));
+        }
+        reader.close().unwrap();
+        out
+    };
+
+    let root1 = dir.join("serial");
+    let root2 = dir.join("par");
+    for (root, mp) in [(&root1, Some(1usize)), (&root2, Some(8usize))] {
+        create_table(root, initial.clone(), PartitionScheme::Month, TableOptions::default()).unwrap();
+        let table = open_table(root, Mode::Write, TableOptions { max_parallelism: mp }).unwrap();
+        write_table(&table, &patch).unwrap();
+        table.close().unwrap();
+    }
+    // 表序 = 分区 ASC × 分区内 sym ASC
+    let want: Vec<f64> = vec![11.0, 41.0, 21.0, 51.0, 31.0, 61.0];
+    assert_eq!(read_prices(&root1), want);
+    assert_eq!(read_prices(&root2), want);
+    cleanup(&dir);
+}
+
+/// 任何写入前完成全部定位与校验：后续分区的 key 缺失 → 整体报错且
+/// 前面分区**不产生部分写入**（无事务契约下的最强前置语义）。
+#[test]
+fn write_table_locate_all_before_write() {
+    let dir = temp_dir("write_locate_all");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let initial = make_data(&[("AAPL", d(7, 1), 10.0), ("MSFT", d(8, 1), 20.0)]);
+    let root = dir.join("tbl");
+    create_table(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+
+    // 07 的 key 合法、08 的 key（A@8-2）不存在 → 定位阶段整体失败
+    let patch_data = make_data(&[("AAPL", d(7, 1), 99.0), ("AAPL", d(8, 2), 99.0)]);
+    let patch = patch_data.as_view();
+    assert!(write_table(&table, &patch).is_err());
+
+    // 07 的原值未被部分写入覆盖（旧实现在此会写入 99）
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut got = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        got.extend(f64s(view.column("price").unwrap()));
+    }
+    reader.close().unwrap();
+    assert_eq!(got, vec![10.0, 20.0]);
+    table.close().unwrap();
+    cleanup(&dir);
+}

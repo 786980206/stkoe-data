@@ -29,6 +29,10 @@
   `Some(n)` = 聚合路径（range 级截断 + pending 剩余，恰好 n 行不超发——修正旧实现
   「拉满为止」的批次超发；多段 ColumnView 拼接保持零拷贝）；`Some(0)` 显式拒绝。
   pending 存 range 而非 DataView（不可变 → 延迟读等价，避免跨 next() 持有数据借用）。
+- write_table 三阶段重写：主线程一次扫描（相邻 key 零分配校验 + 粗键分区 run 划分）
+  → 全部定位与校验先于任何写入（key 缺失不产生部分写入——强于旧实现的逐分区
+  先写后验）→ 分区级并行写（P_part × P_field ≤ max_parallelism 预算切分，Field 级
+  预算临时下调 join 后恢复；per-range 字段 Schema 复用 + slice_rows 零拷贝切片）。
 - Table 元数据读 API 统一缓存模型（另见 splayed-table §3.1）：scan_table 惰性化——
   scan_table 只做裁剪与构造（不打开 Dataset，tt 经 64B META header 直读），分区在
   next() 时按序惰性打开；时间裁剪按 time_min 排序后二分（不依赖分区名字典序——年号

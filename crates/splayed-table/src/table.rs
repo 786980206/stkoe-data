@@ -351,7 +351,7 @@ fn gather_validity(
 }
 
 /// 分区粗键：同 key ⇒ 同分区名（整数判别，避免逐行构造分区名字符串）。
-fn partition_key(scheme: PartitionScheme, value: i64, tt: TimeType) -> i64 {
+pub(crate) fn partition_key(scheme: PartitionScheme, value: i64, tt: TimeType) -> i64 {
     match scheme {
         PartitionScheme::Date => value_to_days(value, tt),
         PartitionScheme::Year | PartitionScheme::Month => {

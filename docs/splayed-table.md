@@ -181,7 +181,7 @@ pub struct TableStatistics {
 | Query | `query_table` | 组合入口：一次完成扫描定位与数据读取 |
 |  | `scan_table` | 定位跨 Partition 的 `PartitionRowRange` |
 |  | `read_table` | 消费 Scanner，输出批量 `DataView` |
-| Write | `write_table` | 对已有 `(sym, time)` 行批量覆盖写入（**未实现**，见 §4.14） |
+| Write | `write_table` | 对已有 `(sym, time)` 行批量覆盖写入（见 §4.14） |
 
 ### 4.1 create_table
 
@@ -666,9 +666,9 @@ impl TableHandle {
 **说明**：
 - 供 scan_table / read_table_metadata 做 pruning 与 partition_range 计算；不作为 public API 暴露。
 
-### 4.14 write_table（**未实现**，设计契约）
+### 4.14 write_table
 
-**接口定义**（设计）：
+**接口定义**：
 ```rust
 pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>
 ```
@@ -678,28 +678,45 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `table` | `&TableHandle` | 输入 | 已打开的 Table Handle（write mode） |
-| `data` | `&DataView<'_>` | 输入 | 必须含 `sym` 与 `time`（按行配对构成联合键，整体按 `(sym ASC, time ASC)` 排序，不得重复且必须已存在于目标 META）；其余列为要写入的 Fields（支持 projection write；`sym / time` 本身不作为 Field 写入） |
+| `data` | `&DataView<'_>` | 输入 | 必须含 `sym` 与 `time`（整体按 `(sym ASC, time ASC)` **严格有序唯一**且已存在于目标 META）；其余列为要写入的 Fields（支持 projection write；`sym / time` 不作为 Field 写入；重复列名拒绝） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 全部 Partition 覆盖写入完成（无事务） |
 
-**内部实现**（设计流程）：
+**内部实现流程（三阶段）**：
 ```
-write_table(table, data)
-    ↓ acquire table/.lock
-校验输入（key 存在 / 唯一 / 有序）
-    ↓ 按 partition_scheme 仅按 time 切分
-Partition A | Partition B | ...
-    ↓ locate_dataset_index(handle, partition_data) → RowRanges
-    ↓ 对每个 RowRange：write_dataset(dataset, offset, input_slice)
-release table/.lock
+① 主线程一次扫描（零分配校验 + 分区 run 划分）
+     相邻 key 借用比较（严格递增：sym ASC，同 sym 内 time ASC 且不重复）
+     → 分区 run 划分：整数粗键判别换段，分区名仅换段时构造
+       （同一分区可因 sym 优先出现多个 run，全部收集）
+     → 前置校验：目标分区均存在（write_table 不创建分区）
+② 主线程定位全部（任何写入之前）
+     逐分区 locate_dataset_index（pairs 按输入序跨 run 拼接；Dataset 缓存复用）
+     → 匹配行数校验（sum(length) == pairs.len()，缺失 → Error）
+     → located range ↔ 输入行段一一对应，映射回全局输入行段
+     → 全部定位与校验完成后才进入写入：key 缺失 / 分区不存在不产生部分写入
+③ 写入（单分区 / 并行度 1 → 串行；否则分区级并行）
+     round-robin 分桶 thread::scope，互不相交 &mut DatasetHandle
+     Field 级预算切分：P_field = max(1, max_parallelism / P_part)（临时下调，join 后恢复）
+     每行段：字段 Schema 一次构建 → slice_rows 零拷贝切片 → write_dataset
 ```
 
-**说明**（设计契约）：
-- 职责：对 Table 中**已存在**的 `(sym, time)` 行执行批量覆盖写入——不追加行、不创建 Partition / Dataset、不扩容、不新增 sym、不扩大 time 范围、不修改 META / Table Schema。
-- **定位**：每个 Partition 调用 core `locate_dataset_index`（(sym, time) 联合键，双指针扫描）。定位成功的充要条件：`sum(RowRange.length) == data.length`；输入 key 重复或 META 中不存在 → **Error**，不允许静默跳过。
-- **无事务**：不提供跨 Partition / Dataset / Field 回滚；中途失败时已完成的写入保留，返回 Error。
-- **并发**：同一 Table 的写通过 `table/.lock` 互斥；锁等待 / 超时策略属实现层。不同 Partition / 不同 RowRange 的写入可并行（实现细节），不得改变最终语义。
-- 输入属于不存在的 Partition → Error（`write_table` 不创建 Partition）。
-- 实现状态：**未实现**——当前代码无 `write_table`；新数据走 `create_table_partition`。
+**核心原则**：
+- **一次扫描完成校验与规划**：排序契约使相邻 key 比较即可检出乱序 / 重复（`string_at`
+  借用比较，无 String 分配）；分区名整数粗键判别，无逐行字符串构造。
+- **定位全部先于写入**：所有 `locate_dataset_index` 与匹配校验在主线程串行完成——
+  key 缺失 / 分区不存在 / 定位不足在任何盘上落痕之前失败。
+- **并行只跨 Partition 且预算切分**：`P_part × P_field ≤ max_parallelism`（Field 级预算
+  临时下调并在 join 后恢复），并行区域只做纯写入、不触碰 Table 缓存。
+- **表级锁覆盖全程**：`.lock` 从校验到写入完成持有，同一 Table 写互斥。
+- **零拷贝输入切片**：每行段 `slice_rows` 零拷贝视图（字段 Schema 一次构建复用）。
+- **无事务**：并行写入中某分区失败，已成功分区保留，返回首个错误。
+
+**说明**：
+- 职责：对已存在行做 positional overwrite——不追加行、不创建 Partition、不扩容、
+  不修改 META / Table Schema。
+- located range 与输入行段的对应：同一分区的同 sym 行在输入中连续（时间单调）→
+  一般一个 run 对应一个 range；跨 run 的网格合并不会发生（不同 sym 的网格块必不相邻），
+  映射按通用消费路径防御性处理。
+- `.lock` 崩溃残留需人工删除；锁等待 / 超时策略属实现层。
 
 ## 5. 与 core 的调用关系
 
