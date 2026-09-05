@@ -31,12 +31,11 @@
 - Handle 的 scratch 缓冲逐次累积（视图生命周期契约要求），长生命周期高频读场景的回收策略待定。
 - ~~`read_index_handle` 的 sym keys 逐行物化~~ → 已解决：`RepeatDict` 段（零存储）替代 keys 物化，scratch arena 已移除。
 
-## 10. Benchmark vs Parquet（V2.0 首轮基线，2026-09）
+## 10. Benchmark vs Parquet
 
-数据：64 sym × 250 行 = 16K 行 × 4 列（sym/time/price/volume），按月分区。
-首轮基线后已落地一批优化（Field 读/写、Scanner 批量管线、META 构建轴二分、
-close/cast/compress/decompress 流式化，见 §8 性能审查记录），尚未计入下表，待统一复测。
 基准：`crates/splayed-table/benches/vs_parquet.rs`（criterion；对照 arrow-rs parquet 56）。
+
+### 10.1 首轮基线（2026-09，64 sym × 250 行 = 16K 行，按月分区）
 
 | 路径 | splayed | parquet | 差距 |
 | --- | --- | --- | --- |
@@ -45,12 +44,29 @@ close/cast/compress/decompress 流式化，见 §8 性能审查记录），尚�
 | 谓词扫描（price > 15，open 复用） | **~1.06 ms** | ~0.69 ms | **≈ 1.5×** |
 
 > 读取 1.4× 差距主要来自 polars 列转换层（DataView → Series 拷贝）；
-> core 层  的 mmap 零拷贝路径本身接近 parquet。
+> core 层的 mmap 零拷贝路径本身接近 parquet。
 > 写入 7× 差距来自 gather_data 逐行拷贝 + 多文件创建，后续可批量化。
 
-结论与定位：当前 V2.0 为**正确性优先**实现——写入开销主要在 MetaBuilder / 每分区
-DataView 物化（gather），读取开销在三层 API 的逐分区打开 + 视图组装 + 谓词行级
-求值。上述「已知优化项」（chunk 惰性解码、谓词向量化、scratch 回收、建表 gather
-优化）是缩小差距的主要抓手；splayed 的目标优势场景（容量网格 O(1) 行定位、
-零拷贝 sym/time 视图）在当前基准的全表读中尚未体现，因 Table 层端到端包含
-schema 组装等固定开销。
+### 10.2 64K 行复测（2026-09，256 sym × 250 行，12 月分区；优化批次后）
+
+| 路径 | splayed | parquet | 对比 |
+| --- | --- | --- | --- |
+| 写入（端到端建表） | ~102 ms | ~24 ms | ≈ 4.2×（写入仍慢） |
+| 全表读取（Table 层，open 复用） | **~0.90 ms** | ~1.77 ms | **splayed 快 ≈ 2.0×** |
+| 谓词扫描（price > 15，open 复用） | **~1.03 ms** | ~2.23 ms | **splayed 快 ≈ 2.2×** |
+
+对照优化批次前的本机记录（criterion 持久基线，a0d1b16 时代）：
+
+- **谓词扫描 ≈ -49%**（p = 0.00，显著）：Scanner 批量管线（类型化向量化比较 + 根部 validity 求交
+  + word 级命中区）的直接成效；splayed 由落后 parquet 反超为**快 2.2×**。
+- 全表读取 0.97 ms → 0.90 ms（≈ -7%）；**splayed 快 ≈ 2.0×**（首轮基线时落后 1.4×）。
+- 写入 102 ms vs 109 ms 基本持平（迭代区间 [68, 146] ms 方差大，criterion 迭代内含
+  `remove_dir_all`）；仍 ≈ 4.2× 慢于 parquet——瓶颈 = 12 分区 × 4 field 文件创建 +
+  MetaBuilder × 12 + gather，即 §8 已知优化项（写入批量化 / 并行化）。
+- Dataset 层阶段计时（release profiler，64K 行）：`read_dataset` 483 µs、`scan_dataset` 谓词 685 µs、
+  `create_table`（单分区）7.0 ms、`create_table`（12 月分区）44.6 ms、compress 13.8 ms、
+  decompress 11.5 ms。
+
+结论与定位：读取侧已反超 parquet（全表 2.0×、谓词 2.2×），谓词向量化已从「已知优化项」兑现；
+**写入是当前唯一显著落后项（≈ 4.2×）**，开销集中在每分区文件创建 / MetaBuilder / gather——
+下一优先级是写入路径批量化与并行化；chunk 级惰性解码与 scratch 回收仍为后续项。
