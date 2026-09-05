@@ -20,6 +20,7 @@
 - `sym_id_of`：字典二分查找 O(log S)（字典按首现序 = 排序序）。
 - Dataset 扫描的 ranges 求交：双指针归并 O(a + b)。
 - `FieldScanner`：顺序批量管线——ranges 直接消费（不 merge）；整段连续 values 类型化比较循环（算子分派在循环外，LLVM 自动向量化）；0/1 字节掩码根部统一 validity 求交；branchless 打包位图 + word 级 `next_true_run` 输出连续命中区。
+- `close_field_handle`（compressed 收尾）：逐 chunk 编码直写 tmp（内存 O(working + 一个 chunk)，不拼接整个重压缩文件）；tmp `sync_all` 后再原子替换，rename 生效时新文件内容已持久。
 
 已知优化项（当前实现为正确性优先的简化，行为符合本文档语义）：
 

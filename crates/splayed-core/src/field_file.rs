@@ -612,8 +612,8 @@ impl FieldHandle {
     }
 }
 
-/// 关闭 Handle：read 无写回；uncompressed write 已直接生效（flush + fsync）；
-/// compressed write 发生修改 → 自动 compress + rewrite（临时文件 + 原子替换，
+/// 关闭 Handle：read 无写回；uncompressed write 已直接生效（mmap flush 即落盘）；
+/// compressed write 发生修改 → 流式重压缩收尾（临时文件 + 原子替换，
 /// 分组沿用打开时读得的 chunk 头；写路径不改 row_count，分组可精确复用）。
 pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
     let FieldHandle { path, header, mode, backing, chunk_rows, chunk_ends, working, modified } =
@@ -637,29 +637,37 @@ pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
     let size = dt.size_of();
     let encoding = header.encoding()?;
     let compression = header.compression()?;
-    let mut out = Vec::with_capacity(HEADER_SIZE + work.values.len() / 2);
-    out.extend_from_slice(&header.to_bytes());
-    for (ci, &rows) in chunk_rows.iter().enumerate() {
-        let hi = chunk_ends[ci] as usize;
-        let lo = hi - rows as usize;
-        let values = &work.values.as_slice()[lo * size..hi * size];
-        let validity = work
-            .validity
-            .as_ref()
-            .map(|b| b.extract_bits(lo, rows as usize))
-            .transpose()?;
-        out.extend_from_slice(&encode_chunk(
-            encoding,
-            compression,
-            dt,
-            values,
-            validity.as_deref(),
-            rows as usize,
-        )?);
-    }
+    // 流式写出：header → 逐 chunk 编码直写 tmp，不拼接整个重压缩文件，
+    // 内存复杂度 O(working + 一个 chunk)
     let tmp = tmp_path(&path);
     let mut f = File::options().write(true).create(true).truncate(true).open(&tmp)?;
-    f.write_all(&out)?;
+    let write_result = (|| -> Result<(), CoreError> {
+        // header 在编码前即完全确定（写路径不改 row_count；generation / null_count 已在
+        // 内存更新；chunked 布局的 data_length / validity_offset 不依赖编码输出），
+        // 直接写真实 header，无需占位回填
+        f.write_all(&header.to_bytes())?;
+        for (ci, &rows) in chunk_rows.iter().enumerate() {
+            let hi = chunk_ends[ci] as usize;
+            let lo = hi - rows as usize;
+            let values = &work.values.as_slice()[lo * size..hi * size];
+            let validity = work
+                .validity
+                .as_ref()
+                .map(|b| b.extract_bits(lo, rows as usize))
+                .transpose()?;
+            let encoded =
+                encode_chunk(encoding, compression, dt, values, validity.as_deref(), rows as usize)?;
+            f.write_all(&encoded)?;
+        }
+        // tmp 完整落盘后再原子替换：rename 生效时新文件内容已持久
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        // 编码 / 写出失败：清理 tmp，原文件保持不变
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
     drop(f);
     fs::rename(&tmp, &path)?;
     Ok(())

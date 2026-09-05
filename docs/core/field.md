@@ -197,10 +197,11 @@ close_field_handle(handle) -> Result<()>
 read                            → 直接 Ok（Mmap 随 Drop 释放）
 write + uncompressed            → MmapMut::flush → Ok
 write + compressed + 未修改      → Ok（不写回）
-write + compressed + 已修改      → 逐 chunk：从 working 切段
-                                    → encode_chunk(encoding, compression, ...)
-                                    → 拼接 header + chunks → 写 tmp 文件
-                                    → fs::rename(tmp, path) 原子替换
+write + compressed + 已修改      → 流式：header（编码前即完全确定，无需占位回填）直写 tmp
+                                    → 逐 chunk：从 working 切段 → extract_bits → encode_chunk
+                                      → 直写 tmp（内存 O(working + 一个 chunk)，不拼接整个重压缩文件）
+                                    → tmp sync_all（rename 生效时新文件内容已持久）
+                                    → fs::rename(tmp, path) 原子替换；失败清理 tmp，原文件保持不变
 ```
 - compressed 重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，写路径不改 row_count）
 - 临时文件路径 = `{field_path}.tmp`，rename 原子替换
