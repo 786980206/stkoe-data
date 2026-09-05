@@ -16,14 +16,15 @@
 
 已优化：
 
-- `MetaBuilder`：run-length 遍历——字符串分配/比较发生在 sym run 边界（O(sym 段数) 而非 O(行数)）；轴定位单调双指针；TIME AXIS 两遍全局构建（全局去重有序，非 first-appearance）。
+- `MetaBuilder`：run-length 遍历——字符串分配/比较发生在 sym run 边界（O(sym 段数) 而非 O(行数)）；轴定位为排序去重后二分（2R·logT，无哈希表）；连续子区间校验保证 time_count 与数据行对齐；TIME AXIS 全局构建（全局去重有序，非 first-appearance）。
 - `sym_id_of`：字典二分查找 O(log S)（字典按首现序 = 排序序）。
 - Dataset 扫描的 ranges 求交：双指针归并 O(a + b)。
+- `FieldScanner`：顺序批量管线——ranges 直接消费（不 merge）；整段连续 values 类型化比较循环（算子分派在循环外，LLVM 自动向量化）；0/1 字节掩码根部统一 validity 求交；branchless 打包位图 + word 级 `next_true_run` 输出连续命中区。
 
 已知优化项（当前实现为正确性优先的简化，行为符合本文档语义）：
 
 - compressed Field 打开即**全量解压**为工作表示；chunk 级惰性解码（只解码覆盖请求范围的 chunk）待实现。
-- 谓词求值逐行走 `read_row_scalar` 标量分发；类型特化的段内向量化（SIMD）待实现。
+- ~~谓词求值逐行 `read_row_scalar` 标量分发~~ → 已解决：类型化批量比较循环 + 字节掩码 + word 级命中区提取（显式 SIMD intrinsics 仍为可选后续项）。
 - Handle 的 scratch 缓冲逐次累积（视图生命周期契约要求），长生命周期高频读场景的回收策略待定。
 - ~~`read_index_handle` 的 sym keys 逐行物化~~ → 已解决：`RepeatDict` 段（零存储）替代 keys 物化，scratch arena 已移除。
 

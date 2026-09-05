@@ -164,8 +164,25 @@ scan_field_handle(handle, request) -> Result<FieldScanner>
 FieldScanner::next() -> Result<RowRange?>
 ```
 
-- `ranges`：候选物理范围（空 = 整个 Field）；`predicate` 在本 Field 的值上求值；`limit` 达到后提前结束。
-- `next()` 每次返回一个连续 RowRange；扫描结束返回 None。
+**内部实现**（顺序批量管线，不物化数据）：
+```
+构造      →  ranges 直接顺序消费：仅与 [0, row_count) 求交防越界（保序、不排序、不合并；
+              有序不重叠由上游保证）；空 ranges = 整个 Field
+next()    →  消费当前段命中位图：word 级 next_true_run 找下一连续命中区 → RowRange
+              （word 跳零字 / 满字扩展；limit 达到即截断并结束）
+段求值    →  段 = [row, min(range.end, row + 1M))：整段连续 values（PLAIN mmap 切片 /
+              compressed working 切片，零拷贝）批量求谓词
+              → Cmp：类型化切片比较循环（算子分派在循环外，LLVM 自动向量化；
+                跨域加宽语义保持 compare_scalar 规则：有符号 ↔ 无符号 ↔ 浮点）
+              → And / Or / Not：字节级位运算（AND 全零短路）
+              → 根部统一与 validity 求交：NULL 行不命中任何条件（含 NOT / OR）
+              → 0/1 字节掩码 → branchless 打包位图（缓冲跨 next() 重用）
+```
+- 不复制 values、不物化数据、不创建 DataView、不逐行生成 RowRange、不做 ranges merge、不处理 sym / time
+- 输出为连续命中区：段内相邻命中行合并为单个 RowRange；跨段不合并
+- 无谓词 = 只输出有效行（validity 过滤）
+- 浮点比较遵循 IEEE 语义（NaN 行 / NaN 目标按 IEEE 求值，仅 Ne 命中；不再逐行报错）
+- 段上限 1M 行仅为限定掩码内存；掩码缓冲跨 `next()` 重用
 - 只定位，不物化数据；输出可交给 `read_field_handle`，或作为其他 Field scan 的 `ranges` 输入做多字段下推。
 - Field 不理解 sym / time；只做值过滤。不支持 order 下推。
 

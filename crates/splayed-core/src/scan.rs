@@ -164,38 +164,6 @@ impl Predicate {
     }
 }
 
-/// 标量比较：`row <op> target`，同域比较（整数 / 浮点 / 字符串 / bool），域不兼容返回 `None`。
-pub(crate) fn compare_scalar(row: &Scalar, op: CmpOp, target: &Scalar) -> Option<bool> {
-    use std::cmp::Ordering;
-    let ord = match (row, target) {
-        (Scalar::Int(a), Scalar::Int(b)) => a.cmp(b),
-        (Scalar::UInt(a), Scalar::UInt(b)) => a.cmp(b),
-        (Scalar::UInt(a), Scalar::Int(b)) => {
-            if *b < 0 {
-                Ordering::Greater
-            } else {
-                a.cmp(&(*b as u64))
-            }
-        }
-        (Scalar::Int(a), Scalar::UInt(b)) => {
-            if *a < 0 {
-                Ordering::Less
-            } else {
-                (*a as u64).cmp(b)
-            }
-        }
-        (Scalar::Float(a), Scalar::Float(b)) => a.partial_cmp(b)?,
-        (Scalar::Float(a), Scalar::Int(b)) => a.partial_cmp(&(*b as f64))?,
-        (Scalar::Float(a), Scalar::UInt(b)) => a.partial_cmp(&(*b as f64))?,
-        (Scalar::Int(a), Scalar::Float(b)) => (*a as f64).partial_cmp(b)?,
-        (Scalar::UInt(a), Scalar::Float(b)) => (*a as f64).partial_cmp(b)?,
-        (Scalar::Str(a), Scalar::Str(b)) => a.cmp(b),
-        (Scalar::Bool(a), Scalar::Bool(b)) => a.cmp(b),
-        _ => return None,
-    };
-    Some(op.matches(ord))
-}
-
 /// 按 DataType 将一行原始字节解释为标量（NULL 行由调用方先行跳过；Utf8 无定宽标量）。
 pub(crate) fn read_row_scalar(data_type: DataType, bytes: &[u8]) -> Result<Scalar, CoreError> {
     macro_rules! le {
@@ -250,19 +218,5 @@ mod tests {
         assert_eq!(clamped, vec![RowRange::new(5, 25)]);
         // 空 ranges = 全表
         assert_eq!(clamp_ranges(&[], 30), vec![RowRange::new(0, 30)]);
-    }
-
-    #[test]
-    fn compare_scalar_domains() {
-        assert!(compare_scalar(&Scalar::Int(10), CmpOp::Gt, &Scalar::Int(3)).unwrap());
-        assert!(compare_scalar(&Scalar::UInt(5), CmpOp::Ge, &Scalar::Int(-1)).unwrap());
-        assert!(compare_scalar(&Scalar::Float(0.5), CmpOp::Le, &Scalar::Int(1)).unwrap());
-        assert!(compare_scalar(
-            &Scalar::Str("b".into()),
-            CmpOp::Ge,
-            &Scalar::Str("a".into())
-        )
-        .unwrap());
-        assert!(compare_scalar(&Scalar::Int(1), CmpOp::Eq, &Scalar::Str("a".into())).is_none());
     }
 }

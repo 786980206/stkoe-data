@@ -30,6 +30,15 @@ fn f64_column(values: &[f64], validity: Option<Bitmap>) -> Column {
     }
 }
 
+fn i32_column(values: &[i32]) -> Column {
+    Column {
+        data_type: DataType::Int32,
+        values: Buffer::from_slice_copy(values),
+        validity: None,
+        dict: None,
+    }
+}
+
 fn view_values(view: &ColumnView<'_>) -> Vec<f64> {
     let mut out = Vec::new();
     for seg in view.segments() {
@@ -329,6 +338,110 @@ fn scan_with_predicate_and_limit() {
     }
     scanner.close().unwrap();
     assert_eq!(rows, vec![3, 5]);
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn scan_null_excluded_at_root() {
+    let dir = temp_dir("scan_null");
+    let path = dir.join("price");
+    // [10, NULL, 60, NULL, 5]
+    let values: Vec<f64> = vec![10.0, 0.0, 60.0, 0.0, 5.0];
+    let mut bm = Bitmap::ones(5);
+    bm.set(1, false);
+    bm.set(3, false);
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+
+    // Ne 999：真实值与 NULL 行的值掩码全为 1 —— NULL 行只能由根部 validity 排除
+    let pred = Predicate::value_cmp(splayed_core::CmpOp::Ne, Scalar::Float(999.0));
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length { rows.push(r.offset + i); }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![0, 2, 4]);
+
+    // NOT(Lt 50)：值掩码命中 = {行 2}；NULL 行不命中 NOT
+    let pred = Predicate::Not(Box::new(Predicate::value_cmp(
+        splayed_core::CmpOp::Lt, Scalar::Float(50.0),
+    )));
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length { rows.push(r.offset + i); }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![2]);
+
+    // Or[Gt 100, Lt 20]：NULL 行两个子条件均假且根部排除
+    let pred = Predicate::Or(vec![
+        Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Float(100.0)),
+        Predicate::value_cmp(splayed_core::CmpOp::Lt, Scalar::Float(20.0)),
+    ]);
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length { rows.push(r.offset + i); }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![0, 4]);
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn scan_typed_int_ranges_order_and_merge() {
+    let dir = temp_dir("scan_int");
+    let path = dir.join("qty");
+    let values: Vec<i32> = vec![1, 7, 3, 9, 2];
+    create_field_file(&path, DataType::Int32, FieldInit::Data(i32_column(&values))).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+
+    // 有符号列 × UInt 目标（跨域加宽语义）：Gt UInt(3) → 行 1, 3
+    let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::UInt(3));
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length { rows.push(r.offset + i); }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![1, 3]);
+
+    // 段内相邻命中合并为单个连续区：Le Int(9) → [0, 5)
+    let pred = Predicate::value_cmp(splayed_core::CmpOp::Le, Scalar::Int(9));
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut ranges = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        ranges.push(r);
+    }
+    scanner.close().unwrap();
+    assert_eq!(ranges, vec![RowRange::new(0, 5)]);
+
+    // ranges 保序直接消费（不重排不合并）：[0,2) 与 [3,2)，Gt Int(2) → 行 1、3
+    let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Int(2));
+    let mut scanner = handle.scan_field_handle(&ScanRequest {
+        ranges: vec![RowRange::new(0, 2), RowRange::new(3, 2)],
+        projection: vec![], predicate: Some(pred), limit: None,
+    }).unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length { rows.push(r.offset + i); }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![1, 3]);
     close_field_handle(handle).unwrap();
     cleanup(&dir);
 }

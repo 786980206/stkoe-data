@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -12,9 +11,7 @@ use splayed_format::{
 };
 
 use crate::error::{CoreError, Mode};
-use crate::scan::{
-    clamp_ranges, compare_scalar, read_row_scalar, Predicate, RowRange, Scalar, ScanRequest,
-};
+use crate::scan::{read_row_scalar, CmpOp, Predicate, RowRange, Scalar, ScanRequest};
 
 /// 单列值写入 / 初始化的流式读取器（`create_field_file` 的 `stream` init）。
 ///
@@ -550,23 +547,36 @@ impl FieldHandle {
 
     // --------------------------------------------------------------- scan
 
-    /// 条件扫描：只返回 ranges，不物化数据（docs/splayed-core.md §5.7）。
+    /// 条件扫描：只返回 ranges，不物化数据（docs/core/field.md §5.7）。
+    ///
+    /// ranges 直接顺序消费：仅与 `[0, row_count)` 求交防越界（保序，不排序不合并——
+    /// 有序不重叠由上游保证）；空 ranges = 整个 Field。
     pub fn scan_field_handle(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
-        let ranges = clamp_ranges(&request.ranges, self.row_count());
+        let ranges = if request.ranges.is_empty() {
+            vec![RowRange::new(0, self.row_count())]
+        } else {
+            request
+                .ranges
+                .iter()
+                .filter_map(|r| r.intersect(&RowRange::new(0, self.row_count())))
+                .collect()
+        };
         Ok(FieldScanner {
             handle: self,
             ranges,
-            range_index: 0,
-            cursor: 0,
             predicate: request.predicate.clone(),
             remaining: request.limit,
-            pending: VecDeque::new(),
+            range_index: 0,
+            row: 0,
+            mask: Vec::new(),
+            mask_rows: 0,
+            mask_pos: 0,
             done: false,
         })
     }
 
-    /// 供 scanner 使用的块视图（块不跨 chunk 边界，保证单段连续）。
-    fn block_views(
+    /// 供 scanner 的整段连续视图（PLAIN: mmap 切片；compressed: working 切片，零拷贝）。
+    fn range_views(
         &self,
         offset: u64,
         length: u64,
@@ -599,19 +609,6 @@ impl FieldHandle {
                 .transpose()?;
             Ok((values, validity))
         }
-    }
-
-    /// 下一个求值块的结束行（不跨 chunk 边界 / 块大小上限 8192）。
-    fn block_end(&self, start: u64, range_end: u64) -> u64 {
-        let mut end = start.saturating_add(8192).min(range_end);
-        if self.is_chunked() {
-            // 二分定位 start 所在 chunk，块止于该 chunk 末尾
-            let ci = self.chunk_ends.partition_point(|&e| e <= start);
-            if ci < self.chunk_ends.len() {
-                end = end.min(self.chunk_ends[ci]);
-            }
-        }
-        end
     }
 }
 
@@ -962,89 +959,120 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
 
 // ------------------------------------------------------------------ Scanner
 
-/// Field Scanner：单 Field 条件扫描，只输出物理 RowRange（docs/splayed-core.md §5.7）。
+/// 单段求值行数上限（仅用于限定掩码内存：1M 行 → 1MB 字节掩码 + 128KB 命中位图）。
+const EVAL_CAP: u64 = 1 << 20;
+
+/// Field Scanner：单 Field 条件扫描，只输出物理 RowRange（docs/core/field.md §5.7）。
+///
+/// 管线：候选 ranges 顺序消费 → 整段连续 values 批量求谓词（类型化循环，可自动向量化）
+/// → 根部统一与 validity 求交 → 打包命中位图 → word 级 `next_true_run` → 连续命中 RowRange。
+/// 不复制 values、不物化数据、不逐行生成 RowRange、不做 ranges merge、不处理 sym / time。
 pub struct FieldScanner<'h> {
     handle: &'h FieldHandle,
     ranges: Vec<RowRange>,
-    range_index: usize,
-    cursor: u64,
     predicate: Option<Predicate>,
     remaining: Option<u64>,
-    pending: VecDeque<RowRange>,
+    range_index: usize,
+    /// 当前候选段起点（物理行）
+    row: u64,
+    /// 当前段命中位图缓存（跨 next() 重用）+ 行数 + 消费游标
+    mask: Vec<u64>,
+    mask_rows: usize,
+    mask_pos: usize,
     done: bool,
 }
 
 impl<'h> FieldScanner<'h> {
-    /// 每次返回一个连续 RowRange；结束返回 `None`。
+    /// 每次返回一个连续命中 RowRange；结束返回 `None`。
     pub fn next(&mut self) -> Result<Option<RowRange>, CoreError> {
         loop {
-            if let Some(r) = self.pending.pop_front() {
-                if let Some(rem) = &mut self.remaining {
-                    let take = r.length.min(*rem);
-                    *rem -= take;
-                    if *rem == 0 {
-                        self.done = true;
-                        self.pending.clear();
-                    }
-                    if take < r.length {
-                        return Ok(Some(RowRange::new(r.offset, take)));
-                    }
-                }
-                return Ok(Some(r));
-            }
-            if self.done || self.range_index >= self.ranges.len() {
+            if self.done {
                 return Ok(None);
             }
+            // 1) 消费当前段命中位图：word 级找下一连续命中区
+            if self.mask_pos < self.mask_rows {
+                if let Some((s, e)) = next_true_run(&self.mask, self.mask_rows, self.mask_pos) {
+                    self.mask_pos = e;
+                    return Ok(Some(self.take(RowRange::new(
+                        self.row + s as u64,
+                        (e - s) as u64,
+                    ))));
+                }
+                self.mask_pos = self.mask_rows;
+            }
+            // 2) 段耗尽：推进游标 / 切换 range
+            self.row += self.mask_rows as u64;
+            self.mask_rows = 0;
+            self.mask_pos = 0;
+            loop {
+                if self.range_index >= self.ranges.len() {
+                    self.done = true;
+                    return Ok(None);
+                }
+                let range = self.ranges[self.range_index];
+                if self.row < range.offset {
+                    self.row = range.offset;
+                }
+                if self.row < range.end() {
+                    break;
+                }
+                self.range_index += 1;
+                self.row = 0;
+            }
+            // 3) 当前 range 的下一段：整段连续 values 批量求值
             let range = self.ranges[self.range_index];
-            if self.cursor < range.offset {
-                self.cursor = range.offset;
+            let end = range.end().min(self.row + EVAL_CAP);
+            let rows = (end - self.row) as usize;
+            self.evaluate_range(rows)?;
+        }
+    }
+
+    /// 应用 limit；达到后标记结束并截断本段输出。
+    fn take(&mut self, range: RowRange) -> RowRange {
+        match &mut self.remaining {
+            Some(rem) if *rem <= range.length => {
+                let out = RowRange::new(range.offset, *rem);
+                *rem = 0;
+                self.done = true;
+                out
             }
-            if self.cursor >= range.end() {
-                self.range_index += 1;
-                self.cursor = 0;
-                continue;
+            Some(rem) => {
+                *rem -= range.length;
+                range
             }
-            let block_end = self.handle.block_end(self.cursor, range.end());
-            let rows = (block_end - self.cursor) as usize;
-            let (values, validity) = self.handle.block_views(self.cursor, rows as u64)?;
-            let mut selection = vec![true; rows];
-            match &self.predicate {
-                Some(pred) => eval_predicate(
-                    pred,
-                    self.handle.data_type(),
-                    values,
-                    validity.as_ref(),
-                    rows,
-                    &mut selection,
-                )?,
-                None => {
-                    if let Some(v) = &validity {
-                        for (i, sel) in selection.iter_mut().enumerate() {
-                            *sel = v.is_valid(i);
-                        }
-                    }
-                }
-            }
-            let base = self.cursor;
-            let mut i = 0usize;
-            while i < rows {
-                if selection[i] {
-                    let start = i;
-                    while i < rows && selection[i] {
-                        i += 1;
-                    }
-                    self.pending
-                        .push_back(RowRange::new(base + start as u64, (i - start) as u64));
-                } else {
-                    i += 1;
-                }
-            }
-            self.cursor = block_end;
-            if self.cursor >= range.end() {
-                self.range_index += 1;
-                self.cursor = 0;
+            None => range,
+        }
+    }
+
+    /// 对 `[self.row, self.row + rows)` 整段连续 values 批量求谓词 → 命中位图缓存。
+    fn evaluate_range(&mut self, rows: usize) -> Result<(), CoreError> {
+        self.mask.clear();
+        self.mask.resize(rows.div_ceil(64), 0);
+        self.mask_rows = rows;
+        self.mask_pos = 0;
+        let (values, validity) = self.handle.range_views(self.row, rows as u64)?;
+        // 值匹配掩码（不含 validity）：无谓词 = 全部行参与
+        let mut hit = match &self.predicate {
+            Some(pred) => eval_predicate_bytes(pred, self.handle.data_type(), values, rows)?,
+            None => vec![1u8; rows],
+        };
+        // 根部统一排除 NULL 行：NULL 不命中任何条件（含 NOT / OR）
+        if let Some(v) = &validity {
+            for (i, slot) in hit.iter_mut().enumerate() {
+                *slot &= v.is_valid(i) as u8;
             }
         }
+        // 字节掩码 → 打包位图（branchless：0/1 字节按位左移或）
+        for (wi, word) in self.mask.iter_mut().enumerate() {
+            let lo = wi * 64;
+            let hi = rows.min(lo + 64);
+            let mut w = 0u64;
+            for (j, &bit) in hit[lo..hi].iter().enumerate() {
+                w |= (bit as u64) << j;
+            }
+            *word = w;
+        }
+        Ok(())
     }
 
     /// 关闭（资源随 handle 生命周期管理，此处仅为契约完备）。
@@ -1053,71 +1081,241 @@ impl<'h> FieldScanner<'h> {
     }
 }
 
-/// 在一段连续 values 上求值谓词，产出行选择（true = 命中）。
-/// NULL 行不命中任何条件（含 NOT / OR 分支）。
-pub(crate) fn eval_predicate(
+/// 在打包位图 `mask`（有效位 `len`，字内填充位必须为 0）中从 `from` 位起找下一连续置位段。
+/// word 级跳过零字 / 扩展满字；返回位区间 `[start, end)`（相对 mask）。
+fn next_true_run(mask: &[u64], len: usize, from: usize) -> Option<(usize, usize)> {
+    if from >= len {
+        return None;
+    }
+    // 定位首个置位
+    let mut pos = from;
+    let start = loop {
+        let w = mask[pos / 64] & (u64::MAX << (pos % 64));
+        if w != 0 {
+            break (pos / 64) * 64 + w.trailing_zeros() as usize;
+        }
+        pos = (pos / 64 + 1) * 64;
+        if pos >= len {
+            return None;
+        }
+    };
+    // 向右扩展连续段
+    let mut end = start;
+    loop {
+        let zeros = (!mask[end / 64]) >> (end % 64);
+        if zeros == 0 {
+            // 本 word 剩余全 1，继续下一 word
+            end = (end / 64 + 1) * 64;
+            if end / 64 >= mask.len() {
+                break;
+            }
+        } else {
+            end += zeros.trailing_zeros() as usize; // 段止于本 word 内首个 0
+            break;
+        }
+    }
+    Some((start, end.min(len)))
+}
+
+/// 谓词批量求值：整段连续 values 上产出 0/1 字节掩码（不含 validity；
+/// NULL 行由调用方在根部统一排除，因此 NOT / OR 无需逐层处理 NULL）。
+/// Cmp 为类型化切片比较循环（LLVM 可自动向量化）；And / Or / Not 为字节级位运算。
+fn eval_predicate_bytes(
     pred: &Predicate,
     data_type: DataType,
     values: &[u8],
-    validity: Option<&BitmapView<'_>>,
     rows: usize,
-    selection: &mut [bool],
-) -> Result<(), CoreError> {
-    let row_valid = |i: usize| validity.map(|v| v.is_valid(i)).unwrap_or(true);
+) -> Result<Vec<u8>, CoreError> {
     match pred {
         Predicate::And(children) => {
-            for (i, sel) in selection.iter_mut().enumerate() {
-                *sel &= row_valid(i);
-            }
+            let mut out = vec![1u8; rows];
             for child in children {
-                eval_predicate(child, data_type, values, validity, rows, selection)?;
-                if selection.iter().all(|&s| !s) {
-                    break;
+                let c = eval_predicate_bytes(child, data_type, values, rows)?;
+                for (o, &b) in out.iter_mut().zip(&c) {
+                    *o &= b;
+                }
+                if out.iter().all(|&b| b == 0) {
+                    break; // 已无命中，短路
                 }
             }
-            Ok(())
+            Ok(out)
         }
         Predicate::Or(children) => {
-            let mut acc = vec![false; rows];
+            let mut out = vec![0u8; rows];
             for child in children {
-                let mut tmp = vec![false; rows];
-                eval_predicate(child, data_type, values, validity, rows, &mut tmp)?;
-                for i in 0..rows {
-                    acc[i] |= tmp[i];
+                let c = eval_predicate_bytes(child, data_type, values, rows)?;
+                for (o, &b) in out.iter_mut().zip(&c) {
+                    *o |= b;
                 }
             }
-            for (i, sel) in selection.iter_mut().enumerate() {
-                *sel &= acc[i] && row_valid(i);
-            }
-            Ok(())
+            Ok(out)
         }
         Predicate::Not(inner) => {
-            let mut tmp = vec![true; rows];
-            eval_predicate(inner, data_type, values, validity, rows, &mut tmp)?;
-            for (i, sel) in selection.iter_mut().enumerate() {
-                *sel &= row_valid(i) && !tmp[i];
-            }
-            Ok(())
+            let c = eval_predicate_bytes(inner, data_type, values, rows)?;
+            Ok(c.into_iter().map(|b| b ^ 1).collect())
         }
-        Predicate::Cmp { op, value, .. } => {
-            if data_type == DataType::Utf8 {
-                return Err(CoreError::Invalid(
-                    "value predicate on Utf8 field is not supported".into(),
-                ));
-            }
-            let size = data_type.size_of();
-            for i in 0..rows {
-                let row_scalar = read_row_scalar(data_type, &values[i * size..i * size + size])?;
-                let hit = row_valid(i)
-                    && compare_scalar(&row_scalar, *op, value)
-                    .ok_or_else(|| {
-                        CoreError::Invalid(format!(
-                            "scalar {value:?} incompatible with column type {data_type:?}"
-                        ))
-                    })?;
-                selection[i] &= hit;
-            }
-            Ok(())
-        }
+        Predicate::Cmp { op, value, .. } => eval_cmp_bytes(data_type, values, *op, value, rows),
     }
+}
+
+/// 按比较算子生成 6 个直线比较循环（算子分派在循环外，循环体可自动向量化）。
+/// `$conv` 为行值到比较域的转换闭包（如 `|a: i8| a as i64`，内联后不阻碍向量化）。
+macro_rules! fill_cmp {
+    ($out:expr, $arr:expr, $op:expr, $conv:expr, $v:expr) => {
+        match $op {
+            CmpOp::Eq => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) == $v) as u8 },
+            CmpOp::Ne => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) != $v) as u8 },
+            CmpOp::Lt => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) < $v) as u8 },
+            CmpOp::Le => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) <= $v) as u8 },
+            CmpOp::Gt => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) > $v) as u8 },
+            CmpOp::Ge => for (o, &a) in $arr.iter().enumerate() { $out[o] = (($conv(a)) >= $v) as u8 },
+        }
+    };
+}
+
+fn typed_slice<T: bytemuck::Pod>(values: &[u8]) -> &[T] {
+    bytemuck::cast_slice(values)
+}
+
+/// Cmp 批量求值：按列类型分派到类型化比较循环，保持 `compare_scalar` 的跨域加宽语义
+/// （有符号 ↔ 无符号 ↔ 浮点；bool 仅与 bool 比较）。浮点遵循 IEEE 语义：
+/// NaN 行 / NaN 目标按 IEEE 求值（仅 Ne 命中）。
+fn eval_cmp_bytes(
+    data_type: DataType,
+    values: &[u8],
+    op: CmpOp,
+    value: &Scalar,
+    rows: usize,
+) -> Result<Vec<u8>, CoreError> {
+    if data_type == DataType::Utf8 {
+        return Err(CoreError::Invalid(
+            "value predicate on Utf8 field is not supported".into(),
+        ));
+    }
+    let incompatible = || {
+        CoreError::Invalid(format!(
+            "scalar {value:?} incompatible with column type {data_type:?}"
+        ))
+    };
+    let mut out = vec![0u8; rows];
+    match data_type {
+        DataType::Bool => {
+            let Scalar::Bool(v) = value else { return Err(incompatible()) };
+            for (o, &a) in values.iter().enumerate() {
+                out[o] = op.matches((a != 0).cmp(v)) as u8;
+            }
+        }
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Date32 => match value {
+            Scalar::Int(v) => match data_type {
+                DataType::Int8 => fill_cmp!(out, typed_slice::<i8>(values), op, |a: i8| a as i64, *v),
+                DataType::Int16 => {
+                    fill_cmp!(out, typed_slice::<i16>(values), op, |a: i16| a as i64, *v)
+                }
+                _ => fill_cmp!(out, typed_slice::<i32>(values), op, |a: i32| a as i64, *v),
+            },
+            Scalar::UInt(v) => {
+                if *v > i64::MAX as u64 {
+                    // 任何 i64 行都小于该目标
+                    out.fill(op.matches(std::cmp::Ordering::Less) as u8);
+                } else {
+                    let v = *v as i64;
+                    match data_type {
+                        DataType::Int8 => {
+                            fill_cmp!(out, typed_slice::<i8>(values), op, |a: i8| a as i64, v)
+                        }
+                        DataType::Int16 => {
+                            fill_cmp!(out, typed_slice::<i16>(values), op, |a: i16| a as i64, v)
+                        }
+                        _ => fill_cmp!(out, typed_slice::<i32>(values), op, |a: i32| a as i64, v),
+                    }
+                }
+            }
+            Scalar::Float(f) => match data_type {
+                DataType::Int8 => fill_cmp!(out, typed_slice::<i8>(values), op, |a: i8| a as f64, *f),
+                DataType::Int16 => {
+                    fill_cmp!(out, typed_slice::<i16>(values), op, |a: i16| a as f64, *f)
+                }
+                _ => fill_cmp!(out, typed_slice::<i32>(values), op, |a: i32| a as f64, *f),
+            },
+            _ => return Err(incompatible()),
+        },
+        DataType::Int64 | DataType::TimestampUs | DataType::Date64 => match value {
+            Scalar::Int(v) => fill_cmp!(out, typed_slice::<i64>(values), op, |a: i64| a, *v),
+            Scalar::UInt(v) => {
+                if *v > i64::MAX as u64 {
+                    out.fill(op.matches(std::cmp::Ordering::Less) as u8);
+                } else {
+                    let v = *v as i64;
+                    fill_cmp!(out, typed_slice::<i64>(values), op, |a: i64| a, v);
+                }
+            }
+            Scalar::Float(f) => fill_cmp!(out, typed_slice::<i64>(values), op, |a: i64| a as f64, *f),
+            _ => return Err(incompatible()),
+        },
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => match value {
+            Scalar::UInt(v) => match data_type {
+                DataType::UInt8 => {
+                    fill_cmp!(out, typed_slice::<u8>(values), op, |a: u8| a as u64, *v)
+                }
+                DataType::UInt16 => {
+                    fill_cmp!(out, typed_slice::<u16>(values), op, |a: u16| a as u64, *v)
+                }
+                DataType::UInt32 => {
+                    fill_cmp!(out, typed_slice::<u32>(values), op, |a: u32| a as u64, *v)
+                }
+                _ => fill_cmp!(out, typed_slice::<u64>(values), op, |a: u64| a, *v),
+            },
+            Scalar::Int(v) => {
+                if *v < 0 {
+                    // 无符号行必然大于负目标
+                    out.fill(op.matches(std::cmp::Ordering::Greater) as u8);
+                } else {
+                    let v = *v as u64;
+                    match data_type {
+                        DataType::UInt8 => {
+                            fill_cmp!(out, typed_slice::<u8>(values), op, |a: u8| a as u64, v)
+                        }
+                        DataType::UInt16 => {
+                            fill_cmp!(out, typed_slice::<u16>(values), op, |a: u16| a as u64, v)
+                        }
+                        DataType::UInt32 => {
+                            fill_cmp!(out, typed_slice::<u32>(values), op, |a: u32| a as u64, v)
+                        }
+                        _ => fill_cmp!(out, typed_slice::<u64>(values), op, |a: u64| a, v),
+                    }
+                }
+            }
+            Scalar::Float(f) => match data_type {
+                DataType::UInt8 => {
+                    fill_cmp!(out, typed_slice::<u8>(values), op, |a: u8| a as f64, *f)
+                }
+                DataType::UInt16 => {
+                    fill_cmp!(out, typed_slice::<u16>(values), op, |a: u16| a as f64, *f)
+                }
+                DataType::UInt32 => {
+                    fill_cmp!(out, typed_slice::<u32>(values), op, |a: u32| a as f64, *f)
+                }
+                _ => fill_cmp!(out, typed_slice::<u64>(values), op, |a: u64| a as f64, *f),
+            },
+            _ => return Err(incompatible()),
+        },
+        DataType::Float32 => match value {
+            Scalar::Float(f) => fill_cmp!(out, typed_slice::<f32>(values), op, |a: f32| a as f64, *f),
+            Scalar::Int(v) => {
+                fill_cmp!(out, typed_slice::<f32>(values), op, |a: f32| a as f64, *v as f64)
+            }
+            Scalar::UInt(v) => {
+                fill_cmp!(out, typed_slice::<f32>(values), op, |a: f32| a as f64, *v as f64)
+            }
+            _ => return Err(incompatible()),
+        },
+        DataType::Float64 => match value {
+            Scalar::Float(f) => fill_cmp!(out, typed_slice::<f64>(values), op, |a: f64| a, *f),
+            Scalar::Int(v) => fill_cmp!(out, typed_slice::<f64>(values), op, |a: f64| a, *v as f64),
+            Scalar::UInt(v) => fill_cmp!(out, typed_slice::<f64>(values), op, |a: f64| a, *v as f64),
+            _ => return Err(incompatible()),
+        },
+        DataType::Utf8 => unreachable!("rejected above"),
+    }
+    Ok(out)
 }
