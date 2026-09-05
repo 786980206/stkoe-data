@@ -892,14 +892,27 @@ fn convert_values(
     let mut out = vec![0u8; rows * ds];
     for i in 0..rows {
         let scalar = read_row_scalar(src, &values[i * ss..i * ss + ss])?;
-        let raw: [u8; 8] = if dst == DataType::Float32 || dst == DataType::Float64 {
-            scalar_to_f64(&scalar).to_le_bytes()
-        } else if dst.is_signed_int() {
-            scalar_to_i64(&scalar).to_le_bytes()
-        } else {
-            scalar_to_u64(&scalar).to_le_bytes()
-        };
-        out[i * ds..i * ds + ds].copy_from_slice(&raw[..ds]);
+        // 目标宽度直接生成对应宽度的 LE 字节（禁止用宽类型字节截断：
+        // f64 小端低 4 位不是 f32 位型，截断对小整数值产生 0.0 / 大值产生乱码）
+        let slot = &mut out[i * ds..i * ds + ds];
+        match dst {
+            DataType::Float32 => {
+                let b = (scalar_to_f64(&scalar) as f32).to_le_bytes();
+                slot.copy_from_slice(&b);
+            }
+            DataType::Float64 => {
+                let b = scalar_to_f64(&scalar).to_le_bytes();
+                slot.copy_from_slice(&b);
+            }
+            _ if dst.is_signed_int() => {
+                let b = scalar_to_i64(&scalar).to_le_bytes();
+                slot.copy_from_slice(&b[..ds]);
+            }
+            _ => {
+                let b = scalar_to_u64(&scalar).to_le_bytes();
+                slot.copy_from_slice(&b[..ds]);
+            }
+        }
     }
     Ok((out, validity, rows))
 }

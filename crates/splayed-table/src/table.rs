@@ -70,34 +70,6 @@ impl TableHandle {
         Ok(unsafe { &*ptr })
     }
 
-    /// 结构操作用的可变访问（不与视图并存；调用方契约）。
-    pub(crate) fn dataset_for_mut(
-        &mut self,
-        partition: &str,
-    ) -> Result<&mut DatasetHandle, CoreError> {
-        if !self.datasets.borrow().contains_key(partition) {
-            let dir = if self.scheme == PartitionScheme::None {
-                self.root.clone()
-            } else {
-                self.root.join(partition)
-            };
-            let ds = open_dataset(&dir, self.mode)?;
-            let mut ds = ds;
-            if let Some(mp) = self.options.max_parallelism {
-                ds.set_max_parallelism(mp);
-            }
-            self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
-        }
-        let mut borrow = self.datasets.borrow_mut();
-        let ptr: *mut DatasetHandle = match borrow.get_mut(partition) {
-            Some(b) => &mut **b as *mut DatasetHandle,
-            None => unreachable!("just inserted"),
-        };
-        drop(borrow);
-        // 安全性：Box 地址稳定；此刻无其他借用（结构操作不与视图并存）
-        Ok(unsafe { &mut *ptr })
-    }
-
     /// 时间单位（从第一个可用 Dataset 的 META 推断，缓存）。
     pub(crate) fn peek_time_type(&self) -> Result<TimeType, CoreError> {
         if let Some(tt) = self.time_type.borrow().as_ref() {
@@ -559,7 +531,15 @@ pub fn create_table_partition(
 }
 
 /// 删除整个 Table（根目录及全部 Partition Dataset）。
+///
+/// 不逐 Partition 并行删除——文件系统级递归删除（remove_dir_all）比用户态遍历
+/// 更快且无锁竞争。显式 `NotFound`（不做幂等删除）。并发契约：调用方保证无打开的
+/// TableHandle 引用该 Table（悬垂句柄防护由上层生命周期保证）；失败时目录可能
+/// 半删（API 无事务保证）。
 pub fn delete_table(table_path: &Path) -> Result<(), CoreError> {
+    if !table_path.is_dir() {
+        return Err(CoreError::NotFound(table_path.to_path_buf()));
+    }
     fs::remove_dir_all(table_path).map_err(|e| CoreError::Io(e))
 }
 
@@ -587,9 +567,16 @@ pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result
 }
 
 /// 重命名 Table 根目录（同一父目录内，原子；调用前 Table 必须无打开 Handle）。
+///
+/// 绝对 O(1)：只做目录 rename，不重建 Table、不复制数据；跨文件系统不支持
+/// （fs::rename 失败即报错，无移动语义）。重命名后路径缓存失效——上层需重新
+/// `open_table`；并发契约：调用方保证无打开的 TableHandle 引用旧路径。
 pub fn rename_table(table_path: &Path, new_name: &str) -> Result<(), CoreError> {
     if new_name.is_empty() || new_name.starts_with('.') || new_name.contains(['/', '\\', '=']) {
         return Err(CoreError::Invalid(format!("invalid table name '{new_name}'")));
+    }
+    if !table_path.is_dir() {
+        return Err(CoreError::NotFound(table_path.to_path_buf()));
     }
     let parent = table_path.parent().unwrap_or_else(|| Path::new("."));
     let target = parent.join(new_name);
@@ -732,10 +719,81 @@ impl TableHandle {
 
     // -------------------------------------------------- Field 结构操作
 
+    /// Field 结构操作的统一执行器（统一并发模型）：
+    /// 主线程串行确保所有 Partition 打开（Dataset 缓存复用）→ `values_mut` 收集
+    /// 互不相交的 `&mut DatasetHandle` → round-robin 分桶 `std::thread::scope`
+    /// 并行执行（P = min(max_parallelism, 分区数)；单分区 / 并行度 1 走串行快路径）。
+    /// Table 层不管理 Field 级并发（各 Dataset 内部策略自理，无嵌套并行）。
+    /// 失败语义：返回首个错误，已完成的 Partition 不回滚（与 create_table 一致）；
+    /// 空表（无分区）vacuous Ok。
+    fn structural_for_each<F>(&self, f: F) -> Result<(), CoreError>
+    where
+        F: Fn(&mut DatasetHandle) -> Result<(), CoreError> + Sync,
+    {
+        let partitions = self.discover_partitions();
+        if partitions.is_empty() {
+            return Ok(());
+        }
+        for p in &partitions {
+            self.dataset_for(p)?;
+        }
+        let mut guard = self.datasets.borrow_mut();
+        let targets: Vec<&mut DatasetHandle> =
+            guard.values_mut().map(|b| &mut **b).collect();
+        let p = self
+            .options
+            .max_parallelism
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1)
+            .min(targets.len());
+        if p <= 1 {
+            for h in targets {
+                f(h)?;
+            }
+            return Ok(());
+        }
+        let mut buckets: Vec<Vec<&mut DatasetHandle>> = (0..p).map(|_| Vec::new()).collect();
+        for (i, h) in targets.into_iter().enumerate() {
+            buckets[i % p].push(h);
+        }
+        // 共享引用先行绑定：move 闭包只捕获 &F（F: Sync），不按值移动
+        let f_ref = &f;
+        std::thread::scope(|s| {
+            let mut joins = Vec::new();
+            for bucket in buckets {
+                joins.push(s.spawn(move || -> Result<(), CoreError> {
+                    for h in bucket {
+                        f_ref(h)?;
+                    }
+                    Ok(())
+                }));
+            }
+            let mut first_err: Option<CoreError> = None;
+            for j in joins {
+                match j.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        first_err.get_or_insert(CoreError::InvalidState(
+                            "structural op thread panicked".into(),
+                        ));
+                    }
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        })
+    }
+
     /// 所有 Partition 新增全 NULL 字段（core `create_field_file(init = length(L_p))`）。
-    /// 前置：所有 Partition 均不含 `field`；不保证跨 Partition 原子。
+    ///
+    /// 最优路径：全 NULL 字段无需物化数据——core 以 `set_len` 稀疏零填充 DATA/VALIDITY
+    /// 区，成本 O(64B header + 稀疏扩展)/分区（非 O(total rows) 写入）。
+    /// 严格前置：所有 Partition 均不含 `field`（避免跨分区 schema 不一致）；
+    /// 失败不回滚，已创建的分区保留。
     pub fn create_table_field(
-        &mut self,
+        &self,
         field: &str,
         data_type: DataType,
     ) -> Result<(), CoreError> {
@@ -750,15 +808,15 @@ impl TableHandle {
                 )));
             }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?
-                .create_dataset_field(field, data_type, splayed_core::DatasetFieldInit::AllNull)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| {
+            ds.create_dataset_field(field, data_type, splayed_core::DatasetFieldInit::AllNull)
+        })
     }
 
-    /// 删除所有 Partition 中的同名字段。前置：所有 Partition 均含该字段。
-    pub fn delete_table_field(&mut self, field: &str) -> Result<(), CoreError> {
+    /// 删除所有 Partition 中的同名字段（直接删物理文件，不打开 Field）。
+    /// 严格前置：所有 Partition 均含该字段（先全量校验再执行，避免部分删除后
+    /// Table schema 不一致）；失败不回滚。
+    pub fn delete_table_field(&self, field: &str) -> Result<(), CoreError> {
         if field == "sym" || field == "time" {
             return Err(CoreError::Invalid(format!("'{field}' is managed by META")));
         }
@@ -770,16 +828,14 @@ impl TableHandle {
                 )));
             }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.delete_dataset_field(field)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| ds.delete_dataset_field(field))
     }
 
-    /// 更新所有 Partition 中该字段的 header 物理属性
-    /// （data_type / row_count 由 core 强制为现值；类型转换走 `cast_table_field`）。
+    /// 更新所有 Partition 中该字段的 header 物理属性（只改 header，不触碰 data；
+    /// data_type / row_count 由 core 强制为现值；类型转换走 `cast_table_field`）。
+    /// 严格前置：所有 Partition 均含该字段。
     pub fn update_table_field(
-        &mut self,
+        &self,
         field: &str,
         header: splayed_format::FieldHeader,
     ) -> Result<(), CoreError> {
@@ -791,14 +847,13 @@ impl TableHandle {
                 )));
             }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.update_dataset_field_header(field, header)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| ds.update_dataset_field_header(field, header))
     }
 
-    /// 重命名所有 Partition 中的同名字段。前置：均含 `field` 且均无 `new_name`。
-    pub fn rename_table_field(&mut self, field: &str, new_name: &str) -> Result<(), CoreError> {
+    /// 重命名所有 Partition 中的同名字段（本质是每分区一次文件 rename，
+    /// 纯文件系统元数据操作，不读取 / 复制数据）。
+    /// 严格前置：均含 `field` 且均无 `new_name`。
+    pub fn rename_table_field(&self, field: &str, new_name: &str) -> Result<(), CoreError> {
         let partitions = self.discover_partitions();
         for p in &partitions {
             let schema = self.dataset_for(p)?.read_dataset_schema();
@@ -813,58 +868,72 @@ impl TableHandle {
                 )));
             }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.rename_dataset_field(field, new_name)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| ds.rename_dataset_field(field, new_name))
     }
 
-    /// 转换所有 Partition 中该字段的类型；中途失败直接重试补齐
-    /// （已为目标类型的 Partition 再转换是无害 no-op）。
-    pub fn cast_table_field(&mut self, field: &str, target_type: DataType) -> Result<(), CoreError> {
+    /// 转换所有 Partition 中该字段的类型（重操作：cast_dataset_field 内部
+    /// chunked streaming + tmp + 原子替换，内存 O(批次)；已为目标类型为无害 no-op）。
+    /// 严格前置：所有 Partition 均含该字段且类型一致（跨分区类型不一致 → Invalid）。
+    pub fn cast_table_field(&self, field: &str, target_type: DataType) -> Result<(), CoreError> {
+        let partitions = self.discover_partitions();
+        let mut cur_type: Option<DataType> = None;
+        for p in &partitions {
+            let schema = self.dataset_for(p)?.read_dataset_schema();
+            let pos = schema.position(field).ok_or_else(|| {
+                CoreError::Invalid(format!("field '{field}' missing in partition '{p}'"))
+            })?;
+            let dt = schema.fields[pos].data_type;
+            match cur_type {
+                None => cur_type = Some(dt),
+                Some(prev) if prev != dt => {
+                    return Err(CoreError::Invalid(format!(
+                        "field '{field}' has inconsistent types across partitions ({prev:?} vs {dt:?})"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        self.structural_for_each(|ds| ds.cast_dataset_field(field, target_type))
+    }
+
+    /// 压缩所有 Partition 中的同名字段（重操作：sym 对齐 chunk 边界 + 流式编码 +
+    /// 原子替换由 Dataset 层完成）。严格前置：均为 uncompressed（轻量 64B header
+    /// 状态检查，不经打开——compressed 打开会全量解压）。
+    pub fn compress_table_field(&self, field: &str) -> Result<(), CoreError> {
         let partitions = self.discover_partitions();
         for p in &partitions {
-            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+            let ds = self.dataset_for(p)?;
+            if ds.read_dataset_schema().position(field).is_none() {
                 return Err(CoreError::Invalid(format!(
                     "field '{field}' missing in partition '{p}'"
                 )));
             }
+            if ds.dataset_field_is_chunked(field)? {
+                return Err(CoreError::Invalid(format!(
+                    "field '{field}' in partition '{p}' is already compressed"
+                )));
+            }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.cast_dataset_field(field, target_type)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| ds.compress_dataset_field(field))
     }
 
-    /// 压缩所有 Partition 中的同名字段（前置：均为 uncompressed）。
-    pub fn compress_table_field(&mut self, field: &str) -> Result<(), CoreError> {
+    /// 解压所有 Partition 中的同名字段（重操作：流式解码 + 原子替换）。
+    /// 严格前置：均为 compressed（轻量 64B header 状态检查）。
+    pub fn decompress_table_field(&self, field: &str) -> Result<(), CoreError> {
         let partitions = self.discover_partitions();
         for p in &partitions {
-            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+            let ds = self.dataset_for(p)?;
+            if ds.read_dataset_schema().position(field).is_none() {
                 return Err(CoreError::Invalid(format!(
                     "field '{field}' missing in partition '{p}'"
                 )));
             }
-        }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.compress_dataset_field(field)?;
-        }
-        Ok(())
-    }
-
-    /// 解压所有 Partition 中的同名字段（前置：均为 compressed）。
-    pub fn decompress_table_field(&mut self, field: &str) -> Result<(), CoreError> {
-        let partitions = self.discover_partitions();
-        for p in &partitions {
-            if self.dataset_for(p)?.read_dataset_schema().position(field).is_none() {
+            if !ds.dataset_field_is_chunked(field)? {
                 return Err(CoreError::Invalid(format!(
-                    "field '{field}' missing in partition '{p}'"
+                    "field '{field}' in partition '{p}' is not compressed"
                 )));
             }
         }
-        for p in &partitions {
-            self.dataset_for_mut(p)?.decompress_dataset_field(field)?;
-        }
-        Ok(())
+        self.structural_for_each(|ds| ds.decompress_dataset_field(field))
     }
 }

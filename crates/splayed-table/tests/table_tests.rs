@@ -352,7 +352,7 @@ fn table_field_structure_operations() {
     let dir = temp_dir("fieldops");
     let root = dir.join("tbl");
     create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
-    let mut table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // create：全 NULL
     table.create_table_field("volume", DataType::Int64).unwrap();
@@ -598,5 +598,76 @@ fn partition_entry_validation() {
     assert!(root.join("month=2026-08").is_dir());
     delete_table_partition(&root, "month=2026-08").unwrap();
     assert!(!root.join("month=2026-08").exists());
+    cleanup(&dir);
+}
+
+/// Field 结构操作统一并发模型：分区级并行（max_parallelism）+ 严格前置校验。
+#[test]
+fn table_field_struct_ops_parallel_and_state_checks() {
+    let dir = temp_dir("struct_par");
+    let root = dir.join("tbl");
+    // 3 分区 × 2 sym × 2 行；sym 外层保证 (sym ASC, time ASC) 契约
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let mut rows: Vec<(&str, i32, f64)> = Vec::new();
+    for (i, sym) in ["AAPL", "MSFT"].iter().enumerate() {
+        for m in [7u32, 8, 9] {
+            for k in 0..2usize {
+                rows.push((sym, d(m, (k + 1) as u32), (i * 100 + m as usize * 2 + k) as f64));
+            }
+        }
+    }
+    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions { max_parallelism: Some(8) }).unwrap();
+
+    let read_prices = |root: &Path| -> Vec<f64> {
+        let table = open_table(root, Mode::Read, TableOptions::default()).unwrap();
+        let req = TableScanRequest::default();
+        let mut reader = query_table(&table, req, None).unwrap();
+        let mut out = Vec::new();
+        while let Some(view) = reader.next().unwrap() {
+            out.extend(f64s(view.column("price").unwrap()));
+        }
+        reader.close().unwrap();
+        out
+    };
+    let before = read_prices(&root);
+    assert_eq!(before.len(), 12);
+
+    let table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(8) }).unwrap();
+    // create：并行全分区新增（全 NULL = 稀疏 set_len，非逐行写入）
+    table.create_table_field("volume", DataType::Int64).unwrap();
+    assert_eq!(table.read_table_schema().unwrap().data_type_of("volume"), Some(DataType::Int64));
+    assert!(table.create_table_field("volume", DataType::Int64).is_err()); // 已存在 → Invalid
+    assert!(table.delete_table_field("nope").is_err()); // 缺字段 → Invalid
+
+    // compress / decompress：并行重操作；64B header 状态前置校验
+    table.compress_table_field("price").unwrap();
+    assert!(table.compress_table_field("price").is_err()); // 已压缩 → Invalid
+    assert!(table.decompress_table_field("volume").is_err()); // 未压缩 → Invalid
+    table.decompress_table_field("price").unwrap();
+    assert!(table.decompress_table_field("price").is_err()); // 已解压 → Invalid
+
+    // cast：f64 → f32 → f64 往返（小整数值精确）；跨分区类型一致才允许
+    table.cast_table_field("price", DataType::Float32).unwrap();
+    table.cast_table_field("price", DataType::Float64).unwrap();
+
+    // rename：保留名冲突 → Invalid
+    assert!(table.rename_table_field("price", "sym").is_err());
+    table.rename_table_field("volume", "qty").unwrap();
+    table.delete_table_field("qty").unwrap();
+    assert_eq!(table.read_table_schema().unwrap().data_type_of("qty"), None);
+    table.close().unwrap();
+
+    // 全部重操作往返后 price 数据不变（分区级并行正确性）
+    assert_eq!(read_prices(&root), before);
+
+    // delete_table / rename_table 显式 NotFound
+    assert!(matches!(
+        delete_table(&dir.join("nope")),
+        Err(splayed_core::CoreError::NotFound(_))
+    ));
+    assert!(matches!(
+        rename_table(&dir.join("nope"), "x"),
+        Err(splayed_core::CoreError::NotFound(_))
+    ));
     cleanup(&dir);
 }

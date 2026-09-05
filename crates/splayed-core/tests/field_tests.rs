@@ -674,3 +674,40 @@ fn read_out_of_bounds_rejected() {
     close_field_handle(handle).unwrap();
     cleanup(&dir);
 }
+
+/// f64 → f32 → f64 往返（回归：convert_values 曾用 f64 小端字节截断生成 f32，
+/// 小整数值低 4 位全零 → 数据清零）。
+#[test]
+fn cast_f64_f32_roundtrip_preserves_values() {
+    let dir = std::env::temp_dir()
+        .join(format!("splayed_core_cast_f32_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("f");
+
+    let vals: Vec<f64> = vec![14.0, 15.0, 114.0, 115.0, -3.5, 0.1];
+    let col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&vals),
+        validity: None,
+        dict: None,
+    };
+    create_field_file(&path, DataType::Float64, FieldInit::Data(col)).unwrap();
+    cast_field_file(&path, DataType::Float32).unwrap();
+    cast_field_file(&path, DataType::Float64).unwrap();
+
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(h.data_type(), DataType::Float64);
+    let view = h.read_field_handle(0, vals.len() as u64).unwrap();
+    let got: Vec<f64> = view
+        .segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, f64>(s.fixed_bytes().unwrap()).to_vec())
+        .collect();
+    // f32 精度内一致
+    for (g, w) in got.iter().zip(vals.iter()) {
+        assert!((g - w).abs() < 1e-5, "got {g}, want {w}");
+    }
+    drop(h);
+    let _ = std::fs::remove_dir_all(&dir);
+}

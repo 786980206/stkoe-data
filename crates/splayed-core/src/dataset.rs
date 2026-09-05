@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use splayed_format::{
@@ -608,6 +608,18 @@ impl DatasetHandle {
         self.fields.borrow_mut().remove(name);
         decompress_field_file(&self.field_path(name))?;
         Ok(())
+    }
+
+    /// 指定 Field 是否为 compressed（chunked）物理表示。
+    /// 轻量实现：只读 64B header，不经 `open_field_file`（compressed 打开会全量解压），
+    /// 供 Table 层 compress / decompress 的前置状态校验（O(64B)/分区）。
+    pub fn dataset_field_is_chunked(&self, name: &str) -> Result<bool, CoreError> {
+        let path = self.field_path(name);
+        let mut f = File::open(&path).map_err(|e| map_io_path(&path, e))?;
+        let mut head = [0u8; 64];
+        f.read_exact(&mut head)?;
+        let header = splayed_format::FieldHeader::from_bytes(&head)?;
+        Ok(header.is_chunked())
     }
 
     /// `(sym, time)` 联合键批量定位（转发 META，供 Table 层 write_table 使用）。

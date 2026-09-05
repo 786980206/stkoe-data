@@ -294,7 +294,11 @@ pub fn delete_table(table_path: &Path) -> Result<(), CoreError>
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 根目录及全部 Partition 已删除 |
 
 **说明**：
-- 删除 Table 根目录及全部 Partition Dataset；不需要逐个删除 Partition。
+- 删除 Table 根目录及全部 Partition Dataset；**不逐 Partition 并行删除**——文件系统级
+  递归删除（remove_dir_all）比用户态遍历更快且无锁竞争。
+- `table_path` 不存在 → 显式 `NotFound`（不做幂等删除，避免掩盖逻辑错误）。
+- 并发契约：调用方保证无打开的 `TableHandle` 引用该 Table（悬垂句柄防护由上层生命周期
+  保证）；失败时目录可能半删（API 无事务保证）。
 
 ### 4.4 rename_table
 
@@ -312,7 +316,9 @@ pub fn rename_table(table_path: &Path, new_name: &str) -> Result<(), CoreError>
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 原子重命名完成 |
 
 **说明**：
-- 纯目录级 rename：Partition 目录名、META、Field 全部原样，不涉及 core 调用与数据改写。
+- 纯目录级 rename：Partition 目录名、META、Field 全部原样，不涉及 core 调用与数据改写——
+  **绝对 O(1)**，不重建 Table、不复制数据。
+- `table_path` 不存在 → 显式 `NotFound`；对应目录已存在 → `AlreadyExists`。
 - 调用前 Table 必须没有任何打开的 Handle（Windows 不允许对打开中的目录 rename）；`TableHandle` 缓存的 `table_path` 在重新 `open_table` 后生效。
 - 目录 rename 在同一文件系统内原子完成；跨文件系统视为非法（Error），不提供移动语义。
 
@@ -344,13 +350,13 @@ impl TableHandle { pub fn close(mut self) -> Result<(), CoreError> }
 **接口定义**：
 ```rust
 impl TableHandle {
-    pub fn create_table_field(&mut self, field: &str, data_type: DataType) -> Result<(), CoreError>
-    pub fn delete_table_field(&mut self, field: &str) -> Result<(), CoreError>
-    pub fn update_table_field(&mut self, field: &str, header: splayed_format::FieldHeader) -> Result<(), CoreError>
-    pub fn rename_table_field(&mut self, field: &str, new_name: &str) -> Result<(), CoreError>
-    pub fn cast_table_field(&mut self, field: &str, target_type: DataType) -> Result<(), CoreError>
-    pub fn compress_table_field(&mut self, field: &str) -> Result<(), CoreError>
-    pub fn decompress_table_field(&mut self, field: &str) -> Result<(), CoreError>
+    pub fn create_table_field(&self, field: &str, data_type: DataType) -> Result<(), CoreError>
+    pub fn delete_table_field(&self, field: &str) -> Result<(), CoreError>
+    pub fn update_table_field(&self, field: &str, header: splayed_format::FieldHeader) -> Result<(), CoreError>
+    pub fn rename_table_field(&self, field: &str, new_name: &str) -> Result<(), CoreError>
+    pub fn cast_table_field(&self, field: &str, target_type: DataType) -> Result<(), CoreError>
+    pub fn compress_table_field(&self, field: &str) -> Result<(), CoreError>
+    pub fn decompress_table_field(&self, field: &str) -> Result<(), CoreError>
 }
 ```
 
@@ -364,26 +370,50 @@ impl TableHandle {
 | `new_name` | `&str` | 输入 | 新字段名 |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 所有 Partition 的同名字段结构变化完成 |
 
-**内部实现**：
+**内部实现流程（统一并发模型）**：
 ```
-1. discover_partitions（none 模式 = 根 Dataset）
-2. 前置校验：所有 Partition 均满足操作前提（存在 / 不存在、无重名、非保留名）
-   ——任一不满足 → Error，不做任何修改
-3. 逐 Partition 调用对应 Dataset 级 API
+① 主线程：discover_partitions（none 模式 = 根 Dataset；Table 层不自建线程池）
+     → 严格前置校验（逐 Partition 读缓存 Schema / 64B header 状态，
+       任一不满足 → Error，不做任何修改）→ 串行 ensure 全部 Partition 打开（缓存复用）
+② structural_for_each：values_mut 收集互不相交的 &mut DatasetHandle
+     → round-robin 分桶 std::thread::scope 并行执行（P = min(max_parallelism, 分区数)；
+       单分区 / 并行度 1 串行快路径）——并行只跨 Partition，Table 层不管理 Field 级并发
+③ 收尾：返回首个错误；已完成的 Partition 不回滚（best-effort，与 create_table 一致）
 ```
+
+**严格前置校验（先全量校验再执行，避免部分操作造成跨分区不一致）**：
+
+| 操作 | 前置 |
+| --- | --- |
+| create | 所有 Partition 均不含 `field` |
+| delete | 所有 Partition 均含 `field` |
+| update / rename | 所有 Partition 均含 `field`；rename 另要求均无 `new_name` |
+| cast | 所有 Partition 均含 `field` 且**类型一致**（跨分区类型不一致 → Invalid） |
+| compress | 所有 Partition 均含 `field` 且为 uncompressed（64B header 轻量状态检查，不经打开） |
+| decompress | 所有 Partition 均含 `field` 且为 compressed（同上） |
+
+**轻 / 重操作分离**：
+- **轻操作**（delete / rename / update）：只触文件系统元数据或 64B header（pread/pwrite），不读写字段数据。
+- **重操作**（cast / compress / decompress）：字段数据重写，由 Dataset 层保证 chunked streaming
+  （内存 O(批次 / 单 chunk)）+ tmp `sync_all` + 原子 rename；compress 的 sym 对齐 chunk 边界由
+  Dataset 层按 META 网格生成。
 
 各 API 语义：
 
-- `create_table_field(field, data_type)`：所有 Partition 新增**全 NULL** 字段（`DatasetFieldInit::AllNull`）。带数据（data / stream）初始化形式为设计预留——要求总行数等于 `Σ L_p` 且按 Table 自然顺序排列、从第一个 Partition 顺序填充——**当前未实现**。
-- `delete_table_field`：逐 Partition `delete_dataset_field`；META 与 sym / time 不受影响。
-- `update_table_field`：逐 Partition `update_dataset_field_header`；可更新的是 encoding / compression / flags 等物理属性。
-- `rename_table_field`：逐 Partition `rename_dataset_field`。
-- `cast_table_field`：逐 Partition `cast_dataset_field`；中途失败会造成 Partition 间类型不一致，直接重试补齐即可（已为目标类型的 Partition 再次转换是无害 no-op）。
-- `compress_table_field`：前置要求各 Partition 该 Field 均为 uncompressed；逐 Partition `compress_dataset_field`（sym 对齐边界由 Dataset 层生成）。
-- `decompress_table_field`：前置要求各 Partition 该 Field 均为 compressed；逐 Partition `decompress_dataset_field`。
+- `create_table_field(field, data_type)`：所有 Partition 新增**全 NULL** 字段
+  （`DatasetFieldInit::AllNull` → core `FieldInit::Length`，DATA/VALIDITY 区由 OS `set_len`
+  稀疏零填充——成本 O(64B header + 稀疏扩展)/分区，非 O(total rows) 写入）。带数据
+  （data / stream）初始化形式为设计预留——要求总行数等于 `Σ L_p` 且按 Table 自然顺序排列、
+  从第一个 Partition 顺序填充——**当前未实现**。
+- `delete_table_field`：直接删除物理文件，不打开 Field；META 与 sym / time 不受影响。
+- `rename_table_field`：本质是每分区一次文件 rename（纯元数据操作）。
+- `cast_table_field`：已为目标类型的 Partition 再次转换是无害 no-op；中途失败会造成
+  Partition 间类型不一致，重试补齐即可（重试的前提校验对已转换分区视为 no-op）。
+- 空表（无 Partition）：所有操作 vacuous Ok（无分区即无字段可操作，语义显式记录）。
 
 **说明**：
-- 对 Table 的**所有 Partition** 执行同名字段的结构操作；不保证跨 Partition 原子：中途失败时已完成的 Partition 保留，返回 Error。
+- 对 Table 的**所有 Partition** 执行同名字段的结构操作；不保证跨 Partition 原子：中途失败时
+  已完成的 Partition 保留，返回首个 Error。
 - `none` 模式即唯一根 Dataset 上的对应操作。
 - 各 Partition Schema 同步更新；Table Schema（以最后 Partition 为准）随之更新。
 
