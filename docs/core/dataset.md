@@ -12,7 +12,7 @@ Dataset（目录）
 
 - `open_dataset` 只打开 META；Dataset Schema 从 META 与 Field 元信息得到。
 - Field Handle 按需打开；首次访问某个 Field 时校验其与 Dataset 的 generation / Schema 一致性。
-- Field 名称 ↔ 文件名的映射由 Dataset 层定义（沿用 V1.0 的字段名文件名约定）。
+- Field 名称 ↔ 文件名的映射由 Dataset 层定义（沿用字段名 = 文件名约定）。
 - Dataset 不引入独立 Schema 文件、独立 Index 文件——Dataset Index 就是 `.meta`。
 
 ### 7.2 总览
@@ -23,59 +23,85 @@ Dataset（目录）
 | `create_dataset_index` | 创建 / 重建 `.meta` | File |
 | `open_dataset` | 打开 Dataset，返回 `DatasetHandle` | File |
 | `delete_dataset` | 删除完整 Dataset 目录 | File |
-| `create_dataset_field` | 新增单个 Field | Dataset |
-| `create_dataset_fields` | 批量新增 Field | Dataset |
-| `delete_dataset_field` | 删除指定 Field | Dataset |
-| `rename_dataset_field` | 重命名指定 Field | Dataset |
-| `cast_dataset_field` | 转换指定 Field 类型 | Dataset |
-| `compress_dataset_field` / `decompress_dataset_field` | 压缩 / 解压指定 Field | Dataset |
-| `read_dataset_schema` | 读取逻辑 Schema | Dataset |
-| `read_dataset_statistics` | 读取 Dataset 级统计 | Dataset |
-| `read_dataset` | 按逻辑行读取多列 | Dataset |
-| `write_dataset` | 按逻辑行覆盖写入 | Dataset |
-| `scan_dataset` | 条件扫描 → `DatasetScanner` | Dataset |
-| `locate_dataset_index` | (sym, time) 联合键批量定位（转发 META） | Dataset |
-| `close_dataset` | 关闭并释放资源 | Dataset |
+| `create_dataset_field` | 新增单个 Field | Handle |
+| `delete_dataset_field` | 删除指定 Field | Handle |
+| `rename_dataset_field` | 重命名指定 Field | Handle |
+| `update_dataset_field_header` | 更新指定 Field 的 header 物理属性 | Handle |
+| `cast_dataset_field` | 转换指定 Field 类型 | Handle |
+| `compress_dataset_field` / `decompress_dataset_field` | 压缩 / 解压指定 Field | Handle |
+| `read_dataset_schema` | 读取逻辑 Schema | Handle |
+| `read_dataset_statistics` | 读取 Dataset 级统计 | Handle |
+| `read_dataset` | 按逻辑行读取多列 | Handle |
+| `write_dataset` | 按逻辑行覆盖写入 | Handle |
+| `scan_dataset` | 条件扫描 → `DatasetScanner` | Handle |
+| `locate_dataset_index` | (sym, time) 联合键批量定位（转发 META） | Handle |
+| `close_dataset` | 关闭并释放资源 | Handle |
 
-> 规范说明：草稿中单字段入口与多字段入口重名（两处 `create_dataset_fields`），规范为 `create_dataset_field`（单）/ `create_dataset_fields`（批量）；`delete / cast / compress / decompress_dataset_field` 在草稿中签名缺失，此处补齐。新增 `locate_dataset_index` 作为 META `locate_index_handle` 的 Dataset 级封装，使 splayed-table 只依赖 Dataset API、不持有 MetaHandle。
+> 规范说明：草稿中单字段入口与多字段入口重名（两处 `create_dataset_fields`），规范为 `create_dataset_field`（单字段）；批量新增由调用方多次调用（未设批量 API）。`delete / cast / compress / decompress_dataset_field` 在草稿中签名缺失，此处补齐。新增 `locate_dataset_index` 作为 META `locate_index_handle` 的 Dataset 级封装，使 splayed-table 只依赖 Dataset API、不持有 MetaHandle。新增 `update_dataset_field_header`（header 物理属性更新，供 Table 层转发）。
 
 ### 7.3 create_dataset
 
+**接口定义**：
+```rust
+pub fn create_dataset(path: &Path, data: Data) -> Result<(), CoreError>
 ```
-create_dataset(path, data: Data) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | Dataset 目录路径；必须不存在 |
+| `data` | `Data` | 输入 | 拥有数据所有权的完整表数据（Schema + 全部列值）；必须含 `sym` 与 `time`，按 `(sym ASC, time ASC)` 排序 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = Dataset 创建完成 |
 
 **内部实现**：
 ```
 1. 校验 path 不存在、data 含 sym/time
 2. create_meta_file(path/.meta, data.as_view())
       → MetaBuilder::build（批量 cast + run 检测）
-      → write_meta_atomic（tmp + rename）
+      → write_meta_atomic（tmp + sync_all + rename）
 3. 遍历非 sym/time 列 → create_field_file(path/<name>, type, Data(col))
 4. 失败 → remove_dir_all(path) 清理残留
 ```
 - 新路径直写（无 temp dir 中转——目录不存在时无原子性需求）
 - 失败时清理整个目录
 
-- `data`：拥有数据所有权的完整表数据（Schema + 全部列值）。
-- 必须包含 `sym` 与 `time`；输入必须按 `(sym ASC, time ASC)` 排序；不要求各 SYM 时间集合相同。
+**说明**：
 - sym / time 转为 META（Index），其余列逐个转为 Field 文件；三者来自同一份输入，天然一致。
-
-流程：临时目录中创建 META + 全部 Field → 全部成功后原子 rename 到 `path`；任何一步失败不留不完整 Dataset，目标路径保持不变。
+- 不要求各 SYM 时间集合相同；缺失时间点由 Field 的 NULL 表示。
 
 ### 7.4 create_dataset_index
 
-```
-create_dataset_index(path, data) -> Result<()>
+**接口定义**：
+```rust
+pub fn create_dataset_index(path: &Path, data: &DataView<'_>) -> Result<(), CoreError>
 ```
 
-Dataset 层对 `create_meta_file(path/.meta, data)` 的封装；只创建 / 重建 `.meta`，不创建 Field。用于 META 重建场景。
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | Dataset 目录路径 |
+| `data` | `&DataView<'_>` | 输入 | sym / time 两列逻辑数据（要求同 `MetaBuilder::build`） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = `.meta` 创建 / 重建完成 |
+
+**说明**：
+- Dataset 层对 `create_meta_file(path/.meta, data)` 的封装；只创建 / 重建 `.meta`，不创建 Field。用于 META 重建场景。
 
 ### 7.5 open_dataset
 
+**接口定义**：
+```rust
+pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
 ```
-open_dataset(path, mode) -> Result<DatasetHandle>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | Dataset 目录路径（必须已存在） |
+| `mode` | `Mode` | 输入 | `read` / `write`（访问意图，不是压缩状态） |
+| 返回 | `Result<DatasetHandle, CoreError>` | 输出 | Dataset 生命周期 Handle |
 
 **内部实现**：
 ```
@@ -88,71 +114,141 @@ open_dataset(path, mode) -> Result<DatasetHandle>
 - 不预打开 Field Handle——按需打开（首次访问时 ensure_field）
 - open 成本 = META mmap + N 次 field header 读取（N = 字段数）
 
-- `mode = read | write`（访问意图，不是压缩状态）。
-- 打开时只打开 META 并计算 Schema；不预先打开任何 Field Handle。
+**说明**：
 - Schema 直接从返回的 DatasetHandle 获取（`read_dataset_schema`），不另设 `get_dataset_schema()`。
 
 ### 7.6 delete_dataset
 
-```
-delete_dataset(path) -> Result<()>
-```
-
-删除整个 Dataset 根目录（META + 全部 Field），不逐个删除。
-
-### 7.7 Field 结构操作
-
-```
-create_dataset_field(path, name, data_type, init?) -> Result<()>
-create_dataset_fields(path, data: DataView) -> Result<()>
-delete_dataset_field(path, name) -> Result<()>
-rename_dataset_field(path, name, new_name) -> Result<()>
-cast_dataset_field(path, name, target_type) -> Result<()>
-compress_dataset_field(path, name) -> Result<()>
-decompress_dataset_field(path, name) -> Result<()>
+**接口定义**：
+```rust
+pub fn delete_dataset(path: &Path) -> Result<(), CoreError>
 ```
 
-共同语义：
+**参数**：
 
-- `sym / time` 不作为普通 Field 操作；其身份由 META 管理。
-- 新增：名称不得与已有 Field 重复（批量时彼此也不得重复）；字段长度必须等于当前逻辑长度 `L`；不改变 sym / time 范围；完成后 Schema 同步增长。`create_dataset_field` 的 `init` 对齐 core `create_field_file`：省略 = 全 NULL（`length(L)`）；`data(ColumnView)` / `stream(reader)` = 带数据初始化，行数必须恰为 `L`，分配与写值一步完成；`data_type` 显式传入并与数据一致。
-- 删除：内部复用 `delete_field_file`；META 不受影响；Schema 同步移除。
-- rename：内部复用 `rename_field_file`（同目录原子 rename）；`new_name` 不得与已有 Field 重复、不得为 `sym` / `time`；原子完成，失败时原字段名保持不变；完成后 Schema 同步更新。
-- cast：内部复用 `cast_field_file`（临时文件 + 原子替换在其内部完成）；完成后 Schema 中该 Field 类型更新。
-- compress：由 META 的 SYM INDEX 生成 chunk 边界（`k` 个连续 sym，默认 `k = 8`；单 sym 区间超过上限 64K 行时按行数劈开），以 `offsets` 传给 `compress_field_file`；decompress：直接调用 `decompress_field_file`。批量 = 多次调用。
-  compress 内部流程：borrow_mut().remove(name)（释放缓存 Handle）→ 遍历 SYM INDEX 累计 row_start → 每 k 个 sym 取一个边界 → 超长 sym 按行数劈开 → compress_field_file(path, Some(offsets))。
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | Dataset 目录路径 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 目录已删除 |
+
+**说明**：
+- 删除整个 Dataset 根目录（META + 全部 Field），不逐个删除；调用方保证没有打开的 Handle。
+
+### 7.7 Field 结构操作（create / delete / rename / update_header / cast / compress / decompress）
+
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn create_dataset_field(&mut self, name: &str, data_type: DataType,
+        init: DatasetFieldInit) -> Result<(), CoreError>
+    pub fn delete_dataset_field(&mut self, name: &str) -> Result<(), CoreError>
+    pub fn rename_dataset_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError>
+    pub fn update_dataset_field_header(&self, name: &str, header: FieldHeader) -> Result<(), CoreError>
+    pub fn cast_dataset_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError>
+    pub fn compress_dataset_field(&mut self, name: &str) -> Result<(), CoreError>
+    pub fn decompress_dataset_field(&mut self, name: &str) -> Result<(), CoreError>
+}
+```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `name` / `field` | `&str` | 输入 | 字段名；不得为 `sym` / `time` 保留名；文件名即字段名 |
+| `data_type` / `target_type` | `DataType` | 输入 | 新增字段类型 / cast 目标类型（cast 涉及 Utf8 → Error） |
+| `init` | `DatasetFieldInit` | 输入 | `AllNull`（全 NULL，长度 = L）/ `Data(Column)`（行数必须恰为 L）/ `Stream { reader }`（累计行数必须恰为 L） |
+| `new_name` | `&str` | 输入 | 新字段名；不得与已有 Field 重复 |
+| `header` | `FieldHeader` | 输入 | 新 header 物理属性；`data_type` / `row_count` 由 core 强制为现值 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 结构变化完成且 Schema 同步更新 |
+
+**内部实现**（全部复用 Field 层 API；Handle 缓存中该字段的 Handle 先释放再操作）：
+```
+create   →  create_field_file(path/<name>, data_type, init 映射)（分配与写值一步完成）
+delete   →  borrow_mut().remove(name)（释放缓存）→ delete_field_file
+rename   →  释放缓存 → rename_field_file（同目录原子 rename）
+update   →  ensure_field → update_field_handle（类型转换走 cast，不走 update）
+cast     →  释放缓存 → cast_field_file（批次流式 + 原子替换在其内部完成）
+compress →  释放缓存 → 由 META 的 SYM INDEX 生成 chunk 边界（k 个连续 sym，默认 k = 8；
+            单 sym 区间超过上限 64K 行时按行数劈开）→ compress_field_file(path, Some(offsets))
+decompress → 释放缓存 → decompress_field_file（chunk 流式）
+```
+
+**说明**：
+- 共同语义：
+  - `sym / time` 不作为普通 Field 操作；其身份由 META 管理。
+  - 新增：名称不得与已有 Field 重复；字段长度必须等于当前逻辑长度 `L`；不改变 sym / time 范围；完成后 Schema 同步增长。
+  - 删除：META 不受影响；Schema 同步移除。
+  - rename：原子完成，失败时原字段名保持不变；完成后 Schema 同步更新。
+  - cast：完成后 Schema 中该 Field 类型更新。
+  - compress 的 chunk 边界来自 META 网格（sym 对齐），decompress 直接转发；批量 = 多次调用。
 
 ### 7.8 read_dataset_schema
 
-```
-read_dataset_schema(handle) -> Schema
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn read_dataset_schema(&self) -> Schema
+}
 ```
 
-- 返回当前全部逻辑字段（含 sym / time）及 `DataType`；不触发数据扫描。
-- 不返回物理属性（encoding / compression / offset）。
-- 返回对象为只读元数据视图，生命周期不超过 Dataset。
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| 返回 | `Schema`（owned） | 输出 | 当前全部逻辑字段（含 sym / time）及 `DataType` |
+
+**说明**：
+- 不触发数据扫描；不返回物理属性（encoding / compression / offset）。
+- 另有 `peek_time_type(&self) -> TimeType` 访问器（来自 META header）。
 
 ### 7.9 read_dataset_statistics
 
-```
-read_dataset_statistics(handle) -> DatasetStatistics
-DatasetStatistics
-├── row_count        // 逻辑行数 = L（容量网格）
-├── sym_count
-├── sym_min / sym_max
-├── time_count
-└── time_min / time_max
+**接口定义**：
+```rust
+pub struct DatasetStatistics {
+    pub row_count: u64,        // 逻辑行数 = L（容量网格）
+    pub sym_count: u32,
+    pub sym_min: Option<String>,
+    pub sym_max: Option<String>,
+    pub time_count: u32,
+    pub time_min: i64,
+    pub time_max: i64,
+}
+impl DatasetHandle {
+    pub fn read_dataset_statistics(&self) -> Result<DatasetStatistics, CoreError>
+}
 ```
 
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| 返回 | `Result<DatasetStatistics, CoreError>` | 输出 | Dataset 级统计（来源见下） |
+
+**说明**：
 - 统计来自 META，不扫描 Field 数据；只读。
 - `sym_min / sym_max` 取字典首尾；`time_min / time_max` 取 TIME AXIS 首尾。
 - 不含 Field 级 min / max / null_count。
 
 ### 7.10 read_dataset
 
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn read_dataset(&self, offset: u64, length: u64,
+        columns: Option<&[&str]>) -> Result<DataView<'_>, CoreError>
+}
 ```
-read_dataset(handle, offset, length, columns?) -> Result<DataView>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&DatasetHandle` | 输入 | Handle（read / write mode 均可） |
+| `offset` | `u64` | 输入 | 逻辑行起始 |
+| `length` | `u64` | 输入 | 读取行数；`offset + length ≤ L` |
+| `columns` | `Option<&[&str]>` | 输入 | 需要的 Field 集合（projection）；`sym` / `time` 恒返回，无需指定；`None` = 全部字段 |
+| 返回 | `Result<DataView<'_>, CoreError>` | 输出 | 多列 zero-copy 视图；生命周期不超过相关 Handle |
 
 **内部实现**（两阶段借用）：
 ```
@@ -160,33 +256,46 @@ read_dataset(handle, offset, length, columns?) -> Result<DataView>
 阶段 2（&self.meta + &self.fields）  →  共享借用创建视图
     base = meta.read_index_handle(offset, length)
         →  locate_row(offset) 二分 SYM INDEX
-        →  逐 sym：keys 常量填充（物化进 meta scratch arena）
+        →  sym 列 RepeatDict 段（零物化，无 scratch arena）
         →  time 列切片 TIME AXIS（零拷贝多段）
-    各 Field → field_handle(...).read_field_handle(offset, length)
+    各 Field → field_handle.read_field_handle(offset, length)
         →  mmap 切片（PLAIN+NONE 单段）或 working 切片（compressed 多段）
     组装 → DataView
 ```
 - 两阶段借用避免 &mut self.fields 与 &self.meta 冲突
 
+**说明**：
 - `offset / length` 是 Dataset 逻辑行范围；因逻辑 = 物理，各 Field 直接以相同 offset / length 读取，无需换算。
-- 默认返回 `sym` 与 `time`（来自 META，零拷贝）；其余 Field 由 `columns` 指定，无需重复指定 sym / time。
+- 默认返回 `sym` 与 `time`（来自 META，零拷贝）；其余 Field 由 `columns` 指定。
 - 一个范围可跨多个 sym；所需 Field 按需打开。
 - 零拷贝优先；返回的 `DataView` 不拥有数据，生命周期不超过相关 Handle。
 
 流程：
 
 ```
-read_dataset(handle, offset, length, columns?)
-        ├── META → sym/time view（TIME AXIS + SYM INDEX）
+read_dataset(offset, length, columns?)
+        ├── META → sym/time view（TIME AXIS + SYM INDEX RepeatDict）
         ├── 各 Field → read_field_handle → ColumnView
         └── 组装 → DataView
 ```
 
 ### 7.11 write_dataset
 
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn write_dataset(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError>
+}
 ```
-write_dataset(handle, offset, data: DataView) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&DatasetHandle` | 输入 | Handle（需 write mode） |
+| `offset` | `u64` | 输入 | 逻辑行起始；`offset + data.length() ≤ L` |
+| `data` | `&DataView<'_>` | 输入 | 待写入列（支持 projection write）；`sym` / `time` 不作为写入列；所有输入列等长 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 各列覆盖写入完成（跨列无原子性） |
 
 **内部实现**：
 ```
@@ -199,21 +308,36 @@ write_dataset(handle, offset, data: DataView) -> Result<()>
 - write_field_handle 内部按 Field 的物理表示分派（mmap 直写或 working 修改）
 - 每次 write 成功后 field generation += 1
 
-职责：对已有逻辑行做 positional overwrite。
-
-- 只覆盖已有数据区域；不改变 META layout、逻辑长度、sym / time 身份；不是追加接口。
-- `offset + data.length ≤ L`；`length = 0` 合法 no-op。
+**说明**：
+- 职责：对已有逻辑行做 positional overwrite；只覆盖已有数据区域；不改变 META layout、逻辑长度、sym / time 身份；不是追加接口。
+- `length = 0` 合法 no-op。
 - 支持 projection write：`data` 可只含 Schema 的部分字段；字段必须属于 Schema 且类型兼容；未提供字段保持原值。
-- 所有输入列等长；`sym / time` 不作为写入列。
 - 每列按名称定位到对应 Field，调用 `write_field_handle`（values + validity 成对写入；`validity = null` 表示本段全有效）。
 - **不保证跨 Field 原子性**：多个 Field 独立写入，部分成功不回滚，Dataset 可能处于部分更新状态；不提供跨 Field transaction / rollback。
 
 ### 7.12 scan_dataset
 
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn scan_dataset(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError>
+}
+impl DatasetScanner {
+    pub fn next(&mut self) -> Result<Option<RowRange>, CoreError>   // 逻辑行范围
+    pub fn close(self) -> Result<(), CoreError>
+}
 ```
-scan_dataset(handle, request) -> Result<DatasetScanner>
-DatasetScanner::next() -> Result<RowRange?>    // 逻辑行范围
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&DatasetHandle` | 输入 | Handle（read / write mode 均可） |
+| `request.ranges` | `&[RowRange]` | 输入 | 逻辑行候选范围（空 = 整个 Dataset） |
+| `request.projection` | `&[Arc<str>]` | 输入 | 需要读取的字段集合（决定哪些 Field 参与谓词求值） |
+| `request.predicate` | `Option<Predicate>` | 输入 | 字段值 / sym / time 条件；跨字段的 Or / Not 不支持（返回 Invalid）——行级过滤由上层兜底 |
+| `request.limit` | `Option<u64>` | 输入 | 最多产生的命中行数 |
+| 返回 scanner | `Result<DatasetScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个逻辑 RowRange，结束返回 `None` |
 
 **内部实现**：
 ```
@@ -225,10 +349,9 @@ DatasetScanner::next() -> Result<RowRange?>    // 逻辑行范围
      →  逐 Field 收窄 ranges（intersect_range_lists 归并求交）
 4. DatasetScanner { ranges: VecDeque(current), remaining: request.limit }
 ```
-- 跨字段的 Or / Not 不支持（返回 Invalid）——行级过滤由上层兜底
 - 求交用双指针归并 O(a + b)，非 O(a × b)
 
-- `ScanRequest.ranges`：逻辑行候选范围（空 = 整个 Dataset）；`projection`：需要读取的字段集合；`predicate` / `limit` 同公共契约。
+**说明**：
 - Scanner 组合 META 与各 Field 的扫描结果（求交 / 裁剪 / 合并），输出 **Dataset 逻辑 RowRange**。
 - 只定位不读取；实际数据由 `read_dataset` 消费；batch 收集由上层负责。
 - 多 predicate 的执行顺序由上层 planner 决定。
@@ -243,18 +366,40 @@ scan_index（sym/time 条件）→ candidate ranges
 
 ### 7.13 locate_dataset_index
 
-```
-locate_dataset_index(handle, data: DataView) -> Result<RowRange[]>
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn locate_dataset_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>
+}
 ```
 
-META `locate_index_handle` 的 Dataset 级封装（参数与语义一致）。供 splayed-table 的 `write_table` 批量定位使用；Table 层不直接持有 MetaHandle。
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `pairs` | `&[(String, i64)]` | 输入 | `(sym, time)` 联合键序列；必须按 `(sym ASC, time ASC)` 排序且唯一 |
+| 返回 | `Result<Vec<RowRange>, CoreError>` | 输出 | 合并后的连续 RowRanges；`sum(length) == pairs.len()` 为定位成功充要条件 |
+
+**说明**：
+- META `locate_index_handle` 的 Dataset 级封装（参数与语义一致）。供 splayed-table 的 `write_table` 批量定位使用；Table 层不直接持有 MetaHandle。
 
 ### 7.14 close_dataset
 
-```
-close_dataset(handle) -> Result<()>
+**接口定义**：
+```rust
+impl DatasetHandle {
+    pub fn close_dataset(mut self) -> Result<(), CoreError>
+}
 ```
 
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `self` | `DatasetHandle` | 输入 | 按值消费 Handle |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 资源释放完成 |
+
+**说明**：
 - 关闭 META Handle，释放 Dataset 层维护的 Field Handle / 元数据。
 - 已返回的 `DataView` / `ColumnView` 在依赖资源关闭后不再保证有效。
 - 关闭后不可继续 Dataset 读写或扫描。
@@ -263,7 +408,8 @@ close_dataset(handle) -> Result<()>
 
 ```
 Field 级变化（原地）
-├── create_dataset_field(s) / delete_dataset_field / cast_dataset_field
+├── create_dataset_field / delete_dataset_field / rename_dataset_field
+├── update_dataset_field_header / cast_dataset_field
 └── compress / decompress_dataset_field
 
 Dataset 级变化（重建）

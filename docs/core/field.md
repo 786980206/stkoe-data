@@ -19,7 +19,57 @@
 | `scan_field_handle` | 条件扫描 → `FieldScanner` | Handle |
 | `close_field_handle` | 关闭 Handle；compressed write 收尾 | Handle |
 
-### 5.1 create_field_file
+### 5.1 Handle 属性访问器
+
+**接口定义**：
+```rust
+impl FieldHandle {
+    pub fn path(&self) -> &Path
+    pub fn header(&self) -> &FieldHeader
+    pub fn mode(&self) -> Mode
+    pub fn data_type(&self) -> DataType
+    pub fn row_count(&self) -> u64
+    pub fn is_chunked(&self) -> bool
+}
+```
+
+**参数与返回**：
+
+| 方法 | 返回类型 | 说明 |
+| --- | --- | --- |
+| `path()` | `&Path` | Field 文件路径 |
+| `header()` | `&FieldHeader` | 当前 header（含 generation / null_count 等，写路径维护后的最新值） |
+| `mode()` | `Mode` | 访问模式（`read` / `write`），不是压缩状态 |
+| `data_type()` | `DataType` | 列数据类型（open 时校验过） |
+| `row_count()` | `u64` | 逻辑行数（= 物理行数） |
+| `is_chunked()` | `bool` | 是否为 compressed chunk 布局 |
+
+**说明**：
+- 全部只读访问器；不触发 IO（数据来自 open 时读取的 header）。
+
+### 5.2 create_field_file
+
+**接口定义**：
+```rust
+pub fn create_field_file(path: &Path, data_type: DataType, init: FieldInit) -> Result<(), CoreError>
+```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | Field 文件路径（文件名即字段名） |
+| `data_type` | `DataType` | 输入 | 列数据类型 |
+| `init` | `FieldInit` | 输入 | 初始化方式，见下表 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 创建完成；此后才可被 `open_field_file` 打开（create 不返回 Handle） |
+
+`FieldInit` 变体：
+
+| 变体 | 载荷 | 说明 |
+| --- | --- | --- |
+| `Length(u64)` | 行数 `n` | 全 NULL 占位 Field（validity 全 0） |
+| `Data(Column)` | 拥有型列 | 带数据初始化；`row_count` = 数据长度；数据全有效时不写 validity 区 |
+| `Stream { reader: Box<dyn FieldChunkReader> }` | 流式读取器 | 两相迭代：先 `next_values()` 消费全部 values，再 `next_validity()` 消费 validity 位；最终长度无需预先知道 |
 
 **内部实现**（统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填）：
 ```
@@ -35,58 +85,99 @@ VALIDITY  →  data(col)：write_all(validity_bits)（全有效不写 validity �
 - 三种 init 共用 `File::options().write(true).create_new(true)` 防止覆盖已有文件
 - data 形态全有效时 `has_validity = 0`（不写 validity 区，文件更小）
 
-```
-create_field_file(path, data_type, init) -> Result<()>
-init = length(n) | data(ColumnView) | stream(reader)
-```
+**说明**：
+- `header` 不要求调用方完整构造；可从 `path / data_type / init` 推断的信息由 core 生成。
+- 必须包含 `sym` 与 `time` 的约定属于 Dataset / Table 层；Field 层不关心字段名语义。
+- 创建完成前由调用方决定是否 fsync；配合上层（Dataset / Table）的临时文件 + 原子 rename。
+- 带数据初始化时写真实 `null_count`；stream 初始化由 validity 位 word 批量 popcount 精确统计。
 
-职责：创建并初始化一个 Field 文件。
+### 5.3 open_field_file
 
-- `length(n)`：创建指定逻辑长度的空占位 Field（全 NULL，validity 全 0）。
-- `data(ColumnView)`：以给定数据初始化；长度由数据推断。
-- `stream(reader)`：从流式数据源持续读取初始化；最终长度无需预先知道。
-- header 不要求调用方完整构造；可从 `path / data_type / init` 推断的信息由 core 生成。
-
-流程（按 `init` 分派，分配与写值一步完成，不做先预分配再写值的二次写入）：
-
-- `length(n)`：写 header（`row_count = n`）→ 预分配 DATA（NULL）+ VALIDITY（全 0 位）。
-- `data(ColumnView)`：`row_count` = 数据长度；header + values + validity 一次性顺序写出；数据全有效时不写 validity 区（`has_validity = 0`）。
-- `stream(reader)`：写 header → 流式追加 values + validity → 结束时回填 `row_count` / `data_length` / `null_count`。
-
-创建完成前 fsync，配合上层（Dataset / Table）的临时文件 + 原子 rename。
-
-注意事项：
-
-- 创建完成后才可被 `open_field_file` 打开；create 不返回 Handle。
-- 带数据初始化时写真实 `null_count`；stream 初始化由 validity 位 word 批量 popcount 精确统计（批内行尾填充位不计）。
-
-### 5.2 open_field_file
-
-```
-open_field_file(path, mode) -> Result<FieldHandle>
+**接口定义**：
+```rust
+pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError>
 ```
 
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | 已存在的 Field 文件路径 |
+| `mode` | `Mode` | 输入 | `read` / `write`（访问意图，不是压缩状态） |
+| 返回 | `Result<FieldHandle, CoreError>` | 输出 | Field 生命周期 Handle |
+
+**内部实现**：
+```
+File::open → 读 64B header → validate
+chunked   →  遍历 chunk 头得 chunk_rows / chunk_ends（累积行末）+ 全量解压 working 表示
+             （null_count 基线从解压位图 word 批量 popcount 精确重建）
+read      →  只读 mmap 挂载
+write     →  MmapMut 挂载
+```
+
+**说明**：
 - Field 必须已存在；open 不负责创建。
-- 打开时校验 magic / version / generation。
+- 打开时校验 magic / version。
 - `read`：允许 read / scan；不修改原文件；compressed Field 的解压对上层隐藏。
-- `write`：允许 read / scan / write / update。uncompressed Field 直接原地修改；compressed Field 内部进入解压后的 working representation，发生修改后由 close 自动重压缩写回。
+- `write`：允许 read / scan / write / update。uncompressed 直接原地修改；compressed 内部进入解压后的 working representation，发生修改后由 close 自动重压缩写回。
+- compressed 打开即全量解压是当前实现策略；chunk 级惰性解码为后续优化项（见 design-boundary）。
 
-### 5.3 rename_field_file
+### 5.4 delete_field_file
 
+**接口定义**：
+```rust
+pub fn delete_field_file(path: &Path) -> Result<(), CoreError>
 ```
-rename_field_file(path, new_name) -> Result<()>
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | 待删除的 Field 文件路径 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 文件已删除 |
+
+**说明**：
+- 直接删除物理文件；调用方保证没有打开的 Handle（Windows 上文件被打开时无法删除）。
+- 不涉及 META / Schema——那是 Dataset / Table 层的职责。
+
+### 5.5 rename_field_file
+
+**接口定义**：
+```rust
+pub fn rename_field_file(path: &Path, new_name: &str) -> Result<(), CoreError>
 ```
 
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | 待重命名的 Field 文件路径 |
+| `new_name` | `&str` | 输入 | 新字段名（= 新文件名） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 原子重命名完成 |
+
+**说明**：
 - 同目录内重命名 Field 文件；文件名即字段名（沿用 Dataset 层的名称解析约定）。
 - 原子完成；`new_name` 对应文件已存在时 Error，不覆盖。
 - 只改文件名，不修改数据、header、generation。
-- 字段名合法性与重复检查由上层负责。
+- 字段名合法性与重复检查由上层负责；`new_name` 为空 / 以 `.` 开头 / 含路径分隔符 → Error。
 
-### 5.4 read_field_handle
+### 5.6 read_field_handle
 
+**接口定义**：
+```rust
+impl FieldHandle {
+    pub fn read_field_handle(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError>
+}
 ```
-read_field_handle(handle, offset, length) -> Result<ColumnView>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&FieldHandle` | 输入 | Handle（read / write mode 均可读） |
+| `offset` | `u64` | 输入 | 起始逻辑行（= 物理行） |
+| `length` | `u64` | 输入 | 读取行数；`length = 0` 返回空 view |
+| 返回 | `Result<ColumnView<'_>, CoreError>` | 输出 | zero-copy 列视图；生命周期不超过 Handle / 底层资源 |
 
 **内部实现**：
 ```
@@ -108,15 +199,29 @@ compressed    →  chunk_ends（open 时累积行末）上 partition_point 二�
 - compressed 定位复杂度 O(log C + 交叠 chunk 数)：二分定位 + 交叠段连续产出，
   不从头遍历 chunk、不做逐 chunk 前缀和；validity 只建位视图（`BitmapView::slice`），不复制位图
 - `offset / length` 为逻辑行（= 物理行）；`offset + length ≤ row_count`（`checked_add` 溢出安全）；`length = 0` 返回空 view。
-- 返回 zero-copy ColumnView：`PLAIN + NONE` 为单段 mmap 切片；compressed Field 逐 chunk 物化，跨 chunk 的读取返回多段。
+
+**说明**：
+- 返回 zero-copy ColumnView：`PLAIN + NONE` 为单段 mmap 切片；compressed 逐 chunk 物化，跨 chunk 的读取返回多段。
 - view 生命周期不能超过 Handle / 底层资源；close 后失效。
 - 不提供 `parallel` 参数，并发由上层控制。
 
-### 5.5 write_field_handle
+### 5.7 write_field_handle
 
+**接口定义**：
+```rust
+impl FieldHandle {
+    pub fn write_field_handle(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError>
+}
 ```
-write_field_handle(handle, offset, data: ColumnView) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&mut self` | `&mut FieldHandle` | 输入 | Handle（需 write mode） |
+| `offset` | `u64` | 输入 | 起始逻辑行；`offset + data.length() ≤ row_count` |
+| `data` | `&ColumnView` | 输入 | 待写入数据（values + validity 成对）；`data_type` 必须与 Field 一致 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 覆盖写入完成，generation 已递增 |
 
 **内部实现**（按物理表示分派；写入三原则：values 逐段 memcpy、validity 字节/word 批量、null_count 增量）：
 ```
@@ -137,35 +242,66 @@ compressed    →  working.values 同上逐段 copy_from_slice
 - write 路径不做 fsync（uncompressed 写入 mmap 即生效；compressed 在 close 时统一落盘）
 - 并发写非重叠区域安全：MmapMut 或 working 上按 offset 切片互不干扰
 
-职责：positional overwrite，按逻辑行覆盖写入。
-
-- 需要 write mode；从 `offset` 起覆盖写入。
-- values + validity 成对写入；`data` 含多个 segment 时按逻辑行序逐段写入，segment 的 `validity = null` 表示该段全部有效。
-- 只改 data，不改 header；不改变逻辑长度；`offset + data.length ≤ row_count`。
-- 这是覆盖写，不是追加 / 扩容接口。
-- compressed Field 修改内部 working representation，close 时统一收尾。
-- 成功后递增 `FIELD.generation`。
+**说明**：
+- 需要 write mode；从 `offset` 起覆盖写入（positional overwrite），不改变逻辑长度；不是追加 / 扩容接口。
+- `data` 含多个 segment 时按逻辑行序逐段写入；segment 的 `validity = null` 表示该段全部有效。
+- 只改 data，不改 header 布局字段；成功后递增 `FIELD.generation`。
 - 允许并发写非重叠区域；重叠区域不允许；并发度由上层控制。
 
 > 规范说明：数据参数统一为 `ColumnView`（草稿中 buffer/stream 与 ColumnView 混用）。写路径长度有界，流式大数据 = 分块多次调用；`stream` 仅保留在 create 的 `init` 中（最终长度未知的场景）。
 
-### 5.6 update_field_handle
+### 5.8 update_field_handle
 
-```
-update_field_handle(handle, header: FieldHeader) -> Result<()>
+**接口定义**：
+```rust
+impl FieldHandle {
+    pub fn update_field_handle(&mut self, header: FieldHeader) -> Result<(), CoreError>
+}
 ```
 
-- 只修改 header，不修改 data；core 校验 header 与现有 data 的一致性（`row_count`、`data_type` 等）。
-- `null_count` 为派生统计，update 不接受调用方改写（保持现值，由写路径增量维护）。
-- 与 `write_field_handle` 的区别：write 改 data，update 改 header。
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&mut self` | `&mut FieldHandle` | 输入 | Handle（需 write mode） |
+| `header` | `FieldHeader` | 输入 | 新 header；`row_count` / `data_type` 必须与现值一致；`null_count` 被忽略 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = header 更新完成，generation 已递增 |
+
+**内部实现**：
+```
+校验     →  magic / version / data_type / row_count 强制为现值；generation = 现 + 1
+            null_count 为派生统计，保持现值（由写路径增量维护，不接受调用方改写）
+布局派生 →  非 chunked：data_length / validity_offset 按现值重算，防布局描述不一致
+落盘     →  uncompressed：立即回写 mmap[0..64]；compressed：随 close 收尾
+```
+
+**说明**：
+- 只修改 header，不修改 data；与 `write_field_handle` 的区别：write 改 data，update 改 header。
+- 可更新的是 encoding / compression / flags 等物理属性；类型转换走 `cast_field_file`。
 - compressed Field 的 header 更新随 close 流程保持文件一致。
 
-### 5.7 scan_field_handle
+### 5.9 scan_field_handle
 
+**接口定义**：
+```rust
+impl FieldHandle {
+    pub fn scan_field_handle(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError>
+}
+impl<'h> FieldScanner<'h> {
+    pub fn next(&mut self) -> Result<Option<RowRange>, CoreError>
+    pub fn close(self) -> Result<(), CoreError>
+}
 ```
-scan_field_handle(handle, request) -> Result<FieldScanner>
-FieldScanner::next() -> Result<RowRange?>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&FieldHandle` | 输入 | Handle（read / write mode 均可） |
+| `request.ranges` | `&[RowRange]` | 输入 | 候选物理范围；空 = 整个 Field；仅与 `[0, row_count)` 求交防越界（保序，不排序不合并） |
+| `request.predicate` | `Option<Predicate>` | 输入 | 作用于本 Field 值的谓词（`field = None`）；Utf8 字段不支持值谓词 |
+| `request.limit` | `Option<u64>` | 输入 | 最多产生的命中行数，达到后提前结束 |
+| 返回 scanner | `Result<FieldScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个连续命中 RowRange，结束返回 `None` |
 
 **内部实现**（顺序批量管线，不物化数据）：
 ```
@@ -189,11 +325,19 @@ next()    →  消费当前段命中位图：word 级 next_true_run 找下一连
 - 只定位，不物化数据；输出可交给 `read_field_handle`，或作为其他 Field scan 的 `ranges` 输入做多字段下推。
 - Field 不理解 sym / time；只做值过滤。不支持 order 下推。
 
-### 5.8 close_field_handle
+### 5.10 close_field_handle
 
+**接口定义**：
+```rust
+pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError>
 ```
-close_field_handle(handle) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `handle` | `FieldHandle` | 输入 | 按值消费 Handle（close 后不可再用） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 资源释放 / 写回完成 |
 
 **内部实现**（按 mode × 是否 chunked 分派）：
 ```
@@ -209,17 +353,27 @@ write + compressed + 已修改      → 流式：header（编码前即完全确�
 - compressed 重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，写路径不改 row_count）
 - 临时文件路径 = `{field_path}.tmp`，rename 原子替换
 
+**说明**：
 - close 后 Handle 不可再用；释放 fd / mmap / working memory。
 - read handle：无写回。
-- uncompressed write handle：写入已直接生效，无需额外动作。
+- uncompressed write handle：写入已直接生效（mmap flush 即落盘），无需额外动作。
 - compressed write handle：发生修改 → 自动 compress + rewrite，文件保持 compressed；重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，自描述，不依赖 META；写路径不改 `row_count`，`Σ rows == row_count` 恒成立，分组可精确复用），写临时文件后原子替换；未修改 → 不写回。
 - 不提供 `commit / flush / dump` public API。
 
-### 5.9 cast_field_file
+### 5.11 cast_field_file
 
+**接口定义**：
+```rust
+pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreError>
 ```
-cast_field_file(path, target_type) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | 待转换的 Field 文件路径 |
+| `target_type` | `DataType` | 输入 | 目标数据类型；与现类型相同 → 直接返回；涉及 Utf8 → Error |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 原地转换完成（`data_type` 变为 `target_type`） |
 
 **内部实现**（read → 逐批 cast → create tmp → sync_all → rename）：
 ```
@@ -235,17 +389,29 @@ stream cast  →  CastReader 批次读取（CAST_BATCH_ROWS = 256K 行/批）：
                 → tmp sync_all → rename 原子替换（rename 生效时新文件内容已持久）
                 → 失败清理 tmp（含 compress 步 tmp），原文件保持不变
 ```
-- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换；validity / NULL 原样保留，不参与类型转换。
 - 临时文件名唯一（`{path}.cast.{pid}.{n}.tmp`），并发 cast 互不覆盖。
 - uncompressed 源全程 O(一个批次) 内存；compressed 源受限于「open 即全量解压」（chunk 级惰性解码为后续优化项）。
+
+**说明**：
+- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换（逐行 `as` 语义：bool ↔ 数值 ↔ 浮点；Utf8 不支持）。
+- validity / NULL 原样保留，不参与类型转换。
 - 转换失败时原文件保持不变；转换通过临时文件完成，不属于 `write_field_handle` 的原地覆盖。
 
-### 5.10 compress_field_file / decompress_field_file
+### 5.12 compress_field_file / decompress_field_file
 
+**接口定义**：
+```rust
+pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError>
+pub fn decompress_field_file(path: &Path) -> Result<(), CoreError>
 ```
-compress_field_file(path, offsets?) -> Result<()>
-decompress_field_file(path) -> Result<()>
-```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `path` | `&Path` | 输入 | 待转换物理表示的 Field 文件路径 |
+| `offsets`（compress） | `Option<Vec<u64>>` | 输入 | chunk 起始行号：升序、`offsets[0] == 0`，隐含最后一块延伸到 `row_count`；省略时按固定 8192 行均匀分块（最后一块允许不足） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 物理表示转换完成；状态不符 → 明确 Error（已压缩再压缩 / 未压缩再解压） |
 
 **compress 内部实现**（chunk 流式，内存 O(一个编码 chunk)）：
 ```
@@ -266,8 +432,8 @@ mmap 原文件 → 直接解析 header + chunk 位置（不经 open_field_file�
     → tmp sync_all → drop handles → rename（失败清理 tmp，原文件保持不变）
 ```
 
+**说明**：
 - File 级物理表示转换；逻辑数据与 header 语义不变（只改物理表示：data_type / row_count / null_count / generation 不变）。
-- `offsets`：可选的 chunk 起始行号，升序、`offsets[0] == 0`，隐含最后一块延伸到 `row_count`；省略时按固定 8192 行均匀分块（最后一块允许不足）。
 - 分块策略是调用方的职责：Dataset 层按 META 网格生成 sym 对齐边界（见 7.7），裸调用可省略 `offsets`。
-- 状态不符时返回明确错误（如 AlreadyCompressed / NotCompressed），不做静默 no-op。
 - compress 编码配置固定 PLAIN + ZSTD（cast 经 `compress_field_file_encoded` 保持源配置）；decompress 目标恒为 PLAIN + NONE。
+- 与 close 的自动压缩互补：一个面向离线维护，一个面向写生命周期。
