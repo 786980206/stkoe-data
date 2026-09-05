@@ -1,0 +1,219 @@
+# splayed-core / Field API
+
+## 5. Field API
+
+### 5.0 总览
+
+| 接口 | 职责 | 层 |
+| --- | --- | --- |
+| `create_field_file` | 创建 Field 文件并初始化 | File |
+| `open_field_file` | 打开已有 Field，返回 `FieldHandle` | File |
+| `delete_field_file` | 删除 Field 物理文件 | File |
+| `rename_field_file` | 重命名 Field 文件 | File |
+| `cast_field_file` | 将 Field 原地转换为 `target_type` | File |
+| `compress_field_file` | uncompressed → compressed 物理表示 | File |
+| `decompress_field_file` | compressed → uncompressed 物理表示 | File |
+| `read_field_handle` | 按逻辑行读取，返回 `ColumnView` | Handle |
+| `write_field_handle` | 按逻辑行覆盖写入 | Handle |
+| `update_field_handle` | 修改 FieldHeader（不改 data） | Handle |
+| `scan_field_handle` | 条件扫描 → `FieldScanner` | Handle |
+| `close_field_handle` | 关闭 Handle；compressed write 收尾 | Handle |
+
+### 5.1 create_field_file
+
+**内部实现**：
+```
+length(n)  →  File::create_new(path) → 写 64B header → set_len(64+data+validity)
+                （OS 零填充，无需显式写 NULL）
+data(col)  →  File::create_new → 写 header → write_all(values) → write_all(validity_bits)
+stream(r)  →  File::create_new → 写占位 header → 循环 write_all(values)+write_all(bits)
+                → seek(0) 回填 header（row_count/data_length/null_count）
+```
+- 三种 init 共用 `File::options().write(true).create_new(true)` 防止覆盖已有文件
+- data 形态全有效时 `has_validity = 0`（不写 validity 区，文件更小）
+
+```
+create_field_file(path, data_type, init) -> Result<()>
+init = length(n) | data(ColumnView) | stream(reader)
+```
+
+职责：创建并初始化一个 Field 文件。
+
+- `length(n)`：创建指定逻辑长度的空占位 Field（全 NULL，validity 全 0）。
+- `data(ColumnView)`：以给定数据初始化；长度由数据推断。
+- `stream(reader)`：从流式数据源持续读取初始化；最终长度无需预先知道。
+- header 不要求调用方完整构造；可从 `path / data_type / init` 推断的信息由 core 生成。
+
+流程（按 `init` 分派，分配与写值一步完成，不做先预分配再写值的二次写入）：
+
+- `length(n)`：写 header（`row_count = n`）→ 预分配 DATA（NULL）+ VALIDITY（全 0 位）。
+- `data(ColumnView)`：`row_count` = 数据长度；header + values + validity 一次性顺序写出；数据全有效时不写 validity 区（`has_validity = 0`）。
+- `stream(reader)`：写 header → 流式追加 values + validity → 结束时回填 `row_count` / `data_length` / `null_count`。
+
+创建完成前 fsync，配合上层（Dataset / Table）的临时文件 + 原子 rename。
+
+注意事项：
+
+- 创建完成后才可被 `open_field_file` 打开；create 不返回 Handle。
+- 带数据初始化时写真实 `null_count`。
+
+### 5.2 open_field_file
+
+```
+open_field_file(path, mode) -> Result<FieldHandle>
+```
+
+- Field 必须已存在；open 不负责创建。
+- 打开时校验 magic / version / generation。
+- `read`：允许 read / scan；不修改原文件；compressed Field 的解压对上层隐藏。
+- `write`：允许 read / scan / write / update。uncompressed Field 直接原地修改；compressed Field 内部进入解压后的 working representation，发生修改后由 close 自动重压缩写回。
+
+### 5.3 rename_field_file
+
+```
+rename_field_file(path, new_name) -> Result<()>
+```
+
+- 同目录内重命名 Field 文件；文件名即字段名（沿用 Dataset 层的名称解析约定）。
+- 原子完成；`new_name` 对应文件已存在时 Error，不覆盖。
+- 只改文件名，不修改数据、header、generation。
+- 字段名合法性与重复检查由上层负责。
+
+### 5.4 read_field_handle
+
+```
+read_field_handle(handle, offset, length) -> Result<ColumnView>
+```
+
+**内部实现**：
+```
+uncompressed  →  mmap 切片 values[offset×size .. (offset+length)×size]
+                  + BitmapView::new(validity_bytes, offset, length)
+                  → 单段 ColumnView::from_one
+compressed    →  working（open 时全量解压缓存）上按 chunk 边界切多段
+                  → 每段 ColumnSegment::new（values 切片 + validity 位级切片）
+                  → ColumnView::new(多段)
+```
+- PLAIN+NONE 返回的值指针直接指向 mmap 区域（零拷贝）
+- compressed Field 打开时全量解压到 `Working { values: Buffer, validity: Option<Bitmap> }`，
+  后续读取从 working 上切片（chunk 级惰性解码为优化项）
+- `offset / length` 为逻辑行（= 物理行）；`offset + length ≤ row_count`；`length = 0` 返回空 view。
+- 返回 zero-copy ColumnView：`PLAIN + NONE` 为单段 mmap 切片；compressed Field 逐 chunk 物化，跨 chunk 的读取返回多段。
+- view 生命周期不能超过 Handle / 底层资源；close 后失效。
+- 不提供 `parallel` 参数，并发由上层控制。
+
+### 5.5 write_field_handle
+
+```
+write_field_handle(handle, offset, data: ColumnView) -> Result<()>
+```
+
+**内部实现**（按物理表示分派）：
+```
+uncompressed  →  MmapMut 切片 values[offset×size .. ] ← copy_from_slice(data.values)
+                  + validity 区 [offset..offset+len] ← 逐 bit 设置（0/1）
+                  + header.generation += 1 → 写回 mmap[0..64]
+compressed    →  working.values 同上 copy_from_slice
+                  + 若段含 NULL 且 working 无位图 → 先物化全 1 位图
+                  + 逐位应用 → null_count 重算 → generation += 1 → modified = true
+```
+- write 路径不做 fsync（uncompressed 写入 mmap 即生效；compressed 在 close 时统一落盘）
+- 并发写非重叠区域安全：MmapMut 或 working 上按 offset 切片互不干扰
+
+职责：positional overwrite，按逻辑行覆盖写入。
+
+- 需要 write mode；从 `offset` 起覆盖写入。
+- values + validity 成对写入；`data` 含多个 segment 时按逻辑行序逐段写入，segment 的 `validity = null` 表示该段全部有效。
+- 只改 data，不改 header；不改变逻辑长度；`offset + data.length ≤ row_count`。
+- 这是覆盖写，不是追加 / 扩容接口。
+- compressed Field 修改内部 working representation，close 时统一收尾。
+- 成功后递增 `FIELD.generation`。
+- 允许并发写非重叠区域；重叠区域不允许；并发度由上层控制。
+
+> 规范说明：数据参数统一为 `ColumnView`（草稿中 buffer/stream 与 ColumnView 混用）。写路径长度有界，流式大数据 = 分块多次调用；`stream` 仅保留在 create 的 `init` 中（最终长度未知的场景）。
+
+### 5.6 update_field_handle
+
+```
+update_field_handle(handle, header: FieldHeader) -> Result<()>
+```
+
+- 只修改 header，不修改 data；core 校验 header 与现有 data 的一致性（`row_count`、`data_type` 等）。
+- 与 `write_field_handle` 的区别：write 改 data，update 改 header。
+- compressed Field 的 header 更新随 close 流程保持文件一致。
+
+### 5.7 scan_field_handle
+
+```
+scan_field_handle(handle, request) -> Result<FieldScanner>
+FieldScanner::next() -> Result<RowRange?>
+```
+
+- `ranges`：候选物理范围（空 = 整个 Field）；`predicate` 在本 Field 的值上求值；`limit` 达到后提前结束。
+- `next()` 每次返回一个连续 RowRange；扫描结束返回 None。
+- 只定位，不物化数据；输出可交给 `read_field_handle`，或作为其他 Field scan 的 `ranges` 输入做多字段下推。
+- Field 不理解 sym / time；只做值过滤。不支持 order 下推。
+
+### 5.8 close_field_handle
+
+```
+close_field_handle(handle) -> Result<()>
+```
+
+**内部实现**（按 mode × 是否 chunked 分派）：
+```
+read                            → 直接 Ok（Mmap 随 Drop 释放）
+write + uncompressed            → MmapMut::flush → Ok
+write + compressed + 未修改      → Ok（不写回）
+write + compressed + 已修改      → 逐 chunk：从 working 切段
+                                    → encode_chunk(encoding, compression, ...)
+                                    → 拼接 header + chunks → 写 tmp 文件
+                                    → fs::rename(tmp, path) 原子替换
+```
+- compressed 重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，写路径不改 row_count）
+- 临时文件路径 = `{field_path}.tmp`，rename 原子替换
+
+- close 后 Handle 不可再用；释放 fd / mmap / working memory。
+- read handle：无写回。
+- uncompressed write handle：写入已直接生效，无需额外动作。
+- compressed write handle：发生修改 → 自动 compress + rewrite，文件保持 compressed；重压缩沿用文件既有 chunk 分组（打开时从 chunk 头读得，自描述，不依赖 META；写路径不改 `row_count`，`Σ rows == row_count` 恒成立，分组可精确复用），写临时文件后原子替换；未修改 → 不写回。
+- 不提供 `commit / flush / dump` public API。
+
+### 5.9 cast_field_file
+
+```
+cast_field_file(path, target_type) -> Result<()>
+```
+
+- 读取 `path` 处 Field → 数据类型转换 → 写临时文件 → 原子 rename 替换原文件；对外表现为原地转换。
+- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换。
+- 转换失败时原文件保持不变。
+- 原文件的压缩状态对调用方透明；转换通过临时文件完成，不属于 `write_field_handle` 的原地覆盖。
+
+### 5.10 compress_field_file / decompress_field_file
+
+```
+compress_field_file(path, offsets?) -> Result<()>
+decompress_field_file(path) -> Result<()>
+```
+
+**compress 内部实现**：
+```
+open(read) → clone_view → drop(handle)
+    → 边界生成（offsets 或均匀 8192）
+    → 逐段 encode_chunk(Plain, Zstd, ...) → 拼 header + chunks
+    → write_field_atomic（tmp + rename）
+```
+
+**decompress 内部实现**：
+```
+open(read) → decode_working（全量解压）→ drop(handle)
+    → 写 uncompressed header + values + validity
+    → write_field_atomic
+```
+
+- File 级物理表示转换；不依赖已打开 Handle；逻辑数据与 header 语义不变。
+- `offsets`：可选的 chunk 起始行号，升序、`offsets[0] == 0`，隐含最后一块延伸到 `row_count`；省略时按固定 8192 行均匀分块（最后一块允许不足）。
+- 分块策略是调用方的职责：Dataset 层按 META 网格生成 sym 对齐边界（见 7.7），裸调用可省略 `offsets`。
+- 状态不符时返回明确错误（如 AlreadyCompressed / NotCompressed），不做静默 no-op。
+- 与 close 的自动压缩互补：一个面向离线维护，一个面向写生命周期。
