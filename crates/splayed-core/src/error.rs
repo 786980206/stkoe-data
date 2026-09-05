@@ -18,6 +18,9 @@ pub enum CoreError {
     NotFound(PathBuf),
     /// 目标已存在（create / rename 的目标冲突）。
     AlreadyExists(PathBuf),
+    /// sym 的 time 序列不是 TIME AXIS 的连续子区间
+    /// （未按 (sym ASC, time ASC) 排序、sym 内 time 重复或跳空）。
+    NonContiguousTime(String),
 }
 
 impl fmt::Display for CoreError {
@@ -30,6 +33,9 @@ impl fmt::Display for CoreError {
             CoreError::InvalidState(msg) => write!(f, "invalid state: {msg}"),
             CoreError::NotFound(p) => write!(f, "not found: {}", p.display()),
             CoreError::AlreadyExists(p) => write!(f, "already exists: {}", p.display()),
+            CoreError::NonContiguousTime(s) => {
+                write!(f, "non-contiguous time range for sym '{s}'")
+            }
         }
     }
 }

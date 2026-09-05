@@ -139,6 +139,11 @@ global_row = row_start + (time_index - time_start)
 
 区间内缺失的时间点是有效的逻辑行位，在 FIELD 中以 NULL（validity = 0）表示。
 
+**连续子区间原则**：每个 SYM 的 time 序列必须严格等于 TIME AXIS 的一个连续子区间
+（`[time_start, time_start + time_count)`）。因此 SYM INDEX 仅凭 `row_start + time_start + time_count`
+三个字段即可完整恢复该 SYM 的行空间与时间定位，不保存任何 symbol 内的 time 信息；META 构建时校验
+`time_count == 该 SYM 数据行数`，不满足即拒绝构建（保证容量网格与数据行严格对齐）。
+
 ### META 不变性
 
 META 创建后 layout 固定、进入只读状态；不提供 update / compress / decompress。

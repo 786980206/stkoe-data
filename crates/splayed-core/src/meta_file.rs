@@ -23,8 +23,11 @@ pub struct MetaBuilder;
 impl MetaBuilder {
     /// `data` 必须包含 `sym`（Utf8 字典视图）与 `time`（整数列），按 `(sym ASC, time ASC)` 排序。
     ///
-    /// run-length 优化：字符串分配与比较发生在 sym run 边界（O(sym 段数)），
-    /// 行内只做数值比较；轴定位用单调双指针（run 内 time 递增）。
+    /// 核心原则：每个 symbol 的 time 必须严格等于 TIME AXIS 的一个连续子区间，
+    /// SYM INDEX 只保存 `row_start + time_start + time_count`，不保存任何 symbol 内的 time 信息。
+    /// 单遍扫描收集 run 边界与全部 time 值 → 轴排序去重 → 每 run 二分定位 first/last
+    /// 并校验 span == run 行数（排序破坏 / sym 内重复 / sym 内跳空 → `NonContiguousTime`）；
+    /// 无 HashMap、无逐行字符串操作（字符串解析仅在 run 边界，O(sym 段数)）。
     pub fn build(data: &DataView<'_>) -> Result<Vec<u8>, CoreError> {
         let sym = data
             .column("sym")
@@ -78,11 +81,12 @@ impl MetaBuilder {
             }
         }
 
-        // 单遍扫描：收集 time 值 + sym run 边界（仅 run 切换时解析字符串）
+        // 单遍扫描：收集全部 time 值 + sym run 边界（仅 run 切换时解析字符串）
         struct SymRun {
             row_start: usize,
-            time_start: u64,
-            time_end: u64,
+            time_first: u64,
+            time_last: u64,
+            rows: usize,
         }
         let mut time_values: Vec<u64> = Vec::with_capacity(rows);
         let mut sym_runs: Vec<SymRun> = Vec::new();
@@ -98,12 +102,15 @@ impl MetaBuilder {
                     .to_owned();
                 sym_runs.push(SymRun {
                     row_start: i,
-                    time_start: time_flat[i],
-                    time_end: time_flat[i],
+                    time_first: time_flat[i],
+                    time_last: time_flat[i],
+                    rows: 1,
                 });
                 run_names.push(name);
             } else {
-                sym_runs.last_mut().unwrap().time_end = time_flat[i];
+                let run = sym_runs.last_mut().unwrap();
+                run.time_last = time_flat[i];
+                run.rows += 1;
             }
         }
 
@@ -112,31 +119,32 @@ impl MetaBuilder {
         time_values.dedup();
         let axis: Vec<u64> = time_values;
 
-        // 轴 index 映射（HashMap O(1) 查找）
-        let time_to_index: std::collections::HashMap<u64, u32> =
-            axis.iter().enumerate().map(|(i, &t)| (t, i as u32)).collect();
-
-        // run 后置校验：time_end >= time_start（捕获未排序输入）
-        for run in &sym_runs {
-            if run.time_end < run.time_start {
-                return Err(CoreError::Invalid(
-                    "meta input must be sorted by (sym ASC, time ASC)".into(),
-                ));
-            }
-        }
-
-        // SYM INDEX
+        // SYM INDEX：每 run 二分定位 time_first / time_last 在轴上的下标。
+        // 连续子区间原则（docs/splayed-format.md §SYM INDEX record）：每个 sym 的 time
+        // 必须严格等于 TIME AXIS 的一个连续子区间，故 span（轴跨度）必须等于 run 行数——
+        // 未按 (sym ASC, time ASC) 排序、sym 内 time 重复或跳空一律拒绝，
+        // 保证 time_count（行容量）与实际数据行严格对齐。
         let mut row_start = 0u32;
         let mut sym_index = Vec::with_capacity(sym_runs.len());
-        for run in &sym_runs {
-            let start = time_to_index[&run.time_start];
-            let end = time_to_index[&run.time_end];
+        for (ri, run) in sym_runs.iter().enumerate() {
+            let start = axis
+                .binary_search(&run.time_first)
+                .expect("run time must exist in axis built from the same values")
+                as u32;
+            let end = axis
+                .binary_search(&run.time_last)
+                .expect("run time must exist in axis built from the same values")
+                as u32;
+            if end < start || (end - start + 1) as usize != run.rows {
+                return Err(CoreError::NonContiguousTime(run_names[ri].clone()));
+            }
+            let span = end - start + 1;
             sym_index.push(SymIndexRecord {
                 time_start: start,
-                time_count: end - start + 1,
+                time_count: span,
                 row_start,
             });
-            row_start += end - start + 1;
+            row_start += span;
         }
         let sym_count = sym_runs.len() as u32;
         let time_count = axis.len() as u32;

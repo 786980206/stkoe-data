@@ -23,19 +23,24 @@ META 是 immutable / read-only 文件：不提供 `write / update / compress / d
 create_meta_file(path, data: DataView) -> Result<()>
 ```
 
-**MetaBuilder::build 内部实现**：
+**MetaBuilder::build 内部实现**（单遍扫描 + 轴二分定位，无 HashMap）：
 ```
-遍历 1  →  time 列整段 bytemuck::cast_slice 为 &[i32]/&[i64]
-            → axis_set.extend（零逐行函数调用）
-            → sort_unstable + dedup → TIME AXIS
-遍历 2  →  sym keys 整段 cast 为 &[u32] → 按 key 相等检测 run（O(sym 段数)）
-            → 每 run 解析一次 string_at（字典解码，O(sym 段数) 字符串分配）
-            → time 列同样批量 cast → run 内单调双指针推进轴 index
-serialize → header(64B) + TIME AXIS + DICT OFFSETS(n+1)×u64
-            + STRING DATA + SYM INDEX(n×12B)
+批量 cast  →  sym keys 整段 cast 为 &[u32]、time 列整段 cast 后归一为 &[u64]（零逐行函数调用）
+单遍扫描   →  收集全部 time 值 + sym run 边界（row_start / time_first / time_last / rows）
+              → 仅 run 切换时解析一次 string_at（字典解码，O(sym 段数) 字符串分配）
+TIME AXIS  →  sort_unstable + dedup
+SYM INDEX  →  每 run 二分定位 time_first / time_last 的轴下标（O(2R·log T)，R=run 数、T=轴长）
+              → 连续子区间校验：end ≥ start 且 (end − start + 1) == run 行数
+                （未按 (sym ASC, time ASC) 排序 / sym 内 time 重复或跳空 → NonContiguousTime）
+              → time_count = span = run 行数；row_start 累计 span
+serialize  →  header(64B) + TIME AXIS + DICT OFFSETS(n+1)×u64
+              + STRING DATA + SYM INDEX(n×12B)
 ```
-- 全局行游标：`row` 按段累计（`row += seg_rows`），段内用 `run_start`（段内偏移）
-- time_flat 为跨段拼接的全局 u64 视图，run 内通过全局偏移索引
+
+**核心原则**：每个 symbol 的 time 必须严格等于 TIME AXIS 的一个连续子区间，因此 SYM INDEX 只需保存
+`row_start + time_start + time_count`，不保存任何 symbol 内的 time 信息。连续性校验使 `time_count`
+（轴跨度）与 run 实际行数强一致，容量网格 `row_start = Σ 前序 time_count` 与数据行严格对齐；
+轴定位从 HashMap 换为二分（`2R·log T` 次比较，无哈希表构建与随机访问），输入规模越大收益越明显。
 
 **write_meta_atomic 内部实现**：
 ```
@@ -43,7 +48,9 @@ File::create(path.tmp) → write_all(bytes) → drop → fs::rename(tmp, path)
 ```
 
 - `data`：按 `(sym ASC, time ASC)` 排序的 sym / time 两列逻辑数据。
-- 不要求不同 SYM 具有相同 TIME 集合；每个 SYM 可以有自己的 TIME 序列。
+- 违反连续子区间原则的输入（sym 内 time 跳空 / 重复 / 未排序）在构建期以 `NonContiguousTime` 拒绝，
+  不会生成网格与数据错位的 META。
+- 不要求不同 SYM 具有相同 TIME 集合；每个 SYM 可以有自己的 TIME 序列（只要各自是轴的连续子区间）。
 - core 从数据推断 `time_type` 等信息，并构建 TIME AXIS / SYM DICT / SYM STRING DATA / SYM INDEX。
 - 区间内缺失的时间点由对应 Field 的 NULL 表示。
 - 完成后 layout 固定、进入只读状态。
