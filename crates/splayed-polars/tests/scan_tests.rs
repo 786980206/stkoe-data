@@ -73,7 +73,7 @@ fn month_sample_with_null() -> Data {
 fn scan_polars_month_table_filter_and_nulls() {
     let dir = temp_dir("month");
     let root = dir.join("tbl");
-    create_table(&root, month_sample_with_null(), splayed_table::PartitionScheme::Month).unwrap();
+    create_table(&root, &month_sample_with_null(), splayed_table::PartitionScheme::Month).unwrap();
 
     let lf = splayed_polars::scan_polars(&root).unwrap();
     let df = lf.collect().unwrap();
@@ -150,7 +150,7 @@ fn scan_polars_none_table() {
         vec![sym_col, time_col, price_col],
     )
     .unwrap();
-    create_table(&root, data, splayed_table::PartitionScheme::None).unwrap();
+    create_table(&root, &data, splayed_table::PartitionScheme::None).unwrap();
 
     let lf = splayed_polars::scan_polars(&root).unwrap();
     let df = lf.collect().unwrap();

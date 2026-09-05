@@ -92,7 +92,7 @@ fn month_sample() -> Data {
 fn month_table_create_query() {
     let dir = temp_dir("month");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
     // 分区目录
     assert!(root.join("month=2026-08").exists());
     assert!(root.join("month=2026-09").exists());
@@ -173,7 +173,7 @@ fn month_table_create_query() {
 fn table_write_overwrites_existing_rows() {
     let dir = temp_dir("write");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 覆盖 08-03 的 AAPL/MSFT（输入按 (sym,time) 有序唯一）
@@ -223,7 +223,7 @@ fn none_scheme_table() {
         ("MSFT", d803, 20.0),
         ("MSFT", d804, 21.0),
     ]);
-    create_table(&root, sorted, PartitionScheme::None).unwrap();
+    create_table(&root, &sorted, PartitionScheme::None).unwrap();
     assert!(root.join(".meta").exists());
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     assert_eq!(table.scheme(), PartitionScheme::None);
@@ -246,7 +246,7 @@ fn partition_and_table_lifecycle() {
     // 先建 08 分区
     let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
     let partial = make_data(&[("AAPL", d803, 10.0)]);
-    create_table(&root, partial, PartitionScheme::Month).unwrap();
+    create_table(&root, &partial, PartitionScheme::Month).unwrap();
 
     // create_table_partition：新增 09 分区（scheme 从已有分区推断）
     let sep_sample = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 1) as i32, 12.0)]);
@@ -313,7 +313,7 @@ fn validity_survives_partition_split() {
         d.columns[price_idx].validity = Some(bits);
         d
     };
-    create_table(&root, data, PartitionScheme::Month).unwrap();
+    create_table(&root, &data, PartitionScheme::Month).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let req = TableScanRequest::default();
     let mut reader = query_table(&table, req, None).unwrap();
@@ -331,7 +331,7 @@ fn validity_survives_partition_split() {
 fn table_field_structure_operations() {
     let dir = temp_dir("fieldops");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
     let mut table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // create：全 NULL

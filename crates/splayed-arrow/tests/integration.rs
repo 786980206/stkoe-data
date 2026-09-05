@@ -167,7 +167,7 @@ fn table_scan_to_arrow_end_to_end() {
     let dir = temp_dir("e2e");
     let root = dir.join("tbl");
     let data = sample_data();
-    create_table(&root, data.clone(), splayed_table::PartitionScheme::None).unwrap();
+    create_table(&root, &data, splayed_table::PartitionScheme::None).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
     assert!(!batches.is_empty());
@@ -207,7 +207,7 @@ fn multi_segment_view_to_batch_and_table_e2e() {
     // 多段（跨分区 batch 聚合）→ 单 Arrow 批
     let dir = temp_dir("e2e_multi");
     let root = dir.join("tbl");
-    create_table(&root, sample_data(), splayed_table::PartitionScheme::None).unwrap();
+    create_table(&root, &sample_data(), splayed_table::PartitionScheme::None).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let batches = scan_to_arrow(&table, TableScanRequest::default(), Some(2)).unwrap();
     // 单 Dataset 全表扫描 = 单一连续 range → batch 聚合消费整个 range → 一批

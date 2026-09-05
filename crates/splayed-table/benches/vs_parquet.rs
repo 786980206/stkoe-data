@@ -129,7 +129,7 @@ fn bench_write(c: &mut Criterion) {
     group.bench_function("splayed_table_month", |b| {
         b.iter(|| {
             let root = temp_root("w_splayed");
-            create_table(&root, data.clone(), splayed_table::PartitionScheme::Month).unwrap();
+            create_table(&root, &data, splayed_table::PartitionScheme::Month).unwrap();
             black_box(&root);
             let _ = std::fs::remove_dir_all(&root);
         })
@@ -150,7 +150,7 @@ fn bench_read_scan(c: &mut Criterion) {
     let data = bench_data();
     // 预建 splayed 表与 parquet 文件
     let splayed_root = temp_root("r_splayed");
-    create_table(&splayed_root, data.clone(), splayed_table::PartitionScheme::Month).unwrap();
+    create_table(&splayed_root, &data, splayed_table::PartitionScheme::Month).unwrap();
     parquet_roundtrip_setup(&splayed_root, &data);
 
     let mut group = c.benchmark_group("read");

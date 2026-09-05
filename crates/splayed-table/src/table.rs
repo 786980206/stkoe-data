@@ -243,7 +243,7 @@ pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreEr
         for field in &data.schema.fields {
             let col = data.column(&field.name).expect("schema iteration guarantees");
             let column = match &col.dict {
-                Some(dict) => {
+                Some(_dict) => {
                     // Utf8 字典列：切片 keys（共享字典不安全 → 重建局部字典）
                     let view = col.as_view();
                     let mut new_keys: Vec<u32> = Vec::with_capacity(rows);
@@ -363,7 +363,7 @@ pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreEr
 /// 不同 Partition 可并行创建（本实现顺序执行）；不改变 Partition 内数据顺序。
 pub fn create_table(
     table_path: &Path,
-    data: Data,
+    data: &Data,
     scheme: PartitionScheme,
 ) -> Result<(), CoreError> {
     if table_path.exists() {
@@ -373,7 +373,7 @@ pub fn create_table(
         return Err(CoreError::Invalid("table input requires sym and time columns".into()));
     }
     if scheme == PartitionScheme::None {
-        return create_dataset(table_path, data);
+        return create_dataset(table_path, data.clone());
     }
     let tt = infer_tt(data.column("time").unwrap().data_type)?;
     let time_view = data.column("time").unwrap().as_view();
@@ -388,15 +388,25 @@ pub fn create_table(
     }
     let mut names: Vec<String> = buckets.keys().cloned().collect();
     names.sort();
-    for name in &names {
-        let indices = &buckets[name];
-        let sub = gather_data(&data, indices)?;
-        if sub.length() == 0 {
-            continue;
+    // 并行分区创建：每个分区独立目录，无共享状态
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for name in &names {
+            let indices = &buckets[name];
+            let sub = gather_data(data, indices)?;
+            if sub.length() == 0 {
+                continue;
+            }
+            let dir = table_path.join(name);
+            handles.push(scope.spawn(move || {
+                splayed_core::create_dataset(&dir, sub)
+            }));
         }
-        let dir = table_path.join(name);
-        splayed_core::create_dataset(&dir, sub)?;
-    }
+        for h in handles {
+            h.join().map_err(|_| CoreError::Invalid("partition thread panicked".into()))??;
+        }
+        Ok::<_, CoreError>(())
+    })?;
     Ok(())
 }
 

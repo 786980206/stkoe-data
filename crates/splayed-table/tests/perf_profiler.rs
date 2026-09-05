@@ -65,7 +65,7 @@ fn perf_profiler() {
 
     // ---- 1. create_table（端到端写入）----
     let t0 = Instant::now();
-    create_table(&root, data.clone(), splayed_table::PartitionScheme::None).unwrap();
+    create_table(&root, &data, splayed_table::PartitionScheme::None).unwrap();
     times.push(("create_table (total)", t0.elapsed()));
 
     // 文件大小
@@ -124,7 +124,7 @@ fn perf_profiler() {
     // ---- 8. 按月分区 create_table ----
     let root2 = temp_dir("profiler_month");
     let t7 = Instant::now();
-    create_table(&root2, data, splayed_table::PartitionScheme::Month).unwrap();
+    create_table(&root2, &data, splayed_table::PartitionScheme::Month).unwrap();
     times.push(("create_table (month, 12 partitions)", t7.elapsed()));
     let _ = std::fs::remove_dir_all(&root2);
 
