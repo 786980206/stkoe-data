@@ -25,7 +25,7 @@
 - compressed Field 打开即**全量解压**为工作表示；chunk 级惰性解码（只解码覆盖请求范围的 chunk）待实现。
 - 谓词求值逐行走 `read_row_scalar` 标量分发；类型特化的段内向量化（SIMD）待实现。
 - Handle 的 scratch 缓冲逐次累积（视图生命周期契约要求），长生命周期高频读场景的回收策略待定。
-- `read_index_handle` 的 sym keys 逐行物化；常量 run 可用 RLE 型段表示。
+- ~~`read_index_handle` 的 sym keys 逐行物化~~ → 已解决：`RepeatDict` 段（零存储）替代 keys 物化，scratch arena 已移除。
 
 ## 10. Benchmark vs Parquet（V2.0 首轮基线，2026-09）
 

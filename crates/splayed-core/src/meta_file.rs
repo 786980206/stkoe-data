@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -234,8 +233,7 @@ pub struct MetaHandle {
     path: PathBuf,
     mmap: Mmap,
     header: MetaHeader,
-    /// scratch：read_index 组装视图时物化的 keys 缓冲（Box 稳定地址，逐次累积，随 Handle 存活）。
-    scratch: RefCell<Vec<Box<Buffer>>>,
+
 }
 
 impl MetaHandle {
@@ -250,7 +248,7 @@ impl MetaHandle {
                 header.file_size
             )));
         }
-        Ok(MetaHandle { path: path.to_path_buf(), mmap, header, scratch: RefCell::new(Vec::new()) })
+        Ok(MetaHandle { path: path.to_path_buf(), mmap, header })
     }
 
     pub fn path(&self) -> &Path {
@@ -400,52 +398,74 @@ impl MetaHandle {
         }
         let time_type = self.header.time_type()?;
         let ts = time_type.size_of();
-        let mut keys: Vec<u8> = Vec::with_capacity(length as usize * 4);
-        let mut spans: Vec<(usize, usize)> = Vec::new(); // (axis 起始 index, 行数)
         let end = offset + length;
-        let mut sym_id = self.locate_row(offset)?.0;
-        while sym_id < self.header.sym_count {
-            let rec = self.sym_record(sym_id)?;
-            let row_start = rec.row_start as u64;
-            let row_end = row_start + rec.time_count as u64;
-            if row_start >= end {
-                break;
-            }
-            let lo = offset.max(row_start);
-            let hi = end.min(row_end);
-            if hi > lo {
-                let k = sym_id.to_le_bytes();
-                for _ in 0..(hi - lo) {
-                    keys.extend_from_slice(&k);
+
+        let mut sym_segments: Vec<ColumnSegment<'_>> = Vec::new();
+        let mut time_segments: Vec<ColumnSegment<'_>> = Vec::new();
+
+        // row_start 单调递增 → 二分找第一个可能重叠的 sym
+        let mut sym_id = {
+            let idx_bytes = self.sym_index_bytes();
+            let mut lo = 0usize;
+            let mut hi = self.header.sym_count as usize;
+            while lo + 1 < hi {
+                let mid = (lo + hi) / 2;
+                let rec = SymIndexRecord::from_bytes(&idx_bytes[mid * 12..])
+                    .map_err(CoreError::from)?;
+                if rec.row_start as u64 <= offset {
+                    lo = mid;
+                } else {
+                    hi = mid;
                 }
-                let t_lo = rec.time_start as usize + (lo - row_start) as usize;
-                spans.push((t_lo, (hi - lo) as usize));
             }
+            lo
+        };
+
+        while sym_id < self.header.sym_count as usize {
+            let rec = self.sym_record(sym_id as u32)?;
+            let rec_row_start = rec.row_start as u64;
+            let rec_row_end = rec_row_start + rec.time_count as u64;
+
+            let lo = offset.max(rec_row_start);
+            let hi = end.min(rec_row_end);
+            if lo >= hi {
+                if rec_row_start >= end {
+                    break;
+                }
+                sym_id += 1;
+                continue;
+            }
+            let n = (hi - lo) as usize;
+
+            // sym：RepeatDict 段（零存储，不物化 keys）
+            let dict_offsets = BufferView::new(self.dict_offsets_bytes());
+            let dict_strings = BufferView::new(self.strings_bytes());
+            sym_segments.push(ColumnSegment::new_repeat_dict(
+                dict_offsets,
+                dict_strings,
+                sym_id as u32,
+                None,
+                n,
+            )?);
+
+            // time：TIME AXIS 零拷贝切片
+            let time_start_idx = rec.time_start as usize + (lo - rec_row_start) as usize;
+            let axis = self.axis_bytes();
+            let time_bytes = BufferView::new(&axis[time_start_idx * ts..(time_start_idx + n) * ts]);
+            time_segments.push(ColumnSegment::new(time_type.data_type(), time_bytes, None, n)?);
+
             sym_id += 1;
         }
-        let keys_buf = crate::arena::push(&self.scratch, Buffer::from_vec(keys));
+
         let schema = Schema::new(vec![
             FieldSchema::new("sym", DataType::Utf8),
             FieldSchema::new("time", time_type.data_type()),
         ]);
-        let sym_view = dict_column_view(
-            BufferView::from_buffer(keys_buf),
-            BufferView::new(self.dict_offsets_bytes()),
-            BufferView::new(self.strings_bytes()),
-            length as usize,
-        )?;
-        let axis = self.axis_bytes();
-        let mut time_segments: Vec<ColumnSegment<'_>> = Vec::with_capacity(spans.len());
-        for (t_lo, n) in spans {
-            let values = BufferView::new(&axis[t_lo * ts..(t_lo + n) * ts]);
-            time_segments.push(ColumnSegment::new(time_type.data_type(), values, None, n)?);
-        }
+        let sym_view = ColumnView::new(DataType::Utf8, sym_segments)?;
         let time_view = ColumnView::new(time_type.data_type(), time_segments)?;
-        let schema2 = schema;
-        DataView::new(schema2, vec![sym_view, time_view]).map_err(CoreError::from)
+        DataView::new(schema, vec![sym_view, time_view]).map_err(CoreError::from)
     }
 
-    /// `scan_index_handle`：SYM / TIME 条件 → FIELD row ranges。
     pub fn scan_index_handle(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
         let time_window = self.extract_time_window(request.predicate.as_ref());
         let sym_ids = self.extract_sym_filter(request.predicate.as_ref())?;

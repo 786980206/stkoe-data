@@ -325,6 +325,16 @@ fn segment_to_owned(
                 .collect();
             Column::from_dict(keys, offs, dict_strings.as_slice().to_vec(), validity)
         }
+        (DataType::Utf8, splayed_format::ColumnValues::RepeatDict { dict_offsets, dict_strings, dict_index }) => {
+            // Arrow 边界物化：RepeatDict → 重复 keys（core 层零存储，此处按需物化）
+            let offs: Vec<u64> = dict_offsets
+                .as_slice()
+                .chunks_exact(8)
+                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            let keys: Vec<u32> = vec![*dict_index; seg.rows()];
+            Column::from_dict(keys, offs, dict_strings.as_slice().to_vec(), validity)
+        }
         _ => Column {
             data_type: dt,
             values: Buffer::from_vec(seg.fixed_bytes().unwrap_or(&[]).to_vec()),

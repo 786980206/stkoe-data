@@ -74,17 +74,17 @@ read_index_handle(handle, offset, length) -> Result<DataView>
 
 **内部实现**：
 ```
-1. locate_row(offset)  →  二分 SYM INDEX（row_start 单调递增）
-                        →  找到起始 sym_id
+1. 二分 SYM INDEX（row_start 单调递增）→ 找到起始 sym_id
 2. 从 sym_id 起逐 sym 遍历：
      每段重叠区间 [max(offset,row_start), min(end,row_end))
-     → keys 常量填充（sym_id.to_le_bytes × 行数）
-     → time 列直接切片 TIME AXIS（零拷贝多段）
-3. keys 物化进 Handle 的 scratch arena（Box 地址稳定，生命周期 = Handle）
-4. 组装 DataView { schema: [sym Utf8, time]，columns: [dict view, time view] }
+     → sym: ColumnSegment::new_repeat_dict(dict_offsets, dict_strings, sym_id, n)
+       （零存储——不物化 keys，O(sym_count) 而非 O(length)）
+     → time: TIME AXIS 直接切片（零拷贝多段）
+3. 组装 DataView { schema: [sym Utf8, time]，columns: [RepeatDict segments, time segments] }
 ```
-- sym 列 keys 逐行物化是 O(length) 的常量填充（每行 4 字节），可用 RLE 优化
+- sym 列零物化：RepeatDict 段只记录 (dict_offsets, dict_strings, dict_index)，消费方按需解析
 - time 列零拷贝：直接引用 mmap 的 TIME AXIS 区域
+- 无 scratch arena：不再需要 keys 物化缓冲
 
 - `offset / length` 是 Index 逻辑行空间（容量网格，§4）中的位置；`offset + length ≤ L`；`length = 0` 返回空 view。
 - 返回该逻辑行段的 `(sym, time)` 两列 view：sym 以字典视图返回（指向 SYM DICT / STRING DATA），time 直接指向 TIME AXIS——两者零拷贝。

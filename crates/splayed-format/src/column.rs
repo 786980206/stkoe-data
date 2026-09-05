@@ -13,6 +13,13 @@ pub enum ColumnValues<'a> {
         dict_offsets: BufferView<'a>,
         dict_strings: BufferView<'a>,
     },
+    /// 隐式重复：字典中第 `dict_index` 个字符串重复 `rows` 次（零存储）。
+    /// read_index_handle 用此变体避免 sym keys 逐行物化。
+    RepeatDict {
+        dict_offsets: BufferView<'a>,
+        dict_strings: BufferView<'a>,
+        dict_index: u32,
+    },
 }
 
 /// 单列段：一段连续行区间。
@@ -38,6 +45,31 @@ impl<'a> ColumnSegment<'a> {
             return Err(FormatError::SizeMismatch { expected, found: values.len() });
         }
         Ok(ColumnSegment { values: ColumnValues::Fixed(values), validity, rows })
+    }
+
+    /// 隐式重复字典段：字典中第 `dict_index` 个值重复 `rows` 次（零存储）。
+    pub fn new_repeat_dict(
+        dict_offsets: BufferView<'a>,
+        dict_strings: BufferView<'a>,
+        dict_index: u32,
+        validity: Option<BitmapView<'a>>,
+        rows: usize,
+    ) -> Result<Self, FormatError> {
+        if dict_offsets.is_empty() || dict_offsets.len() % 8 != 0 {
+            return Err(FormatError::InvalidLayout(
+                "dict offsets must be a non-empty multiple of 8 bytes".into(),
+            ));
+        }
+        if dict_index as usize >= dict_offsets.len() / 8 - 1 {
+            return Err(FormatError::InvalidLayout(format!(
+                "dict_index {dict_index} out of range"
+            )));
+        }
+        Ok(ColumnSegment {
+            values: ColumnValues::RepeatDict { dict_offsets, dict_strings, dict_index },
+            validity,
+            rows,
+        })
     }
 
     /// Utf8 字典段：keys 为 u32 LE 字典索引；dict_offsets 为 `(n+1) × u64`；
@@ -72,7 +104,7 @@ impl<'a> ColumnSegment<'a> {
     pub fn fixed_bytes(&self) -> Option<&'a [u8]> {
         match &self.values {
             ColumnValues::Fixed(v) => Some(v.as_slice()),
-            ColumnValues::Dict { .. } => None,
+            ColumnValues::Dict { .. } | ColumnValues::RepeatDict { .. } => None,
         }
     }
 
@@ -169,6 +201,24 @@ impl<'a> ColumnView<'a> {
                         }
                         std::str::from_utf8(&sb[lo as usize..hi as usize]).ok()
                     }
+                    ColumnValues::RepeatDict { dict_offsets, dict_strings, dict_index } => {
+                        let ob = dict_offsets.as_slice();
+                        let lo = u64::from_le_bytes(
+                            ob[*dict_index as usize * 8..*dict_index as usize * 8 + 8]
+                                .try_into()
+                                .ok()?,
+                        );
+                        let hi = u64::from_le_bytes(
+                            ob[*dict_index as usize * 8 + 8..*dict_index as usize * 8 + 16]
+                                .try_into()
+                                .ok()?,
+                        );
+                        let sb = dict_strings.as_slice();
+                        if hi as usize > sb.len() {
+                            return None;
+                        }
+                        std::str::from_utf8(&sb[lo as usize..hi as usize]).ok()
+                    }
                     ColumnValues::Fixed(_) => None,
                 };
             }
@@ -216,6 +266,15 @@ impl<'a> ColumnView<'a> {
                             kb,
                             *dict_offsets,
                             *dict_strings,
+                            validity,
+                            n,
+                        )?);
+                    }
+                    ColumnValues::RepeatDict { dict_offsets, dict_strings, dict_index } => {
+                        segments.push(ColumnSegment::new_repeat_dict(
+                            *dict_offsets,
+                            *dict_strings,
+                            *dict_index,
                             validity,
                             n,
                         )?);
