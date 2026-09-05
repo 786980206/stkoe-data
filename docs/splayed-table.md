@@ -72,6 +72,12 @@ pub struct TableOptions { /* max_parallelism: Option<usize> */ }
 
 **说明**：
 - `open_table` 只打开 Table 级元信息与 Partition 组织信息；Dataset 在实际 scan / read / write 时按需打开并可在内部缓存复用（实现细节，非 public API）。
+- **统一缓存模型（元数据读路径）**：`TableHandle` 内缓存两类不可变状态——
+  ① `datasets`：按需打开的 `DatasetHandle`（META mmap + Schema，重复调用零 I/O）；
+  ② `stats_cache`：逐分区 `DatasetStatistics`（按名 memo；逐分区统计不可变，永不失效）。
+  分区**列表**不缓存：`read_dir` + 过滤 + 排序为微秒级，且保证路径式
+  `create_table_partition` / `delete_table_partition`（以及外部进程变更）在下次读路径
+  自动生效——缓存列表会静默漏掉新建分区，属不可恢复的正确性风险。
 - `max_parallelism`（缺省 = 逻辑核数）是 Table 内部并行**总预算**：create_table 按
   `P_part × P_field ≤ max_parallelism` 在「分区并行 × Field 并行」间切分（见 §4.1），
   并在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动
@@ -432,10 +438,18 @@ impl TableHandle {
 | --- | --- | --- | --- |
 | 返回 | `Result<Schema, CoreError>` | 输出 | 逻辑 Schema（含 sym / time） |
 
+**内部实现流程**：
+```
+① discover_partitions（分区名稳定排序；read_dir 微秒级）
+② 取最后一个 Partition（不遍历全部、不 merge——跨分区 Schema 一致性由写侧保证，
+   读侧信任，见 §4.6 严格前置校验）
+③ dataset_for(last).read_dataset_schema()（Dataset 缓存 + 内部 Schema 缓存，
+   首次打开后重复调用零 I/O）
+```
+
 **说明**：
-- 返回**最后一个 Partition** 的 Dataset Schema（core `read_dataset_schema`）。
-- 不扫描所有 Partition，不做多 Partition Schema merge——Schema 跨 Partition 一致是**写侧责任**，读侧以最后 Partition 为准。
 - 逻辑 Schema，仅用于字段 / DataType 映射与查询规划。
+- 空表（无分区）无法经 `open_table` 打开（scheme 无法推断），此处不出现空表分支。
 
 ### 4.8 read_table_statistics
 
@@ -450,11 +464,26 @@ impl TableHandle {
 
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| 返回 | `Result<TableStatistics, CoreError>` | 输出 | 跨 Partition 聚合统计 |
+| 返回 | `Result<TableStatistics, CoreError>` | 输出 | 跨 Partition 聚合统计（row_count / partition_count / sym_min/max / time_min/max） |
+
+**内部实现流程（统一缓存模型）**：
+```
+① discover_partitions（分区集合每次重扫——read_dir 微秒级，保证外部 create /
+   delete_table_partition 的正确性；不缓存列表）
+② 逐分区 partition_stats(name)：stats_cache 命中 → 纯内存；未命中 → 经缓存的
+   DatasetHandle 读一次（META header + TIME AXIS 端点）后按名 memo
+③ 主线程聚合：row_count checked_add 溢出 → Error；time / sym 界以 Option 归并
+```
+
+**核心原则**：
+- **逐分区统计不可变**：META immutable + positional overwrite 不改 row_count / TIME AXIS /
+  sym 字典——`DatasetStatistics` 按名字 memo 后**永不失效**；新建分区因列表不缓存而在
+  下一次调用自动纳入，删除自动剔除。
+- **聚合用 Option 归并**：不依赖 default 的 0（修正此前 time_min 恒为 0 的聚合 bug）。
+- 不引入并行 META 读取：剩余 I/O 是经缓存句柄的 64B 级读，线程创建开销高于收益。
 
 **说明**：
-- 遍历全部 Partition 的 `read_dataset_statistics` 并聚合：`row_count` 求和，min / max 跨 Partition 聚合。
-- 只访问各 Dataset 的 META 级统计，不扫 Field 数据。
+- 只访问 META 级统计，不扫 Field 数据；`time_min / time_max` 是**实际数据**端点（非分区名义范围）。
 
 ### 4.9 read_table_metadata
 
@@ -471,12 +500,18 @@ impl TableHandle {
 | --- | --- | --- | --- |
 | 返回 | `Result<TableMetadata, CoreError>` | 输出 | Table 组织信息（ordering / partitioning / capabilities / partitions） |
 
-**内部实现**：
+**内部实现流程**：
 ```
 none 模式 →  partitions 为空，直接返回组织信息
-分区模式  →  discover_partitions → 逐 Partition partition_range（scheme + time_type）
-             →  PartitionInfo { name, time_min, time_max }
+分区模式  →  discover_partitions（升序）→ 逐分区 partition_range（scheme + time_type）
+             →  PartitionInfo { name, time_min, time_max }（纯计算，零 META I/O）
 ```
+
+**核心原则**：
+- **分区时间界由分区名纯推导**：`partition_range` 是纯函数（零 I/O、不可变），无需读
+  META；`PartitionInfo.time_min / time_max` 为分区**含端点**名义范围——数据实际范围的
+  覆盖超集（裁剪 / 元数据语义），精确统计走 `read_table_statistics`。
+- **不含 row_count**：当前无消费者；加入会把统计 I/O 拖进本路径（需要时走 §4.8 的 memo）。
 
 **说明**：
 - 返回 Table 自身组织信息与执行能力；不读取实际字段数据。

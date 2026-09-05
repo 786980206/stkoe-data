@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
-    CreateDatasetOptions, CoreError, DatasetHandle, Mode, create_dataset, delete_dataset,
-    open_dataset,
+    CreateDatasetOptions, CoreError, DatasetHandle, DatasetStatistics, Mode, create_dataset,
+    delete_dataset, open_dataset,
 };
 use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeType};
 
@@ -31,6 +31,11 @@ pub struct TableHandle {
     #[allow(dead_code)]
     pub(crate) options: TableOptions,
     pub(crate) datasets: RefCell<HashMap<String, Box<DatasetHandle>>>,
+    /// 逐分区统计缓存（统一缓存模型）：分区名 → DatasetStatistics。
+    /// 逐分区统计**不可变**——META immutable + positional overwrite 不改 row_count /
+    /// TIME AXIS / sym 字典——按名字 memo 后永不失效；分区集合本身不缓存（read_dir
+    /// 微秒级且保证外部 create / delete 的正确性），新建分区在下一次统计时自动纳入。
+    stats_cache: RefCell<HashMap<String, DatasetStatistics>>,
 }
 
 impl TableHandle {
@@ -162,6 +167,8 @@ pub struct Capabilities {
 }
 
 /// partition 信息（等价于 list_table_partitions，不单独暴露 API）。
+/// `time_min` / `time_max` 为该分区**含端点**的时间值范围（由分区名纯推导，
+/// 零 META I/O；是数据实际范围的覆盖超集——裁剪 / 元数据语义，非精确统计）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionInfo {
     pub name: String,
@@ -623,6 +630,7 @@ pub fn open_table(
         mode,
         options,
         datasets: RefCell::new(HashMap::new()),
+        stats_cache: RefCell::new(HashMap::new()),
     })
 }
 
@@ -641,6 +649,25 @@ impl TableHandle {
         Ok(())
     }
     /// Table Schema：最后一个 Partition 的 Dataset Schema（不做多 Partition merge）。
+    /// 逐分区统计（统一缓存模型）：命中 `stats_cache` 直接返回（零 I/O）；
+    /// 未命中经缓存的 DatasetHandle 读取一次（META header + TIME AXIS 端点）后 memo。
+    /// 逐分区统计不可变（META immutable + positional overwrite 不改 row_count），
+    /// memo 永不失效；分区集合每次 discover（read_dir 微秒级），外部 create / delete
+    /// 的分区在下一次调用自动纳入 / 剔除。
+    fn partition_stats(&self, name: &str) -> Result<DatasetStatistics, CoreError> {
+        if let Some(s) = self.stats_cache.borrow().get(name) {
+            return Ok(s.clone());
+        }
+        let s = self.dataset_for(name)?.read_dataset_statistics()?;
+        self.stats_cache.borrow_mut().insert(name.to_string(), s.clone());
+        Ok(s)
+    }
+
+    /// Table 逻辑 Schema（sym / time + 字段）= 最后一个 Partition（分区名稳定排序）
+    /// 的 Dataset Schema。统一缓存模型：只访问最后一个 Partition，不遍历、不 merge
+    /// （跨分区 Schema 一致性由写侧保证，读侧信任——见 §4.6 严格前置校验）；经
+    /// `dataset_for` 打开的 Dataset 内部缓存 Schema，重复调用零 I/O。
+    /// 空表（无分区）无法经 `open_table` 打开（scheme 无法推断），此处不出现。
     pub fn read_table_schema(&self) -> Result<Schema, CoreError> {
         let last = self
             .discover_partitions()
@@ -651,31 +678,62 @@ impl TableHandle {
     }
 
     /// 聚合各 Partition 的统计（row_count 求和；min/max 跨 Partition 聚合）。
+    /// Table 级统计：各 Partition 统计聚合（row_count 求和、min/max 归并）。
+    ///
+    /// 统一缓存模型：分区列表每次 discover（保证外部 create / delete 正确），
+    /// 逐分区统计走 `partition_stats` memo——首次调用后聚合为纯内存操作（零 META I/O）。
+    /// 数值安全：row_count `checked_add` 溢出 → Error；time_min/max 以 Option 起始
+    /// 归并（不依赖 default 的 0，修正此前 time_min 恒为 0 的聚合 bug）。
     pub fn read_table_statistics(&self) -> Result<TableStatistics, CoreError> {
-        let mut stats = TableStatistics::default();
         let partitions = self.discover_partitions();
-        stats.partition_count = partitions.len() as u32;
+        let mut row_count: u64 = 0;
+        let mut time_min: Option<i64> = None;
+        let mut time_max: Option<i64> = None;
+        let mut sym_min: Option<String> = None;
+        let mut sym_max: Option<String> = None;
         for p in &partitions {
-            let s = self.dataset_for(p)?.read_dataset_statistics()?;
-            stats.row_count += s.row_count;
-            stats.sym_min = match (&stats.sym_min, &s.sym_min) {
-                (_, None) => stats.sym_min,
-                (None, Some(x)) => Some(x.clone()),
-                (Some(a), Some(b)) => Some(if a <= b { a.clone() } else { b.clone() }),
+            let s = self.partition_stats(p)?;
+            row_count = row_count
+                .checked_add(s.row_count)
+                .ok_or_else(|| CoreError::Invalid("row_count overflow in statistics".into()))?;
+            time_min = match (time_min, s.time_min) {
+                (None, v) => Some(v),
+                (Some(a), b) => Some(a.min(b)),
             };
-            stats.sym_max = match (&stats.sym_max, &s.sym_max) {
-                (_, None) => stats.sym_max,
-                (None, Some(x)) => Some(x.clone()),
-                (Some(a), Some(b)) => Some(if a >= b { a.clone() } else { b.clone() }),
+            time_max = match (time_max, s.time_max) {
+                (None, v) => Some(v),
+                (Some(a), b) => Some(a.max(b)),
             };
-            stats.time_min = stats.time_min.min(s.time_min);
-            stats.time_max = stats.time_max.max(s.time_max);
+            sym_min = match (&sym_min, &s.sym_min) {
+                (None, None) => None,
+                (opt, None) => opt.clone(),
+                (None, Some(x)) => Some(x.clone()),
+                (Some(a), Some(b)) => Some(a.min(b).clone()),
+            };
+            sym_max = match (&sym_max, &s.sym_max) {
+                (None, None) => None,
+                (opt, None) => opt.clone(),
+                (None, Some(x)) => Some(x.clone()),
+                (Some(a), Some(b)) => Some(a.max(b).clone()),
+            };
         }
-        Ok(stats)
+        Ok(TableStatistics {
+            row_count,
+            partition_count: partitions.len() as u32,
+            sym_min,
+            sym_max,
+            time_min: time_min.unwrap_or(0),
+            time_max: time_max.unwrap_or(0),
+        })
     }
 
     /// Table 组织信息（ordering / partitioning / capabilities / partitions；
     /// none 模式无分区子目录，partitions 为空）。
+    /// Table 组织信息与执行能力。统一缓存模型中最优路径：PartitionInfo 的
+    /// time_min / time_max 直接由分区名经 `partition_range` **纯计算推导**（零 META
+    /// I/O、天然不可变），分区列表来自 discover（保证外部 create / delete 正确）；
+    /// 不含 row_count（当前无消费者，避免把统计 I/O 拖进本路径；需要时走
+    /// `read_table_statistics` 的 memo 缓存）。
     pub fn read_table_metadata(&self) -> Result<TableMetadata, CoreError> {
         if self.scheme == PartitionScheme::None {
             return Ok(TableMetadata {
@@ -699,7 +757,9 @@ impl TableHandle {
             .map(|name| {
                 let (lo, hi) = partition_range(self.scheme, name, tt)
                     .ok_or_else(|| CoreError::Invalid(format!("bad partition name {name}")))?;
-                Ok(PartitionInfo { name: name.clone(), time_min: lo, time_max: hi })
+                // 含端点语义（与 DatasetStatistics / RowRange 一致）：hi 为排他上界，
+                // 有效分区名保证 hi > lo
+                Ok(PartitionInfo { name: name.clone(), time_min: lo, time_max: hi - 1 })
             })
             .collect();
         Ok(TableMetadata {

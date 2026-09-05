@@ -671,3 +671,66 @@ fn table_field_struct_ops_parallel_and_state_checks() {
     ));
     cleanup(&dir);
 }
+
+/// 统一缓存模型：元数据读 API 的正确性与缓存新鲜度。
+#[test]
+fn metadata_read_apis_cache_semantics() {
+    let dir = temp_dir("meta_cache");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let mut rows: Vec<(&str, i32, f64)> = Vec::new();
+    for (i, sym) in ["AAPL", "MSFT"].iter().enumerate() {
+        for m in [7u32, 8] {
+            for k in 0..2usize {
+                rows.push((sym, d(m, (k + 1) as u32), (i * 100 + m as usize * 2 + k) as f64));
+            }
+        }
+    }
+    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+
+    // statistics：row_count 求和 + **实际数据**的 time 界（time_min 聚合 bug 回归：
+    // 不得为 default 的 0）+ sym 界
+    let st = table.read_table_statistics().unwrap();
+    assert_eq!(st.partition_count, 2);
+    assert_eq!(st.row_count, 8);
+    assert_eq!(st.time_min, d(7, 1) as i64);
+    assert_eq!(st.time_max, d(8, 2) as i64);
+    assert_eq!(st.sym_min.as_deref(), Some("AAPL"));
+    assert_eq!(st.sym_max.as_deref(), Some("MSFT"));
+
+    // 缓存路径：第二次调用结果一致（逐分区 memo 命中）
+    assert_eq!(table.read_table_statistics().unwrap(), st);
+
+    // metadata：分区名升序 + 分区范围由名字纯推导（零 I/O）
+    let md = table.read_table_metadata().unwrap();
+    assert_eq!(md.partitions.len(), 2);
+    assert_eq!(md.partitions[0].name, "month=2026-07");
+    assert_eq!(md.partitions[1].name, "month=2026-08");
+    assert_eq!(md.partitions[0].time_min, d(7, 1) as i64);
+    assert_eq!(md.partitions[1].time_max, d(9, 1) as i64 - 1);
+
+    // 缓存新鲜度（关键）：handle 打开期间**外部**新建分区 → 统计/元数据自动纳入
+    let sep = make_data(&[("AAPL", d(9, 1), 1.0), ("MSFT", d(9, 2), 2.0)]);
+    create_table_partition(&root, "month=2026-09", sep).unwrap();
+    let st2 = table.read_table_statistics().unwrap();
+    assert_eq!(st2.partition_count, 3);
+    assert_eq!(st2.row_count, 10);
+    assert_eq!(st2.time_max, d(9, 2) as i64);
+    let md2 = table.read_table_metadata().unwrap();
+    assert_eq!(md2.partitions.len(), 3);
+    assert_eq!(md2.partitions[2].name, "month=2026-09");
+
+    // 外部删除分区 → 自动剔除
+    delete_table_partition(&root, "month=2026-07").unwrap();
+    let st3 = table.read_table_statistics().unwrap();
+    assert_eq!(st3.partition_count, 2);
+    assert_eq!(st3.row_count, 6);
+    assert_eq!(st3.time_min, d(8, 1) as i64);
+
+    // schema：仍为最后分区（month=2026-09）的 Schema
+    let schema = table.read_table_schema().unwrap();
+    assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
+    cleanup(&dir);
+}
