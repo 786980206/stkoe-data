@@ -3,10 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
-use splayed_core::Mode;
+use splayed_core::{CmpOp, Mode, Predicate, Scalar};
 use splayed_table::{
     create_table, create_table_partition, delete_table, delete_table_partition, open_table,
-    query_table, rename_table, write_table, PartitionScheme, TableOptions, TableScanRequest,
+    query_table, rename_table, scan_table, write_table, PartitionScheme, TableOptions,
+    TableScanRequest,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -732,5 +733,78 @@ fn metadata_read_apis_cache_semantics() {
     // schema：仍为最后分区（month=2026-09）的 Schema
     let schema = table.read_table_schema().unwrap();
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
+    cleanup(&dir);
+}
+
+/// scan_table 惰性扫描：分区裁剪 + 边界分区精确过滤 + limit 精确不超发 + 顺序。
+#[test]
+fn scan_table_lazy_prune_limit_and_boundary() {
+    let dir = temp_dir("scan_lazy");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let mut rows: Vec<(&str, i32, f64)> = Vec::new();
+    for (i, sym) in ["AAPL", "MSFT"].iter().enumerate() {
+        for m in [7u32, 8, 9] {
+            for k in 0..2usize {
+                rows.push((sym, d(m, (k + 1) as u32), (i * 100 + m as usize * 2 + k) as f64));
+            }
+        }
+    }
+    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+
+    let collect = |req: TableScanRequest| -> (Vec<String>, usize) {
+        let mut scanner = scan_table(&table, req).unwrap();
+        let mut parts: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        while let Some(prr) = scanner.next().unwrap() {
+            if parts.last() != Some(&prr.partition) {
+                parts.push(prr.partition.clone());
+            }
+            total += prr.row_range.length as usize;
+        }
+        scanner.close().unwrap();
+        (parts, total)
+    };
+
+    // 边界分区时间精确过滤：窗口 [7-2, 9-1) → 07 被选中但 7-1 的行由 Dataset 内
+    // 残差 time 条件滤掉（完整谓词下传，裁剪不剥时间条件）；09 被 prune
+    let req = TableScanRequest { time: Some((d(7, 2) as i64, d(9, 1) as i64)), ..Default::default() };
+    let (parts, total) = collect(req);
+    assert_eq!(parts, vec!["month=2026-07".to_string(), "month=2026-08".to_string()]);
+    assert_eq!(total, 6); // 7-2 × 2 行 + 8 月 4 行（7-1 × 2 行被精确过滤）
+
+    // limit 精确不超发：全局剩余下推 + 返回前防御裁剪
+    let req = TableScanRequest { limit: Some(5), ..Default::default() };
+    let (parts, total) = collect(req);
+    assert_eq!(total, 5);
+    assert!(parts.len() <= 2); // 07(4 行) + 08 裁剪 1 行，09 不打开语义下不产出
+
+    // 空窗口：立即结束、零产出
+    let req = TableScanRequest { time: Some((0, d(7, 1) as i64)), ..Default::default() };
+    let (parts, total) = collect(req);
+    assert!(parts.is_empty());
+    assert_eq!(total, 0);
+
+    // 用户 predicate 携带 time 条件（predicate 路径，不参与裁剪但精确过滤生效）
+    let req = TableScanRequest {
+        predicate: Some(Predicate::cmp("time", CmpOp::Ge, Scalar::Int(d(9, 2) as i64))),
+        ..Default::default()
+    };
+    let (parts, total) = collect(req);
+    assert_eq!(parts, vec!["month=2026-09".to_string()]);
+    assert_eq!(total, 2); // 9-2 × 2 行（9-1 × 2 行被滤掉）
+
+    // 无条件：全部分区按名升序
+    let (parts, total) = collect(TableScanRequest::default());
+    assert_eq!(
+        parts,
+        vec![
+            "month=2026-07".to_string(),
+            "month=2026-08".to_string(),
+            "month=2026-09".to_string()
+        ]
+    );
+    assert_eq!(total, 12);
     cleanup(&dir);
 }

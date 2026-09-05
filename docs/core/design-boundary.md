@@ -25,7 +25,13 @@
 - `compress_field_file` / `decompress_field_file`：chunk 流式——compress 逐 chunk 零拷贝切片编码直写 tmp（header 编码前即确定）；decompress 直接解析 chunk 位置逐 chunk 解码（不经 open 全量解压），DATA / VALIDITY 双游标顺序写，validity 位跨 chunk 拼接；内存 O(单个 chunk)；tmp `sync_all` 后原子替换。
 - `read_dataset` / `write_dataset` / `scan_dataset` 统一三阶段并发模型（主线程校验 + `ensure_field` 串行 → Field 级并行只做纯 I/O → 主线程收尾；并行度 `max_parallelism` 由最上层控制，`std::thread::scope` 分桶，不自建线程池）：write_dataset 按 `values_mut` 收集互不相交 `&mut FieldHandle`（列名唯一校验）分桶并行写，总字节 < 1 MiB 走串行快路径；scan_dataset 各 Field 以相同候选范围独立并行扫描后主线程顺序求交 + 相邻合并（与逐字段串行收窄等价：谓词逐行性质 + `∩` 交换/结合），候选 < 64K 行走串行，`limit` 不下推子扫描（截断后求交会漏行）；read_dataset **保持单线程**——读路径是 O(1) 零拷贝切片、不触碰数据页，并行调度开销为负收益，并行插入点在 chunk 惰性解码落地后。
 - Table 层 Field 结构操作统一执行器 `structural_for_each`（主线程严格前置校验 → `values_mut` 互不相交 `&mut DatasetHandle` 分桶并行 → 返回首个错误；并行只跨 Partition、不嵌套 Field 级并发）；compress / decompress 增加物理状态前置校验（`dataset_field_is_chunked` 只读 64B header，不经打开——compressed 打开会全量解压）；cast 增加跨分区类型一致性校验；create 的全 NULL 字段经 `FieldInit::Length` 的 `set_len` 稀疏零填充，成本 O(header)/分区。
-- Table 元数据读 API 统一缓存模型：逐分区 `DatasetStatistics` 按名 memo（不可变——META
+- Table 元数据读 API 统一缓存模型（另见 splayed-table §3.1）：scan_table 惰性化——
+  scan_table 只做裁剪与构造（不打开 Dataset，tt 经 64B META header 直读），分区在
+  next() 时按序惰性打开；时间裁剪按 time_min 排序后二分（不依赖分区名字典序——年号
+  位数不同时字典序 ≠ 时间序）；完整谓词下传（裁剪是粗筛，边界分区需 Dataset 内时间
+  精确过滤）；limit 逐分区下推 + 返回前防御性裁剪；无时间条件的扫描不读任何 META。
+  串行扫描（保持顺序 / limit 早停 / 无嵌套并行）。
+- 统一缓存模型：逐分区 `DatasetStatistics` 按名 memo（不可变——META
   immutable + positional overwrite 不改 row_count / TIME AXIS / sym 字典，命中后聚合纯内存）；
   分区 time 界由分区名 `partition_range` 纯推导（零 I/O）；**分区列表不缓存**（read_dir 微秒级，
   保证路径式 create / delete_table_partition 与外部变更的正确性——修正伪代码中"open 时缓存

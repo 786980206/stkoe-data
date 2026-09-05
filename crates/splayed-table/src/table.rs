@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
@@ -75,21 +76,28 @@ impl TableHandle {
         Ok(unsafe { &*ptr })
     }
 
-    /// 时间单位（从第一个可用 Dataset 的 META 推断，缓存）。
+    /// 时间单位（统一缓存模型：直接读第一个可用分区的 **64B META header** 推断，
+    /// 不经 DatasetHandle 打开——保持 scan / 元数据读路径的惰性；结果缓存）。
     pub(crate) fn peek_time_type(&self) -> Result<TimeType, CoreError> {
         if let Some(tt) = self.time_type.borrow().as_ref() {
             return Ok(*tt);
         }
-        let tt = if self.scheme == PartitionScheme::None {
-            self.dataset_for("")?.peek_time_type()
+        let meta_path = if self.scheme == PartitionScheme::None {
+            self.root.join(".meta")
         } else {
             let first = self
                 .discover_partitions()
                 .first()
                 .cloned()
                 .ok_or_else(|| CoreError::Invalid("table has no partitions".into()))?;
-            self.dataset_for(&first)?.peek_time_type()
+            self.root.join(&first).join(".meta")
         };
+        let mut f = fs::File::open(&meta_path).map_err(|e| CoreError::Io(e))?;
+        let mut head = [0u8; splayed_format::META_HEADER_SIZE];
+        f.read_exact(&mut head).map_err(|e| CoreError::Io(e))?;
+        let header = splayed_format::MetaHeader::from_bytes(&head).map_err(CoreError::from)?;
+        header.validate().map_err(CoreError::from)?;
+        let tt = header.time_type().map_err(CoreError::from)?;
         *self.time_type.borrow_mut() = Some(tt);
         Ok(tt)
     }

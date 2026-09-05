@@ -521,7 +521,12 @@ none 模式 →  partitions 为空，直接返回组织信息
 
 **接口定义**：
 ```rust
-pub fn scan_table(table: &TableHandle, request: TableScanRequest) -> Result<TableScanner, CoreError>
+pub fn scan_table<'t>(table: &'t TableHandle, request: TableScanRequest)
+    -> Result<TableScanner<'t>, CoreError>
+impl TableScanner<'t> {
+    pub fn next(&mut self) -> Result<Option<PartitionRowRange>, CoreError>
+    pub fn close(self) -> Result<(), CoreError>
+}
 ```
 
 **参数**：
@@ -530,29 +535,38 @@ pub fn scan_table(table: &TableHandle, request: TableScanRequest) -> Result<Tabl
 | --- | --- | --- | --- |
 | `table` | `&TableHandle` | 输入 | 已打开的 Table Handle |
 | `request` | `TableScanRequest` | 输入 | 扫描请求（见 §3.2） |
-| 返回 | `Result<TableScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个连续 `PartitionRowRange`，结束返回 `None` |
+| 返回 | `Result<TableScanner<'t>, CoreError>` | 输出 | 惰性定位器；`next()` 每次返回一个连续 `PartitionRowRange`，结束返回 `None` |
 
-**内部实现**：
+**内部实现流程（惰性 + 串行）**：
 ```
-TableScanRequest
-   ↓ partition pruning（仅 time 条件）
-选中的 Partitions
-   ↓ 逐 Partition：locate / open Dataset → scan_dataset(residual request)
-DatasetScanner → 逻辑 RowRange
-   ↓
-TableScanner::next() -> PartitionRowRange
+scan_table（主线程，轻量）
+   ① residual 谓词组合：sym 条件 + time 条件 + 用户 predicate（完整下传）
+   ② 分区裁剪（仅 time 条件）：无时间条件 → 全部分区（不读任何 META）；
+      有时间条件 → 分区时间界由分区名 partition_range 纯推导（零 META I/O）
+      → 按 time_min 排序 → 二分定位（首个 hi > lo 起连续取 lo' < hi）
+   ③ 构造 TableScanner（不打开任何 Dataset；tt 的 64B META header 直读亦在此步内）
+next()（惰性、串行）
+   循环：remaining == 0 → None（绝不打开后续分区）
+      → 当前 DatasetScanner 取下一个 RowRange（返回前防御性 limit 裁剪）
+      → 耗尽则关闭、惰性打开下一分区（dataset_for 缓存复用）→ scan_dataset(residual)
 ```
-- `limit` 为全局 limit，Scanner 维护剩余量并按 Partition 递减下推：
 
-```
-remaining_limit → Partition 1 scan_dataset(limit=remaining)
-                → remaining -= returned_rows
-                → Partition 2 ...
-```
+**核心原则**：
+- **惰性顺序扫描**：`scan_table` 不打开任何 Dataset（`peek_time_type` 也走 64B header
+  直读）；`next()` 按分区 ASC 逐个打开并扫描，任意时刻至多持有一个 `DatasetScanner`；
+  打开 / META 错误延迟到 `next()` 返回（惰性迭代器语义）。
+- **裁剪不剥时间条件**：partition pruning 是粗筛——边界分区（时间窗落入分区内部）仍需
+  Dataset 内的 time 精确过滤，完整谓词原样下传。
+- **limit 严格下推 + 防御**：每个新分区以 `remaining` 为 `ScanRequest.limit` 下传，
+  `next()` 返回前再裁剪；`remaining == 0` 立即终止，绝不打开后续分区。
+- **无并行扫描分区**：并行会破坏顺序、需要缓冲、限制 limit 早停，并与 Dataset 内部
+  字段级并行形成嵌套；scan 阶段保持串行，数据读取的优化留给 read_table。
 
 **说明**：
-- `next()` 每次返回**一个**连续 `PartitionRowRange`；结束返回 None；不返回 ranges 集合，不负责 batch。
+- `next()` 每次返回**一个**连续 `PartitionRowRange`；结束返回 None；不负责 batch。
 - 输出顺序固定：Partition ASC；Partition 内保持 Dataset 的 `sym ASC, time ASC`。
+- `TableScanner<'t>` 借用 `TableHandle`（生命周期 `'_`）——Scanner 存活期间 Table
+  Handle 不可移动 / 关闭。
 
 ### 4.11 read_table
 

@@ -13,7 +13,7 @@ pub mod scan;
 pub use dataset::{
     create_dataset, create_dataset_index, delete_dataset, open_dataset, CreateDatasetOptions,
     DatasetFieldInit,
-    DatasetHandle, DatasetStatistics, RESERVED_FIELD_NAMES,
+    DatasetHandle, DatasetScanner, DatasetStatistics, RESERVED_FIELD_NAMES,
 };
 pub use error::{CoreError, Mode};
 pub use field_file::{
