@@ -335,25 +335,27 @@ impl FieldHandle {
 
     /// 按逻辑行（= 物理行）读取，返回 zero-copy ColumnView。
     ///
+    /// 职责边界：只把逻辑行范围转换为 ColumnView —— 不做解压（open 时一次完成）、
+    /// 数据复制、段合并或谓词求值（归 Scanner / Dataset 层）。
     /// PLAIN + NONE 为单段 mmap 切片；compressed 跨 chunk 的读取返回多段。
     /// compressed 定位复杂度 O(log C + 交叠 chunk 数)：chunk_ends 上二分首个 chunk，
     /// `cstart ≥ end` 即停；不从头遍历 chunk、不做逐 chunk 前缀和。
     pub fn read_field_handle(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
         let row_count = self.row_count();
-        if offset + length > row_count {
+        // 边界检查溢出安全
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| CoreError::Invalid("read range offset + length overflows".into()))?;
+        if end > row_count {
             return Err(CoreError::Invalid(format!(
-                "read range [{offset}, {}) exceeds row_count {row_count}",
-                offset + length
+                "read range [{offset}, {end}) exceeds row_count {row_count}"
             )));
         }
         let dt = self.data_type();
         let size = dt.size_of();
         if length == 0 {
-            // 空 view：单空段满足 ColumnView “segments 非空”不变式
-            let seg = ColumnSegment::new(dt, BufferView::new(&[]), None, 0)?;
-            return ColumnView::new(dt, vec![seg]).map_err(CoreError::from);
+            return Ok(ColumnView::empty(dt));
         }
-        let end = offset + length;
         if self.is_chunked() {
             let work = self.working_ref()?;
             let first = self.chunk_ends.partition_point(|&e| e <= offset);
@@ -372,7 +374,7 @@ impl FieldHandle {
                 let validity = work
                     .validity
                     .as_ref()
-                    .map(|b| BitmapView::new(BufferView::new(b.as_view().as_raw()), lo, hi - lo))
+                    .map(|b| b.as_view().slice(lo, hi - lo))
                     .transpose()?;
                 segments.push(ColumnSegment::new(dt, values, validity, hi - lo)?);
             }

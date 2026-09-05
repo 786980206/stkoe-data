@@ -87,20 +87,24 @@ read_field_handle(handle, offset, length) -> Result<ColumnView>
 
 **内部实现**：
 ```
+bounds        →  end = offset.checked_add(length)（溢出安全）→ end ≤ row_count
+length = 0    →  ColumnView::empty（单零行段，满足 segments 非空不变式）
 uncompressed  →  mmap 切片 values[offset×size .. (offset+length)×size]
                   + BitmapView::new(validity_bytes, offset, length)
                   → 单段 ColumnView::from_one
 compressed    →  chunk_ends（open 时累积行末）上 partition_point 二分首个 chunk
                   → 自首个 chunk 顺序切段，cstart ≥ end 即 break
-                  → 每段 ColumnSegment::new（values 字节切片 + validity 位视图，均零拷贝）
+                  → 每段 ColumnSegment::new（values 字节切片 + validity.slice 位视图，均零拷贝）
                   → ColumnView::new(多段；段容量按平均 chunk 行数预分配)
 ```
+- 职责边界：read 只负责"逻辑行范围 → ColumnView"转换 —— 解压在 open 一次性完成；
+  不在此做数据复制、段合并或谓词求值（归 Scanner / Dataset 层）
 - PLAIN+NONE 返回的值指针直接指向 mmap 区域（零拷贝）
 - compressed Field 打开时全量解压到 `Working { values: Buffer, validity: Option<Bitmap> }`，
   后续读取从 working 上切片（chunk 级惰性解码为优化项）
 - compressed 定位复杂度 O(log C + 交叠 chunk 数)：二分定位 + 交叠段连续产出，
-  不从头遍历 chunk、不做逐 chunk 前缀和；validity 只建 `BitmapView`，不复制位图
-- `offset / length` 为逻辑行（= 物理行）；`offset + length ≤ row_count`；`length = 0` 返回空 view（单空段，满足 ColumnView 非空段不变式）。
+  不从头遍历 chunk、不做逐 chunk 前缀和；validity 只建位视图（`BitmapView::slice`），不复制位图
+- `offset / length` 为逻辑行（= 物理行）；`offset + length ≤ row_count`（`checked_add` 溢出安全）；`length = 0` 返回空 view。
 - 返回 zero-copy ColumnView：`PLAIN + NONE` 为单段 mmap 切片；compressed Field 逐 chunk 物化，跨 chunk 的读取返回多段。
 - view 生命周期不能超过 Handle / 底层资源；close 后失效。
 - 不提供 `parallel` 参数，并发由上层控制。

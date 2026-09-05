@@ -52,6 +52,7 @@ DataView      { schema, columns: ColumnView[], length }
   - `segments` 非空、按逻辑行序排列；
   - `Σ segments 行数 == length`；
   - `PLAIN + NONE` 路径恒为单段（mmap 切片）；多段仅出现在 compressed 跨 chunk 读取与跨 Partition batch 聚合。
+  - 空视图由 `ColumnView::empty(data_type)` 构造（单零行段，`length = 0`），同样满足非空段不变式。
 - Schema：纯逻辑描述，不携带 encoding / compression / offset 等物理属性；不独立持久化（无 Schema 文件）。
 - DataView：read-only 优先；可只含部分字段（projection）；所有列统一 `length`；不同列可来自不同 Buffer；列内多段对 DataView 透明。
 - `Data` 为 owning / materialized 表示；仅需要独立拥有数据时才发生 `DataView → Data` 复制。

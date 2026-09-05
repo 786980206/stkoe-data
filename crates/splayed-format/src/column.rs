@@ -155,6 +155,13 @@ impl<'a> ColumnView<'a> {
         ColumnView::new(data_type, vec![segment])
     }
 
+    /// 空视图：单零行段（满足 “segments 非空” 不变式，`length == 0`）。
+    pub fn empty(data_type: DataType) -> Self {
+        let segment = ColumnSegment::new(data_type, BufferView::new(&[]), None, 0)
+            .expect("zero-row segment is valid by construction");
+        ColumnView { data_type, segments: vec![segment], length: 0 }
+    }
+
     pub fn data_type(&self) -> DataType {
         self.data_type
     }
@@ -228,6 +235,7 @@ impl<'a> ColumnView<'a> {
     }
 
     /// 行区间切片：跨段时返回多段视图，零拷贝（validity 位级切分）。
+    /// `length = 0` 返回空视图（与 [`ColumnView::empty`] 一致）。
     pub fn slice_rows(&self, offset: usize, length: usize) -> Result<Self, FormatError> {
         if offset + length > self.length {
             return Err(FormatError::InvalidLayout(format!(
@@ -235,6 +243,9 @@ impl<'a> ColumnView<'a> {
                 offset,
                 offset + length,
             )));
+        }
+        if length == 0 {
+            return Ok(ColumnView::empty(self.data_type));
         }
         let size = self.data_type.size_of();
         let mut segments = Vec::new();
@@ -417,6 +428,26 @@ mod tests {
 
         let valid = Column::zeroed(DataType::Float64, 250, false);
         assert_eq!(valid.null_count(), 0);
+    }
+
+    #[test]
+    fn empty_view_is_single_zero_row_segment() {
+        let view = ColumnView::empty(DataType::Float64);
+        assert_eq!(view.data_type(), DataType::Float64);
+        assert_eq!(view.length(), 0);
+        assert!(view.is_empty());
+        assert_eq!(view.segments().len(), 1);
+        assert_eq!(view.null_count(), 0);
+        // 零长度切片与 empty 一致
+        let data = Buffer::from_vec(vec![1u8, 2, 3, 4]);
+        let one = ColumnView::from_one(
+            DataType::Int16,
+            BufferView::from_buffer(&data),
+            None,
+            2,
+        )
+        .unwrap();
+        assert_eq!(one.slice_rows(1, 0).unwrap().length(), 0);
     }
 
     #[test]
