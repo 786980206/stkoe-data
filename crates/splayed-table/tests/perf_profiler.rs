@@ -97,6 +97,7 @@ fn perf_profiler() {
     let mut scanner = ds.scan_dataset(&splayed_core::ScanRequest::default()).unwrap();
     let mut ranges = 0;
     while scanner.next().unwrap().is_some() { ranges += 1; }
+    assert!(ranges > 0, "scan must produce ranges");
     scanner.close().unwrap();
     times.push(("scan_dataset (no filter)", t4.elapsed()));
 

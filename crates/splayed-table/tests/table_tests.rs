@@ -263,7 +263,7 @@ fn partition_and_table_lifecycle() {
     let root2 = dir.join("tbl_v2");
     assert!(root2.join("month=2026-08").exists());
 
-    let mut table = open_table(&root2, Mode::Read, TableOptions::default()).unwrap();
+    let table = open_table(&root2, Mode::Read, TableOptions::default()).unwrap();
     let stats = table.read_table_statistics().unwrap();
     assert_eq!(stats.row_count, 2);
     assert_eq!(stats.partition_count, 2);

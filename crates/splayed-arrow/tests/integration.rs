@@ -4,7 +4,7 @@ use splayed_arrow::{
     column_to_arrow, data_to_record_batch, data_view_to_batch, from_arrow_type,
     record_batch_to_data, scan_to_arrow, to_arrow_type,
 };
-use splayed_core::{create_dataset, Mode};
+use splayed_core::Mode;
 use arrow_array::Array as _;
 use std::path::Path;
 use splayed_core::{open_dataset as open_dataset_inner};
@@ -175,7 +175,6 @@ fn table_scan_to_arrow_end_to_end() {
     assert_eq!(total, 4);
 
     // 经 parquet 写读对照（能力对齐验证：Arrow 生态互通）
-    use arrow_array::RecordBatchWriter;
     let file = std::fs::File::create(dir.join("out.parquet")).unwrap();
     let mut writer = parquet::arrow::ArrowWriter::try_new(
         file,

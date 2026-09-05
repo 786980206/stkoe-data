@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use splayed_core::{
     create_dataset, create_dataset_index, delete_dataset, open_dataset, CmpOp, DatasetFieldInit,
-    Mode, Predicate, RowRange, Scalar, ScanRequest,
+    Mode, Predicate, Scalar, ScanRequest,
 };
-use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
+use splayed_format::{Buffer, Column, Data, DataType, FieldSchema, Schema};
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
@@ -80,7 +80,7 @@ fn dataset_create_read_write_roundtrip() {
     // 重复创建 → AlreadyExists
     assert!(create_dataset(&root, sample_data()).is_err());
 
-    let mut ds = open_dataset(&root, Mode::Read).unwrap();
+    let ds = open_dataset(&root, Mode::Read).unwrap();
     let schema = ds.read_dataset_schema();
     assert_eq!(schema.len(), 3);
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
@@ -138,7 +138,7 @@ fn dataset_write_and_scan() {
     let dir = temp_dir("write_scan");
     let root = dir.join("ds");
     create_dataset(&root, sample_data()).unwrap();
-    let mut ds = open_dataset(&root, Mode::Write).unwrap();
+    let ds = open_dataset(&root, Mode::Write).unwrap();
 
     // write：覆盖 MSFT 两行（逻辑行 [3, 5)）
     let patch = Column {
@@ -334,7 +334,7 @@ fn dataset_index_rebuild() {
     // 重建 .meta（同输入）
     let data = sample_data();
     create_dataset_index(&root, &data.as_view()).unwrap();
-    let mut ds = open_dataset(&root, Mode::Read).unwrap();
+    let ds = open_dataset(&root, Mode::Read).unwrap();
     let view = ds.read_dataset(0, 8, None).unwrap();
     assert_eq!(view.length(), 8);
     ds.close_dataset().unwrap();

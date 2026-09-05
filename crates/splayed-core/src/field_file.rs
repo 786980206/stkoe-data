@@ -212,6 +212,8 @@ pub struct FieldHandle {
     backing: Backing,
     /// compressed：打开时从 chunk 头读得的分组（自描述，close 重压缩沿用）。
     chunk_rows: Vec<u32>,
+    /// compressed：chunk 累积行末（chunk_ends[i] = Σ chunk_rows[..=i]），读侧二分定位用。
+    chunk_ends: Vec<u64>,
     /// compressed：解压后的工作表示。
     working: Option<Working>,
     modified: bool,
@@ -329,15 +331,13 @@ impl FieldHandle {
         Ok(Working { values, validity })
     }
 
-    fn chunk_start(&self, index: usize) -> u64 {
-        self.chunk_rows[..index].iter().map(|&r| r as u64).sum()
-    }
-
     // --------------------------------------------------------------- read
 
     /// 按逻辑行（= 物理行）读取，返回 zero-copy ColumnView。
     ///
     /// PLAIN + NONE 为单段 mmap 切片；compressed 跨 chunk 的读取返回多段。
+    /// compressed 定位复杂度 O(log C + 交叠 chunk 数)：chunk_ends 上二分首个 chunk，
+    /// `cstart ≥ end` 即停；不从头遍历 chunk、不做逐 chunk 前缀和。
     pub fn read_field_handle(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
         let row_count = self.row_count();
         if offset + length > row_count {
@@ -348,32 +348,33 @@ impl FieldHandle {
         }
         let dt = self.data_type();
         let size = dt.size_of();
+        if length == 0 {
+            // 空 view：单空段满足 ColumnView “segments 非空”不变式
+            let seg = ColumnSegment::new(dt, BufferView::new(&[]), None, 0)?;
+            return ColumnView::new(dt, vec![seg]).map_err(CoreError::from);
+        }
+        let end = offset + length;
         if self.is_chunked() {
             let work = self.working_ref()?;
-            let mut segments = Vec::new();
-            let mut pos = offset;
-            let end = offset + length;
-            for (ci, &crows) in self.chunk_rows.iter().enumerate() {
-                if pos >= end {
+            let first = self.chunk_ends.partition_point(|&e| e <= offset);
+            // 段容量按平均 chunk 行数预分配，避免逐段扩容
+            let avg_chunk = (self.header.row_count as usize / self.chunk_rows.len().max(1)).max(1);
+            let mut segments = Vec::with_capacity(length as usize / avg_chunk + 2);
+            for ci in first..self.chunk_rows.len() {
+                let cend = self.chunk_ends[ci];
+                let cstart = cend - self.chunk_rows[ci] as u64;
+                if cstart >= end {
                     break;
                 }
-                let cstart = self.chunk_start(ci);
-                let cend = cstart + crows as u64;
-                let lo = pos.max(cstart);
-                let hi = end.min(cend);
-                if hi > lo {
-                    let (lo, hi) = (lo as usize, hi as usize);
-                    let values = BufferView::new(&work.values.as_slice()[lo * size..hi * size]);
-                    let validity = work
-                        .validity
-                        .as_ref()
-                        .map(|b| {
-                            BitmapView::new(BufferView::new(b.as_view().as_raw()), lo, hi - lo)
-                        })
-                        .transpose()?;
-                    segments.push(ColumnSegment::new(dt, values, validity, hi - lo)?);
-                    pos = hi as u64;
-                }
+                let lo = offset.max(cstart) as usize;
+                let hi = end.min(cend) as usize;
+                let values = BufferView::new(&work.values.as_slice()[lo * size..hi * size]);
+                let validity = work
+                    .validity
+                    .as_ref()
+                    .map(|b| BitmapView::new(BufferView::new(b.as_view().as_raw()), lo, hi - lo))
+                    .transpose()?;
+                segments.push(ColumnSegment::new(dt, values, validity, hi - lo)?);
             }
             return ColumnView::new(dt, segments).map_err(CoreError::from);
         }
@@ -563,13 +564,10 @@ impl FieldHandle {
     fn block_end(&self, start: u64, range_end: u64) -> u64 {
         let mut end = start.saturating_add(8192).min(range_end);
         if self.is_chunked() {
-            let mut cum = 0u64;
-            for &r in &self.chunk_rows {
-                cum += r as u64;
-                if cum > start {
-                    end = end.min(cum);
-                    break;
-                }
+            // 二分定位 start 所在 chunk，块止于该 chunk 末尾
+            let ci = self.chunk_ends.partition_point(|&e| e <= start);
+            if ci < self.chunk_ends.len() {
+                end = end.min(self.chunk_ends[ci]);
             }
         }
         end
@@ -600,7 +598,8 @@ fn apply_segment_bits(region: &mut [u8], validity: Option<BitmapView<'_>>) -> Re
 /// compressed write 发生修改 → 自动 compress + rewrite（临时文件 + 原子替换，
 /// 分组沿用打开时读得的 chunk 头；写路径不改 row_count，分组可精确复用）。
 pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
-    let FieldHandle { path, header, mode, backing, chunk_rows, working, modified } = handle;
+    let FieldHandle { path, header, mode, backing, chunk_rows, chunk_ends, working, modified } =
+        handle;
     match mode {
         Mode::Read => return Ok(()),
         Mode::Write => {}
@@ -622,10 +621,9 @@ pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
     let compression = header.compression()?;
     let mut out = Vec::with_capacity(HEADER_SIZE + work.values.len() / 2);
     out.extend_from_slice(&header.to_bytes());
-    let mut cum = 0u64;
-    for &rows in &chunk_rows {
-        let lo = cum as usize;
-        let hi = lo + rows as usize;
+    for (ci, &rows) in chunk_rows.iter().enumerate() {
+        let hi = chunk_ends[ci] as usize;
+        let lo = hi - rows as usize;
         let values = &work.values.as_slice()[lo * size..hi * size];
         let validity = work
             .validity
@@ -640,7 +638,6 @@ pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
             validity.as_deref(),
             rows as usize,
         )?);
-        cum += rows as u64;
     }
     let tmp = tmp_path(&path);
     let mut f = File::options().write(true).create(true).truncate(true).open(&tmp)?;
@@ -893,6 +890,13 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
             ));
         }
     }
+    let chunk_ends: Vec<u64> = chunk_rows
+        .iter()
+        .scan(0u64, |acc, &r| {
+            *acc += r as u64;
+            Some(*acc)
+        })
+        .collect();
     let working = if header.is_chunked() {
         Some(FieldHandle::decode_working(&map, &header)?)
     } else {
@@ -907,6 +911,7 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
             mode,
             backing: Backing::Mmap(unsafe { Mmap::map(&file)? }),
             chunk_rows,
+            chunk_ends,
             working,
             modified: false,
         })
@@ -918,6 +923,7 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
             mode,
             backing: Backing::MmapMut(unsafe { MmapMut::map_mut(&file)? }),
             chunk_rows,
+            chunk_ends,
             working,
             modified: false,
         })

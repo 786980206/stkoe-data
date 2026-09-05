@@ -4,10 +4,9 @@ use std::path::Path;
 
 use splayed_core::{
     cast_field_file, close_field_handle, compress_field_file, create_field_file,
-    decompress_field_file, delete_field_file, open_field_file, rename_field_file, FieldChunkReader,
-    FieldHandle, FieldInit, Mode, Predicate, RowRange, Scalar, ScanRequest, StreamValues,
+    decompress_field_file, delete_field_file, open_field_file, rename_field_file, FieldChunkReader, FieldInit, Mode, Predicate, RowRange, Scalar, ScanRequest, StreamValues,
 };
-use splayed_format::{Bitmap, Buffer, BufferView, Column, ColumnView, DataType};
+use splayed_format::{Bitmap, Buffer, Column, ColumnView, DataType};
 
 use std::path::PathBuf;
 
@@ -283,6 +282,12 @@ fn compress_decompress_roundtrip() {
     // 跨 chunk 读取（返回多段）
     let view = handle.read_field_handle(30, 20).unwrap();
     assert!(view.segments().len() >= 2);
+    // 块内读取（二分定位直接命中第二块）
+    let view = handle.read_field_handle(40, 10).unwrap();
+    assert_eq!(view.length(), 10);
+    assert_eq!(view_values(&view), &values[40..50]);
+    // length = 0 → 空 view
+    assert_eq!(handle.read_field_handle(37, 0).unwrap().length(), 0);
     close_field_handle(handle).unwrap();
 
     // 已压缩再次压缩 → 错误
