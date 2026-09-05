@@ -690,3 +690,50 @@ fn create_dataset_with_compression() {
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }
+
+/// sym IN（Or 组合）下推 META 扫描：只命中目标 sym 的行（R3/R4 场景的过滤语义）。
+#[test]
+fn scan_dataset_symbol_in_or_pushdown() {
+    let dir = temp_dir("sym_in");
+    let root = dir.join("ds");
+    let data = two_field_data(); // A@1,A@2,B@1,B@2
+    create_dataset(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
+    let ds = open_dataset(&root, Mode::Read).unwrap();
+
+    // sym IN ("B") —— 单元素 Or 等价 IN
+    let pred = Predicate::Or(vec![Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("B".into()))]);
+    let mut scanner = ds
+        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length {
+            rows.push(r.offset + i);
+        }
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, vec![2, 3]); // B 的行（输入序 A@1,A@2,B@1,B@2）
+
+    // sym IN ("A","B") 之外再叠加 time 条件：And(Or(sym), time Ge)
+    let pred = Predicate::And(vec![
+        Predicate::Or(vec![
+            Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("A".into())),
+            Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("B".into())),
+        ]),
+        Predicate::cmp("time", CmpOp::Ge, Scalar::Int(2)),
+    ]);
+    let mut scanner = ds
+        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .unwrap();
+    let mut rows = Vec::new();
+    while let Some(r) = scanner.next().unwrap() {
+        for i in 0..r.length {
+            rows.push(r.offset + i);
+        }
+    }
+    scanner.close().unwrap();
+    // A@2 与 B@2（time >= 2 的行）
+    assert_eq!(rows, vec![1, 3]);
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}

@@ -27,8 +27,8 @@ pub struct TableOptions {
     pub max_parallelism: Option<usize>,
     /// 新建 Field 的 chunk 压缩算法（None / 缺省 = 未压缩）。
     pub compression: Option<splayed_format::Compression>,
-    /// 压缩 chunk 的 sym 分组数（缺省 = 8）。
-    pub chunk_syms: Option<usize>,
+    /// 压缩 chunk 的目标行数（自动规划 sym 对齐边界；缺省 = 8192）。
+    pub chunk_target_rows: Option<usize>,
 }
 
 /// Table 的打开态对象（partition discovery + 按需打开的 Dataset 缓存）。
@@ -255,6 +255,10 @@ type RowSpan = (usize, usize);
 ///   源列无 validity → 目标无 validity；拼接后全 1 → 收缩为 None（全有效）。
 pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreError> {
     let total: usize = runs.iter().map(|&(_, len)| len).sum();
+    if std::env::var("GATHER_DEBUG").is_ok() {
+        eprintln!("DBG gather_runs total={} runs={:?} fields={:?}",
+            total, runs, data.schema.fields.iter().map(|f| f.name.to_string()).collect::<Vec<_>>());
+    }
     let mut columns = Vec::with_capacity(data.schema.fields.len());
     for field in &data.schema.fields {
         let col = data.column(&field.name).expect("schema iteration guarantees");
@@ -276,12 +280,24 @@ pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreErr
                         let k = u32::from_le_bytes(kb.try_into().unwrap()) as usize;
                         let id = match remap[k] {
                             u32::MAX => {
-                                let lo = u64::from_le_bytes(
-                                    dict_offsets[k * 8..k * 8 + 8].try_into().unwrap(),
-                                ) as usize;
-                                let hi = u64::from_le_bytes(
-                                    dict_offsets[k * 8 + 8..k * 8 + 16].try_into().unwrap(),
-                                ) as usize;
+                                let lo_bytes = dict_offsets
+                                    .get(k * 8..k * 8 + 8)
+                                    .expect("dict offsets lo out of range");
+                                let hi_bytes = dict_offsets
+                                    .get(k * 8 + 8..k * 8 + 16)
+                                    .expect("dict offsets hi out of range");
+                                let lo =
+                                    u64::from_le_bytes(lo_bytes.try_into().unwrap()) as usize;
+                                let hi =
+                                    u64::from_le_bytes(hi_bytes.try_into().unwrap()) as usize;
+                                if hi > dict_strings.len() {
+                                    panic!(
+                                        "dict strings out of range: field={} k={k} lo={lo} hi={hi} strings_len={} offs_len={} n_dict={n_dict}",
+                                        field.name,
+                                        dict_strings.len(),
+                                        dict_offsets.len(),
+                                    );
+                                }
                                 new_strings.extend_from_slice(&dict_strings[lo..hi]);
                                 new_offsets.push(new_strings.len() as u64);
                                 // id 独立计数（new_offsets[0] 为哨兵，不能以 len-1 推 id）
@@ -453,7 +469,7 @@ pub fn create_table(
     let ds_options = CreateDatasetOptions {
         max_parallelism: max_p,
         compression: options.compression.unwrap_or(splayed_format::Compression::None),
-        chunk_syms: options.chunk_syms.unwrap_or(8),
+        chunk_target_rows: options.chunk_target_rows.unwrap_or(8192),
     };
     if scheme == PartitionScheme::None {
         // 单 Dataset 快速路径：列所有权直接移动，不克隆
@@ -904,16 +920,16 @@ impl TableHandle {
             .options
             .compression
             .unwrap_or(splayed_format::Compression::None);
-        let chunk_syms = self.options.chunk_syms.unwrap_or(8);
+        let chunk_target_rows = self.options.chunk_target_rows.unwrap_or(8192);
         self.structural_for_each(|ds| {
-            // 创建即压缩：按各分区自身的 META 网格推导 sym 对齐 chunk 边界
+            // 创建即压缩：按各分区自身的 META 网格自动规划 sym 对齐 chunk 边界
             let field_options = if matches!(compression, splayed_format::Compression::None) {
                 splayed_core::CreateFieldOptions::default()
             } else {
                 splayed_core::CreateFieldOptions {
                     compression,
                     chunk_offsets: Some(
-                        ds.sym_aligned_chunk_offsets(chunk_syms, splayed_core::CHUNK_ROW_CAP),
+                        ds.sym_aligned_chunk_offsets(chunk_target_rows, splayed_core::CHUNK_ROW_CAP),
                     ),
                 }
             };

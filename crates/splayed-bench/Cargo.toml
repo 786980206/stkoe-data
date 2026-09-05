@@ -1,0 +1,23 @@
+[package]
+name = "splayed-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Splayed vs Parquet benchmark suite (docs/benchmark.md)"
+
+[dependencies]
+splayed-core = { path = "../splayed-core" }
+splayed-table = { path = "../splayed-table" }
+splayed-format = { path = "../splayed-format" }
+arrow-array = "56"
+arrow-buffer = "56"
+arrow-schema = "56"
+arrow-select = "56"
+parquet = { version = "56", default-features = false, features = ["arrow", "zstd"] }
+bytemuck = "1"
+
+[[bin]]
+name = "splayed-bench"
+path = "src/main.rs"

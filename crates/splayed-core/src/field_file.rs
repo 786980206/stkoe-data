@@ -289,6 +289,11 @@ pub fn create_field_file(
     if matches!(options.compression, Compression::None) {
         return create_field_file_plain(path, data_type, init);
     }
+    if data_type == DataType::Utf8 {
+        // encode_chunk 值域为定宽（Utf8 keys 不适用）——压缩创建不支持 Utf8，
+        // 保持未压缩（与 compress_field_file 的既有约束一致）
+        return create_field_file_plain(path, data_type, init);
+    }
     if matches!(init, FieldInit::Data(_) | FieldInit::Length(_)) {
         return create_field_file_chunked(path, data_type, init, &options);
     }

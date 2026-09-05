@@ -635,27 +635,27 @@ impl DatasetHandle {
         self.meta.locate_index_handle(pairs)
     }
 
-    /// sym 对齐的压缩 chunk 边界（创建即压缩 / compress 共用）：每
-    /// `syms_per_chunk` 个连续 sym 一个边界；行数超过 `row_cap` 的 sym 按 cap 劈开。
-    pub fn sym_aligned_chunk_offsets(&self, syms_per_chunk: usize, row_cap: u64) -> Vec<u64> {
+    /// sym 对齐的压缩 chunk 边界（创建即压缩 / compress 共用）——**自动规划**：
+    /// 按 sym 边界累积行数，达到 `target_rows` 即收口（chunk 保持整 sym、
+    /// 行数 ≈ target）；行数超过 `row_cap` 的 sym 按 cap 劈开。
+    pub fn sym_aligned_chunk_offsets(&self, target_rows: usize, row_cap: u64) -> Vec<u64> {
         let mut boundaries: Vec<u64> = vec![0];
-        let mut syms_in_chunk = 0usize;
+        let mut acc: u64 = 0;
         for id in 0..self.meta.header().sym_count {
             let Ok(rec) = self.meta.sym_record(id) else { break };
             let (start, len) = (rec.row_start as u64, rec.time_count as u64);
-            if syms_in_chunk == syms_per_chunk {
+            if acc >= target_rows as u64 {
                 boundaries.push(start);
-                syms_in_chunk = 0;
+                acc = 0;
             }
-            syms_in_chunk += 1;
+            acc += len;
             if len > row_cap {
-                boundaries.push(start);
                 let mut p = start + row_cap;
                 while p < start + len {
                     boundaries.push(p);
                     p += row_cap;
                 }
-                syms_in_chunk = 0;
+                acc = start + len - (p - row_cap);
             }
         }
         boundaries.sort_unstable();
@@ -846,6 +846,19 @@ fn collect_for_fields(pred: &Predicate, allowed: &[&str]) -> Predicate {
                     collect(c, allowed, out);
                 }
             }
+            Predicate::Or(children) => {
+                // Or 子树（如 symbol IN）的全部字段都在 allowed 内 → 整体下推 META
+                //（compile_predicate 原生处理 Or sym 过滤并集）；否则保持跳过
+                let mut fields = Vec::new();
+                pred.fields(&mut fields);
+                if fields.iter().all(|f| allowed.iter().any(|a| f.as_ref() == *a)) {
+                    out.push(pred.clone());
+                } else {
+                    for c in children {
+                        collect(c, allowed, out);
+                    }
+                }
+            }
             Predicate::Cmp { field: Some(f), .. }
                 if allowed.iter().any(|a| f.as_ref() == *a) =>
             {
@@ -884,9 +897,9 @@ pub struct CreateDatasetOptions {
     pub max_parallelism: usize,
     /// 新建 Field 的 chunk 压缩算法（默认 None = 未压缩）。
     pub compression: Compression,
-    /// 压缩 chunk 的 sym 分组数（每 chunk 覆盖的连续 sym 数；行数超过
-    /// `CHUNK_ROW_CAP` 的 sym 按 cap 劈开）。默认 8。
-    pub chunk_syms: usize,
+    /// 压缩 chunk 的**目标行数**（自动规划：按 sym 边界累积到目标行数即收口，
+    /// 行数超过 `CHUNK_ROW_CAP` 的 sym 按 cap 劈开）。默认 8192。
+    pub chunk_target_rows: usize,
 }
 
 impl Default for CreateDatasetOptions {
@@ -894,18 +907,18 @@ impl Default for CreateDatasetOptions {
         CreateDatasetOptions {
             max_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
             compression: Compression::None,
-            chunk_syms: 8,
+            chunk_target_rows: 8192,
         }
     }
 }
 
-/// 由输入 sym 列（字典 keys）的 run 结构推导 sym 对齐 chunk 边界：
-/// 每 `chunk_syms` 个连续 sym 一个边界，行数超过 `row_cap` 的 sym 按 cap 劈开。
-/// 输入 (sym ASC, time ASC) ⇒ sym run 行数 = 该 sym 的容量网格行数，
-/// 边界与 META 网格一致（供创建即压缩时逐 Field 复用）。
+/// 由输入 sym 列（字典 keys）的 run 结构**自动规划** sym 对齐 chunk 边界：
+/// 按 sym 边界累积行数，达到 `target_rows` 即收口（chunk 保持整 sym、行数
+/// ≈ target）；行数超过 `row_cap` 的 sym 按 cap 劈开。输入 (sym ASC, time ASC)
+/// ⇒ sym run 行数 = 该 sym 的容量网格行数，边界与 META 网格一致。
 fn sym_chunk_offsets_from_data(
     view: &splayed_format::Column,
-    chunk_syms: usize,
+    target_rows: usize,
     row_cap: u64,
 ) -> Result<Vec<u64>, CoreError> {
     let view = view.as_view();
@@ -922,7 +935,8 @@ fn sym_chunk_offsets_from_data(
     };
     let n = keys.len() / 4;
     let mut offsets = vec![0u64];
-    let (mut syms_in_chunk, mut i) = (0usize, 0usize);
+    let mut acc: u64 = 0; // 自上次边界以来当前 chunk 的累计行数
+    let mut i = 0usize;
     while i < n {
         let k = u32::from_le_bytes(keys[i * 4..i * 4 + 4].try_into().unwrap());
         let mut len = 1usize;
@@ -932,21 +946,22 @@ fn sym_chunk_offsets_from_data(
             len += 1;
         }
         let start = i as u64;
-        if syms_in_chunk == chunk_syms {
+        let len = len as u64;
+        if acc >= target_rows as u64 {
             offsets.push(start);
-            syms_in_chunk = 0;
+            acc = 0;
         }
-        syms_in_chunk += 1;
-        if len as u64 > row_cap {
-            offsets.push(start);
+        acc += len;
+        // 超大 sym：按 row_cap 劈开（chunk 边界落在 sym 内部）
+        if len > row_cap {
             let mut p = start + row_cap;
-            while p < start + len as u64 {
+            while p < start + len {
                 offsets.push(p);
                 p += row_cap;
             }
-            syms_in_chunk = 0;
+            acc = start + len - (p - row_cap);
         }
-        i += len;
+        i += len as usize;
     }
     offsets.sort_unstable();
     offsets.dedup();
@@ -974,12 +989,15 @@ pub fn create_dataset(
     //    （全部 Field 复用同一网格边界），随 CreateFieldOptions 下发
     let field_options = if matches!(options.compression, Compression::None) {
         CreateFieldOptions::default()
+    } else if options.chunk_target_rows == 0 {
+        // chunk_target_rows = 0 → 均匀 8192 行分块（不按 sym 对齐）
+        CreateFieldOptions { compression: options.compression, chunk_offsets: None }
     } else {
         CreateFieldOptions {
             compression: options.compression,
             chunk_offsets: Some(sym_chunk_offsets_from_data(
                 data.column("sym").unwrap(),
-                options.chunk_syms.max(1),
+                options.chunk_target_rows.max(1),
                 CHUNK_ROW_CAP,
             )?),
         }
@@ -1021,12 +1039,13 @@ pub fn create_dataset(
         let p = options.max_parallelism.max(1).min(field_cols.len()).max(1);
         if p <= 1 {
             for (name, data_type, col) in field_cols {
-                create_field_file(
-                    &tmp.join(&name),
-                    data_type,
-                    FieldInit::Data(col),
-                    field_options.clone(),
-                )?;
+                // Utf8 字段不支持 chunk 压缩（encode_chunk 定宽值域）→ 未压缩创建
+                let fo = if data_type == DataType::Utf8 {
+                    CreateFieldOptions::default()
+                } else {
+                    field_options.clone()
+                };
+                create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col), fo)?;
             }
         } else {
             // round-robin 分桶（列大小不均时负载更均匀）；列所有权移动，零拷贝
@@ -1041,11 +1060,17 @@ pub fn create_dataset(
                     let fo = &field_options;
                     handles.push(s.spawn(move || -> Result<(), CoreError> {
                         for (name, data_type, col) in bucket {
+                            // Utf8 字段不支持 chunk 压缩 → 未压缩创建
+                            let fo = if data_type == DataType::Utf8 {
+                                CreateFieldOptions::default()
+                            } else {
+                                fo.clone()
+                            };
                             create_field_file(
                                 &tmp.join(&name),
                                 data_type,
                                 FieldInit::Data(col),
-                                fo.clone(),
+                                fo,
                             )?;
                         }
                         Ok(())

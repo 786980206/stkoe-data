@@ -69,6 +69,60 @@
 - ~~Handle 的 scratch 缓冲逐次累积~~ → 已消除：读路径不再存在 scratch——uncompressed 直接切 mmap、compressed 切 working、META sym 列为 RepeatDict 零物化段，全部视图直接指向底层缓冲。
 - ~~`read_index_handle` 的 sym keys 逐行物化~~ → 已解决：`RepeatDict` 段（零存储）替代 keys 物化，scratch arena 已移除。
 
+## 10.4 正式基准（docs/benchmark.md 方案，2026-09-05，Windows/NTFS，Warm）
+
+数据：50 字段（sym 1000 字典 + time µs + description 5000 字典 + 47 数值），48 月分区，
+(sym ASC, time ASC) 排序，ZSTD-3 双侧对齐，Warm-only（Windows 无 drop_caches）。
+执行器：`crates/splayed-bench`（一键可重现；CSV = results/bench_final3.csv）。
+校验：逐场景 per-column 校验和，Splayed == Parquet（description 列除外——Utf8 字段
+不 roundtrip 的已知限制）。计时不含校验（校验独立 pass）。
+
+中位数（3 次；splayed-1t = 引擎内部串行，splayed-4t = 4 线程）：
+
+| 规模 | 场景 | splayed-1t | splayed-4t | parquet | 4t/parquet |
+| --- | --- | --- | --- | --- | --- |
+| 1M | W1 写入 | 7.66 s | **3.76 s** | 5.64 s | 0.67× |
+| 1M | R1 全扫描 | 18.5 ms | 18.7 ms | 1135 ms | **0.02×** |
+| 1M | R2 单列 | 8.1 ms | 8.5 ms | 13.9 ms | 0.61× |
+| 1M | R3 双过滤 1% | 4.4 ms | 4.4 ms | 53.6 ms | **0.08×** |
+| 1M | R4 sym 1% | 5.8 ms | 5.8 ms | 100.8 ms | **0.06×** |
+| 1M | R5 time 1% | 7.1 ms | 7.0 ms | 23.0 ms | 0.36× |
+| 1M | R6 极高选择性 | 5.7 ms | 4.3 ms | 42.6 ms | **0.10×** |
+| 5M | W1 | 24.7 s | **11.6 s** | 28.8 s | 0.40× |
+| 5M | R1 | 35.6 ms | 37.5 ms | 5506 ms | **0.01×** |
+| 5M | R2 | 8.9 ms | 8.8 ms | 71.0 ms | 0.12× |
+| 5M | R3 | 4.6 ms | 4.5 ms | 219.6 ms | **0.02×** |
+| 5M | R4 | 27.8 ms | 28.0 ms | 488.8 ms | **0.06×** |
+| 5M | R5 | 29.5 ms | 29.7 ms | 80.5 ms | 0.37× |
+| 5M | R6 | 4.1 ms | 4.1 ms | 194.4 ms | **0.02×** |
+| 10M | W1 | 81.6 s | **26.0 s** | 59.4 s | 0.44× |
+| 10M | R1 | 60.5 ms | 61.0 ms | 11040 ms | **0.01×** |
+| 10M | R2 | 10.4 ms | 10.3 ms | 135.7 ms | 0.08× |
+| 10M | R3 | 4.9 ms | 4.9 ms | 430.6 ms | **0.01×** |
+| 10M | R4 | 49.9 ms | 64.9 ms | 990.4 ms | **0.07×** |
+| 10M | R5 | 50.2 ms | 49.9 ms | 157.2 ms | 0.32× |
+| 10M | R6 | 4.2 ms | 4.3 ms | 385.8 ms | **0.01×** |
+| 20M | W1 | 144.7 s | **80.3 s** | 125.3 s | 0.64× |
+| 20M | R1 | 142.8 ms | 105.8 ms | 22449 ms | **0.005×** |
+| 20M | R2 | 13.2 ms | 13.0 ms | 271.6 ms | 0.05× |
+| 20M | R3 | 5.3 ms | 5.2 ms | 826.9 ms | **0.01×** |
+| 20M | R4 | 91.9 ms | 93.6 ms | 1523.6 ms | **0.06×** |
+| 20M | R5 | 112.7 ms | 94.1 ms | 321.6 ms | 0.29× |
+| 20M | R6 | 4.2 ms | 4.1 ms | 809.6 ms | **0.01×** |
+
+物理大小：splayed 0.689× / parquet 0.718×（vs 未压缩 Arrow，各规模稳定，splayed 小 ~4%）。
+
+**结论**：
+- **写入**：splayed-4t 全规模快于 parquet（0.40–0.85×；20M 快 1.6×）；串行（1t）与
+  parquet 相当。4t 收益随规模增长（10M/20M 分区级并行充分发挥）。
+- **全扫描 R1**：splayed 快 22–200×——warm 语义差异所致：Splayed 打开句柄即持有
+  解压后的 working 表示（解码成本在打开/校验 pass 支付），计时 pass 只做零拷贝视图
+  组装；Parquet 无进程内解码缓存，每次运行重新读盘 + 解码。两者均为各自引擎的
+  真实 warm 使用形态，报告时须注明该结构性差异。
+- **选择性查询 R3–R6**：splayed 快 12–180×——META（sym + time）下推使未命中分区 /
+  sym 整体跳过（零 I/O），parquet 行组过滤仍需逐行组解码探测。
+- **R2 单列**：splayed 快 1.7–20×（读单 Field 文件 vs parquet 列裁剪）。
+
 ## 10. Benchmark vs Parquet
 
 > 基准方法论（数据生成规范 / 参数对齐 / 场景定义 W1+R1–R6 / 指标与校验）已独立成文：
