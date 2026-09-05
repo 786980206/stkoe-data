@@ -74,8 +74,9 @@
   内部 Field 级并行嵌套）——此前"跨分区串行"的记载系函数注释失实所致。
 
 结论与定位：读取侧已反超 parquet（全表 2.0×、谓词 2.2×），谓词向量化已从「已知优化项」兑现；
-**写入是当前唯一显著落后项**——create_table 的剩余串行瓶颈 = 主线程 gather_data
-（非连续索引逐行拷贝 + validity 逐 bit 写，违反批量位操作原则）+ 逐行 partition_name
-字符串构造 + MetaBuilder × 12（META 单线程为设计约束）；Table 层优化的候选方向：
-gather 批量化（连续 run 拼接 + 批量位操作）、分区并行接入 `max_parallelism`
-（消除无上界嵌套）、Table 级 tmp + 原子发布；chunk 级惰性解码（读路径 Field 级并行的前提）仍为后续项。
+**写入侧 create_table 已完成批量化 + 并行预算治理**（一次线性扫描产出分区连续片段 →
+gather_runs 连续片段 memcpy + validity word 级拼接 + 字典 remap 零逐行字符串分配 →
+`P_part × P_field ≤ max_parallelism` 预算切分并行，TableOptions 直达 create_table）；
+剩余待测：端到端写入基准复测；chunk 级惰性解码（读路径 Field 级并行的前提）仍为后续项。
+已查明的边界：Field 文件层仅支持定宽类型的 roundtrip（Utf8 字段的字典区不落盘，
+读回为空 Fixed 段）——Utf8 值字段的持久化支持待设计评估。

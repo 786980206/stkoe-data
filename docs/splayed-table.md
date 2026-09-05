@@ -72,7 +72,11 @@ pub struct TableOptions { /* max_parallelism: Option<usize> */ }
 
 **说明**：
 - `open_table` 只打开 Table 级元信息与 Partition 组织信息；Dataset 在实际 scan / read / write 时按需打开并可在内部缓存复用（实现细节，非 public API）。
-- `max_parallelism`（缺省 = 逻辑核数）在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动 `write_dataset` / `scan_dataset` 的 Field 级并行分桶；Table 内部并行不得突破该上限，避免与上层执行线程池形成不可控并发放大。`create_table` 的分区创建已并行（每分区一个线程，见 §4.1），但尚未接入该上限——与 `create_dataset` 内部 Field 级并行形成无上界嵌套，是 Table 层优化的待修正项。
+- `max_parallelism`（缺省 = 逻辑核数）是 Table 内部并行**总预算**：create_table 按
+  `P_part × P_field ≤ max_parallelism` 在「分区并行 × Field 并行」间切分（见 §4.1），
+  并在打开每个 Partition Dataset 时下沉为 `DatasetHandle.max_parallelism`，驱动
+  `write_dataset` / `scan_dataset` 的 Field 级并行分桶——多层并发有统一上界，
+  避免与上层执行线程池形成不可控并发放大。
 
 ### 3.2 TableScanRequest
 
@@ -177,7 +181,8 @@ pub struct TableStatistics {
 
 **接口定义**：
 ```rust
-pub fn create_table(table_path: &Path, data: &Data, scheme: PartitionScheme) -> Result<(), CoreError>
+pub fn create_table(table_path: &Path, data: Data, scheme: PartitionScheme,
+    options: TableOptions) -> Result<(), CoreError>
 ```
 
 **参数**：
@@ -185,19 +190,51 @@ pub fn create_table(table_path: &Path, data: &Data, scheme: PartitionScheme) -> 
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `table_path` | `&Path` | 输入 | Table 根目录；必须不存在 |
-| `data` | `&Data` | 输入 | 完整 Table 数据；必须含 `sym` 与 `time`，按 `(sym ASC, time ASC)` 排序 |
+| `data` | `Data` | 输入 | 完整 Table 数据（**接管列所有权**，`none` 路径零克隆）；必须含 `sym` 与 `time`，按 `(sym ASC, time ASC)` 排序 |
 | `scheme` | `PartitionScheme` | 输入 | `none \| year \| month \| date` 四选一 |
+| `options` | `TableOptions` | 输入 | `max_parallelism`：Table 内部并行总预算（缺省 = 逻辑核数） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Table 创建完成 |
 
-**内部实现**：
+**内部实现流程**：
 ```
-none                →  Table 根目录直接创建单个 Dataset（core create_dataset）
-year / month / date →  按 time 切分输入 → 生成 Hive-style partition_name
-                        →  每个 Partition 通过 core create_dataset 创建
+① 主线程校验（轻量）      →  路径不存在 / sym-time 在列 / time 类型可分区（infer_tt）
+                            →  0 行：仅创建根目录并返回 Ok（无 META、无分区）
+② none 快速路径           →  create_dataset 根目录（列所有权直接移交，Field 级并行拿满预算）
+③ 一次线性扫描 time 列    →  每分区「连续行片段」RowSpan(start, len)：
+                              sym run 内 time 单调 ⇒ 同名分区行连续成段（片段可跨 sym 边界，
+                              拼接后分区内仍保持 (sym, time) 序）；
+                              分区名字符串仅在换段时构造（段内用整数粗键判别，无逐行分配）
+④ 并行创建分区（预算切分）→  P_part = min(max_parallelism, 分区数)
+                              P_part = 1 → 串行（Field 级并行拿满 max_parallelism）
+                              否则 P_field = max(1, max_parallelism / P_part)，
+                              round-robin 分桶 thread::scope：
+                              每工作线程 gather_runs（批量拼接）→ create_dataset（Field 级并行 P_field）
+                              ⇒ P_part × P_field ≤ max_parallelism，多层并发有上界
+⑤ 失败语义                →  单分区原子（tmp + sync_all + rename）；已创建分区保留、不回滚
 ```
 
+**gather_runs（分区 gather 批量拼接原则）**：
+- 定宽列：目标缓冲一次预分配，逐**片段** `copy_from_slice`（每片段一次 memcpy，不逐行）；
+- Utf8 字典列（sym 等）：`remap` 表把全局字典 id 映射为分区局部 id（首现序），字符串仅
+  首现时拷贝一次；逐行只做 u32 键读取 + 查表，无 String 分配、无哈希表；
+- validity：`Bitmap::copy_bits_from` 逐片段 word 级位拼接（不逐 bit）；源无 validity → 目标无
+  validity；拼接后全 1 → 收缩为 None（不落 validity 区）。
+
+**核心原则**：
+- **片段化 gather**：排序契约使分区行在输入中连续成段，gather 从「逐行散点拷贝」退化为
+  「连续片段拼接」，内存带宽接近 memcpy。
+- **并行预算单源**：分区级 × Field 级共享 `max_parallelism` 预算（`P_part × P_field ≤ max_parallelism`），
+  消除 Table → Dataset 两层并发的无上界叠加；不引入 rayon，`std::thread::scope` 分桶。
+- **分区名零逐行分配**：整数粗键判别换段（year → 年号；month → `y×12+m-1`；date → 天号），
+  字符串仅在片段边界构造。
+- **单分区原子、表级不回滚**：与 write_table 一致的失败契约——部分创建保留（调用方删除
+  Table 目录即可清理）。
+
 **说明**：
-- 不同 Partition 可并行创建；不改变 Partition 内数据顺序（time 切分天然保序）。
+- 不改变 Partition 内数据顺序（time 切分天然保序，片段拼接保持源行序）。
+- 分区目录由 create_dataset 的 tmp + rename 隐式创建根目录（首个分区落盘时父目录随之存在）。
+- 0 行输入创建的 Table 无 `.meta`、无分区目录；`open_table` 后 `discover_partitions` 为空
+  （`none` scheme 需走 create_table_partition / 重新 create_table 建立根 Dataset）。
 
 ### 4.2 create_table_partition / delete_table_partition
 
@@ -216,7 +253,8 @@ pub fn delete_table_partition(table_path: &Path, partition_name: &str) -> Result
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = Partition 创建 / 删除完成 |
 
 **说明**：
-- create：内部即 core `create_dataset`；delete：删除对应 Partition 目录（Dataset），不影响其他 Partition。
+- create：内部即 core `create_dataset`——`data` 列所有权直接移交（无 gather / 克隆）；
+  delete：删除对应 Partition 目录（Dataset），不影响其他 Partition。
 - 这是向 Table 引入新数据的唯一入口（`write_table` 只覆盖已有行；向已有 Partition 追加数据暂缓，见 §6）。
 
 ### 4.3 delete_table

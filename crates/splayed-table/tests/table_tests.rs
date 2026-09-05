@@ -29,6 +29,26 @@ fn f64s(view: &splayed_format::ColumnView<'_>) -> Vec<f64> {
         .collect()
 }
 
+/// 取 i32 列全部行值（跨段拼接）。
+fn i32s(view: &splayed_format::ColumnView<'_>) -> Vec<i32> {
+    view.segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, i32>(s.fixed_bytes().unwrap()).to_vec())
+        .collect()
+}
+
+/// 全局行号 → 有效性（跨段定位段内行号；无 validity = 全有效）。
+fn is_valid_at(view: &splayed_format::ColumnView<'_>, row: usize) -> bool {
+    let mut pos = row;
+    for s in view.segments() {
+        if pos < s.rows() {
+            return s.validity().map_or(true, |v| v.is_valid(pos));
+        }
+        pos -= s.rows();
+    }
+    false
+}
+
 /// 构造 (sym, time, price) 数据。time 用天序号（Date32），便于按月分区断言。
 /// rows: (sym, day, price)，调用方保证 (sym, day) 有序唯一。
 fn make_data(rows: &[(&str, i32, f64)]) -> Data {
@@ -92,7 +112,7 @@ fn month_sample() -> Data {
 fn month_table_create_query() {
     let dir = temp_dir("month");
     let root = dir.join("tbl");
-    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     // 分区目录
     assert!(root.join("month=2026-08").exists());
     assert!(root.join("month=2026-09").exists());
@@ -173,7 +193,7 @@ fn month_table_create_query() {
 fn table_write_overwrites_existing_rows() {
     let dir = temp_dir("write");
     let root = dir.join("tbl");
-    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 覆盖 08-03 的 AAPL/MSFT（输入按 (sym,time) 有序唯一）
@@ -223,7 +243,7 @@ fn none_scheme_table() {
         ("MSFT", d803, 20.0),
         ("MSFT", d804, 21.0),
     ]);
-    create_table(&root, &sorted, PartitionScheme::None).unwrap();
+    create_table(&root, sorted, PartitionScheme::None, TableOptions::default()).unwrap();
     assert!(root.join(".meta").exists());
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     assert_eq!(table.scheme(), PartitionScheme::None);
@@ -246,7 +266,7 @@ fn partition_and_table_lifecycle() {
     // 先建 08 分区
     let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
     let partial = make_data(&[("AAPL", d803, 10.0)]);
-    create_table(&root, &partial, PartitionScheme::Month).unwrap();
+    create_table(&root, partial, PartitionScheme::Month, TableOptions::default()).unwrap();
 
     // create_table_partition：新增 09 分区（scheme 从已有分区推断）
     let sep_sample = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 1) as i32, 12.0)]);
@@ -313,7 +333,7 @@ fn validity_survives_partition_split() {
         d.columns[price_idx].validity = Some(bits);
         d
     };
-    create_table(&root, &data, PartitionScheme::Month).unwrap();
+    create_table(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let req = TableScanRequest::default();
     let mut reader = query_table(&table, req, None).unwrap();
@@ -331,7 +351,7 @@ fn validity_survives_partition_split() {
 fn table_field_structure_operations() {
     let dir = temp_dir("fieldops");
     let root = dir.join("tbl");
-    create_table(&root, &month_sample(), PartitionScheme::Month).unwrap();
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let mut table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // create：全 NULL
@@ -384,5 +404,136 @@ fn table_field_structure_operations() {
     assert!(table.delete_table_field("vol").is_err());
 
     table.close().unwrap();
+    cleanup(&dir);
+}
+
+/// 3 sym × 2 月交错数据；price 两个 NULL（源行 1/7）、side（Int32）一个 NULL（源行 4）。
+/// 行序满足 (sym ASC, time ASC)：sym 外层、月内层。返回 (Data, 源行集)。
+fn parallel_opts_sample() -> (Data, Vec<(String, i32, Option<f64>, Option<i32>)>) {
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let syms = ["AAPL", "GOOG", "MSFT"];
+    let mut sym_keys: Vec<u32> = Vec::new();
+    let mut times: Vec<i32> = Vec::new();
+    let mut prices: Vec<f64> = Vec::new();
+    let mut side_vals: Vec<i32> = Vec::new();
+    let mut rows: Vec<(String, i32, Option<f64>, Option<i32>)> = Vec::new();
+    for (si, sym) in syms.iter().enumerate() {
+        for k in 0..6usize {
+            let t = d(if k < 3 { 8 } else { 9 }, (k % 3 + 1) as u32);
+            let (price, side) = ((si * 10 + k) as f64, (k % 2) as i32);
+            sym_keys.push(si as u32);
+            times.push(t);
+            prices.push(price);
+            side_vals.push(side);
+            rows.push((sym.to_string(), t, Some(price), Some(side)));
+        }
+    }
+    let mut price_bits = vec![0xFFu8; (prices.len() + 7) / 8];
+    price_bits[0] &= !(1 << 1); // 源行 1 NULL
+    price_bits[0] &= !(1 << 7); // 源行 7 NULL
+    let mut side_bits = vec![0xFFu8; (side_vals.len() + 7) / 8];
+    side_bits[0] &= !(1 << 4); // 源行 4 NULL
+    for (i, r) in rows.iter_mut().enumerate() {
+        if i == 1 || i == 7 {
+            r.2 = None;
+        }
+        if i == 4 {
+            r.3 = None;
+        }
+    }
+    let mut sym_offsets = vec![0u64];
+    let mut sym_strings: Vec<u8> = Vec::new();
+    for s in &syms {
+        sym_strings.extend_from_slice(s.as_bytes());
+        sym_offsets.push(sym_strings.len() as u64);
+    }
+    let data = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+            FieldSchema::new("price", DataType::Float64),
+            FieldSchema::new("side", DataType::Int32),
+        ]),
+        vec![
+            Column::from_dict(sym_keys, sym_offsets, sym_strings, None),
+            Column { data_type: DataType::Date32, values: Buffer::from_slice_copy(&times), validity: None, dict: None },
+            Column { data_type: DataType::Float64, values: Buffer::from_slice_copy(&prices), validity: Some(Bitmap::from_bytes(price_bits, prices.len())), dict: None },
+            Column { data_type: DataType::Int32, values: Buffer::from_slice_copy(&side_vals), validity: Some(Bitmap::from_bytes(side_bits, side_vals.len())), dict: None },
+        ],
+    )
+    .unwrap();
+    (data, rows)
+}
+
+/// 并行选项等价性：max_parallelism = 1 与 8 产出内容一致的 Table
+/// （分区 gather 批量拼接 + 预算切分并行的正确性回归）。
+#[test]
+fn create_table_parallel_options_equivalent() {
+    let dir = temp_dir("create_par_opts");
+    let read_rows = |root: &Path| -> Vec<(String, i32, Option<f64>, Option<i32>)> {
+        let table = open_table(root, Mode::Read, TableOptions::default()).unwrap();
+        let req = TableScanRequest::default();
+        let mut reader = query_table(&table, req, None).unwrap();
+        let mut out = Vec::new();
+        while let Some(view) = reader.next().unwrap() {
+            let prices_all = f64s(view.column("price").unwrap());
+            let times_all = i32s(view.column("time").unwrap());
+            let side_all = i32s(view.column("side").unwrap());
+            let price_col = view.column("price").unwrap();
+            let side_col = view.column("side").unwrap();
+            for i in 0..view.length() {
+                let sym = view.column("sym").unwrap().string_at(i).unwrap().to_string();
+                let price_ok = is_valid_at(price_col, i);
+                let side_ok = is_valid_at(side_col, i);
+                out.push((
+                    sym,
+                    times_all[i],
+                    if price_ok { Some(prices_all[i]) } else { None },
+                    if side_ok { Some(side_all[i]) } else { None },
+                ));
+            }
+        }
+        reader.close().unwrap();
+        out
+    };
+
+    let (data1, expected) = parallel_opts_sample();
+    let (data2, _) = parallel_opts_sample();
+    let root1 = dir.join("serial");
+    create_table(&root1, data1, PartitionScheme::Month, TableOptions { max_parallelism: Some(1) }).unwrap();
+    let root2 = dir.join("par");
+    create_table(&root2, data2, PartitionScheme::Month, TableOptions { max_parallelism: Some(8) }).unwrap();
+
+    let rows1 = read_rows(&root1);
+    let rows2 = read_rows(&root2);
+    // 期望输出序：分区名 ASC（2026-08 → 2026-09），分区内保持源行序
+    let sep_start = splayed_table::days_from_civil(2026, 9, 1) as i32;
+    let mut expected_out: Vec<_> = expected.iter().filter(|r| r.1 < sep_start).cloned().collect();
+    expected_out.extend(expected.iter().filter(|r| r.1 >= sep_start).cloned());
+    assert_eq!(rows1.len(), 18);
+    assert_eq!(rows1, expected_out, "serial (max_parallelism=1) 内容/行序/NULL 不符");
+    assert_eq!(rows1, rows2, "并行 (max_parallelism=8) 与串行结果不一致");
+    cleanup(&dir);
+}
+
+/// 空数据（0 行）：仅创建根目录并返回 Ok，不创建任何分区。
+#[test]
+fn create_table_empty_data_creates_root() {
+    let dir = temp_dir("create_empty");
+    let root = dir.join("tbl");
+    let data = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+        ]),
+        vec![
+            Column::from_dict(Vec::new(), vec![0u64, 0], Vec::new(), None),
+            Column { data_type: DataType::Date32, values: Buffer::from_vec(Vec::new()), validity: None, dict: None },
+        ],
+    )
+    .unwrap();
+    create_table(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
+    assert!(root.is_dir());
+    assert!(std::fs::read_dir(&root).unwrap().next().is_none()); // 无任何子项
     cleanup(&dir);
 }

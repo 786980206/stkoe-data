@@ -8,11 +8,12 @@ use std::path::{Path, PathBuf};
 use splayed_core::{CreateDatasetOptions, create_dataset, open_dataset, CoreError, DatasetHandle, Mode};
 use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeType};
 
-use crate::partition::{partition_name, partition_range, PartitionScheme};
+use crate::partition::{civil_from_days, partition_name, partition_range, value_to_days, PartitionScheme};
 
-/// Table Options：`max_parallelism` 下沉为每个 Partition `DatasetHandle` 的 Field 级
-/// 并行上限（驱动 write_dataset / scan_dataset 的并行分桶）；create_table 跨分区
-/// 创建目前仍为顺序执行。
+/// Table Options：`max_parallelism` 是 Table 内部并行**总预算**——create_table 按
+/// `P_part × P_field ≤ max_parallelism` 在「分区并行 × Field 并行」之间切分，
+/// 并下沉为每个 Partition `DatasetHandle` 的 Field 级并行上限（驱动
+/// write_dataset / scan_dataset 的并行分桶），避免多层并发无上界叠加。
 #[derive(Debug, Clone, Default)]
 pub struct TableOptions {
     pub max_parallelism: Option<usize>,
@@ -243,125 +244,89 @@ pub(crate) fn time_value_at(time_col: &splayed_format::ColumnView<'_>, i: usize)
 }
 
 /// 按行索引集从 Data 聚出子 Data（保持行序；sym/time/字段全部聚集）。
-pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreError> {
-    let rows = indices.len();
-    // 快路径：indices 连续时按 buffer 切片（O(cols) 而非 O(rows × cols)）
-    let contiguous = indices.windows(2).all(|w| w[1] == w[0] + 1);
-    if contiguous && !indices.is_empty() {
-        let start = indices[0];
-        let mut columns = Vec::with_capacity(data.schema.fields.len());
-        for field in &data.schema.fields {
-            let col = data.column(&field.name).expect("schema iteration guarantees");
-            let column = match &col.dict {
-                Some(_dict) => {
-                    // Utf8 字典列：切片 keys（共享字典不安全 → 重建局部字典）
-                    let view = col.as_view();
-                    let mut new_keys: Vec<u32> = Vec::with_capacity(rows);
-                    let mut new_dict: HashMap<String, u32> = HashMap::new();
-                    let mut new_order: Vec<String> = Vec::new();
-                    let mut new_offsets = vec![0u64];
-                    let mut new_strings: Vec<u8> = Vec::new();
-                    for i in start..start + rows {
-                        if let Some(sv) = view.string_at(i) {
-                            let id = *new_dict.entry(sv.to_owned()).or_insert_with(|| {
-                                new_order.push(sv.to_owned());
-                                new_order.len() as u32 - 1
-                            });
-                            new_keys.push(id);
-                        } else {
-                            new_keys.push(0);
-                        }
-                    }
-                    for s in &new_order {
-                        new_strings.extend_from_slice(s.as_bytes());
-                        new_offsets.push(new_strings.len() as u64);
-                    }
-                    Column::from_dict(new_keys, new_offsets, new_strings, col.validity.clone())
-                }
-                None => {
-                    let size = field.data_type.size_of();
-                    let byte_start = start * size;
-                    let byte_len = rows * size;
-                    let values = Buffer::from_vec(
-                        col.values.as_slice()[byte_start..byte_start + byte_len].to_vec(),
-                    );
-                    let validity = col.validity.as_ref().map(|bm| {
-                        let extracted = bm.extract_bits(start, rows).unwrap_or_else(|_| {
-                            splayed_format::Bitmap::zeros(rows).as_view().as_raw().to_vec()
-                        });
-                        splayed_format::Bitmap::from_bytes(extracted, rows)
-                    });
-                    Column { data_type: field.data_type, values, validity, dict: None }
-                }
-            };
-            columns.push(column);
-        }
-        return Data::new(data.schema.clone(), columns).map_err(CoreError::from);
-    }
-    let mut columns = Vec::new();
+/// 连续行片段：(输入行起点, 行数)；分区片段按输入行序排列。
+type RowSpan = (usize, usize);
+
+/// 把 `data` 中若干**连续行片段**（按序）拼接为新的 owned `Data`（分区 gather）。
+///
+/// 批量拼接原则：
+/// - 定宽列：目标缓冲一次预分配，逐片段 `copy_from_slice`（每片段一次 memcpy，不逐行）；
+/// - Utf8 字典列：`remap` 表把全局字典 id 映射为分区局部 id（首现序），字符串仅在
+///   首现时拷贝一次；逐行只做 u32 键读取 + 查表，无 String 分配、无哈希表；
+/// - validity：`Bitmap::copy_bits_from` 逐片段位拼接（word 级批量，不逐 bit）；
+///   源列无 validity → 目标无 validity；拼接后全 1 → 收缩为 None（全有效）。
+pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreError> {
+    let total: usize = runs.iter().map(|&(_, len)| len).sum();
+    let mut columns = Vec::with_capacity(data.schema.fields.len());
     for field in &data.schema.fields {
         let col = data.column(&field.name).expect("schema iteration guarantees");
-        let column = match field.data_type {
-            DataType::Utf8 => {
-                // 字典列：重建分区局部字典
-                let mut dict: HashMap<String, u32> = HashMap::new();
-                let mut order: Vec<String> = Vec::new();
-                let mut keys: Vec<u32> = Vec::with_capacity(rows);
-                let mut bits: Vec<u8> = vec![0u8; (rows + 7) / 8];
-                for (out_i, &src) in indices.iter().enumerate() {
-                    match col.as_view().string_at(src) {
-                        Some(s) => {
-                            let id = *dict.entry(s.to_owned()).or_insert_with(|| {
-                                order.push(s.to_owned());
-                                order.len() as u32 - 1
-                            });
-                            keys.push(id);
-                            bits[out_i / 8] |= 1 << (out_i % 8);
-                        }
-                        None => {}
+        let column = match &col.dict {
+            Some(dict) => {
+                // Utf8 字典列：remap 重建分区局部字典（NULL 行同样压键，由 validity 屏蔽）
+                let dict_offsets = dict.offsets.as_slice();
+                let dict_strings = dict.strings.as_slice();
+                let n_dict = dict_offsets.len() / 8 - 1;
+                let mut remap: Vec<u32> = vec![u32::MAX; n_dict];
+                let mut new_keys: Vec<u32> = Vec::with_capacity(total);
+                let mut new_offsets: Vec<u64> = vec![0];
+                let mut new_strings: Vec<u8> = Vec::new();
+                let mut dict_count: u32 = 0;
+                let keys = col.values.as_slice();
+                for &(start, len) in runs {
+                    let row_keys = &keys[start * 4..(start + len) * 4];
+                    for kb in row_keys.chunks_exact(4) {
+                        let k = u32::from_le_bytes(kb.try_into().unwrap()) as usize;
+                        let id = match remap[k] {
+                            u32::MAX => {
+                                let lo = u64::from_le_bytes(
+                                    dict_offsets[k * 8..k * 8 + 8].try_into().unwrap(),
+                                ) as usize;
+                                let hi = u64::from_le_bytes(
+                                    dict_offsets[k * 8 + 8..k * 8 + 16].try_into().unwrap(),
+                                ) as usize;
+                                new_strings.extend_from_slice(&dict_strings[lo..hi]);
+                                new_offsets.push(new_strings.len() as u64);
+                                // id 独立计数（new_offsets[0] 为哨兵，不能以 len-1 推 id）
+                                let id = dict_count;
+                                dict_count += 1;
+                                remap[k] = id;
+                                id
+                            }
+                            mapped => mapped,
+                        };
+                        new_keys.push(id);
                     }
                 }
-                let mut offsets = vec![0u64];
-                let mut strings: Vec<u8> = Vec::new();
-                for s in &order {
-                    strings.extend_from_slice(s.as_bytes());
-                    offsets.push(strings.len() as u64);
-                }
+                let validity = gather_validity(&col.validity, runs, total)?;
                 Column {
                     data_type: DataType::Utf8,
                     values: Buffer::from_vec(
-                        keys.iter().flat_map(|k| k.to_le_bytes()).collect::<Vec<u8>>(),
+                        new_keys.iter().flat_map(|k| k.to_le_bytes()).collect::<Vec<u8>>(),
                     ),
-                    validity: Some(splayed_format::Bitmap::from_bytes(bits, rows)),
+                    validity,
                     dict: Some(DictBuffers {
                         offsets: Buffer::from_vec(
-                            offsets.iter().flat_map(|o| o.to_le_bytes()).collect(),
+                            new_offsets.iter().flat_map(|o| o.to_le_bytes()).collect::<Vec<u8>>(),
                         ),
-                        strings: Buffer::from_vec(strings),
+                        strings: Buffer::from_vec(new_strings),
                     }),
                 }
             }
-            fixed => {
-                let size = fixed.size_of();
-                let mut values = Buffer::zeroed_aligned(rows * size, 8);
+            None => {
+                let size = field.data_type.size_of();
+                let mut values = Buffer::zeroed_aligned(total * size, 8);
                 {
                     let dst = values.as_mut_slice();
                     let src = col.values.as_slice();
-                    for (out_i, &src_i) in indices.iter().enumerate() {
-                        dst[out_i * size..(out_i + 1) * size]
-                            .copy_from_slice(&src[src_i * size..(src_i + 1) * size]);
+                    let mut out = 0usize;
+                    for &(start, len) in runs {
+                        dst[out..out + len * size]
+                            .copy_from_slice(&src[start * size..(start + len) * size]);
+                        out += len * size;
                     }
                 }
-                let validity = col.validity.as_ref().map(|bm| {
-                    let mut bits = vec![0u8; (rows + 7) / 8];
-                    for (out_i, &src_i) in indices.iter().enumerate() {
-                        if bm.as_view().is_valid(src_i) {
-                            bits[out_i / 8] |= 1 << (out_i % 8);
-                        }
-                    }
-                    splayed_format::Bitmap::from_bytes(bits, rows)
-                });
-                Column { data_type: fixed, values, validity, dict: None }
+                let validity = gather_validity(&col.validity, runs, total)?;
+                Column { data_type: field.data_type, values, validity, dict: None }
             }
         };
         columns.push(column);
@@ -369,14 +334,106 @@ pub(crate) fn gather_data(data: &Data, indices: &[usize]) -> Result<Data, CoreEr
     Data::new(data.schema.clone(), columns).map_err(CoreError::from)
 }
 
-/// 创建完整 Table（`none` → 根目录 Dataset；year/month/date → 按 time 切分 Partition）。
-/// 分区创建并行执行（每分区一个线程，尚未接入 `max_parallelism` 上限，与
-/// `create_dataset` 内部的 Field 级并行嵌套）；gather 在主线程串行执行；
-/// 不改变 Partition 内数据顺序。
-pub fn create_table(
-    table_path: &Path,
+/// 逐片段位拼接 validity（`Bitmap::copy_bits_from` word 级批量）；
+/// 源列无 validity → None（全有效）；拼接后无一个 NULL → 收缩为 None。
+fn gather_validity(
+    validity: &Option<splayed_format::Bitmap>,
+    runs: &[RowSpan],
+    total: usize,
+) -> Result<Option<splayed_format::Bitmap>, CoreError> {
+    let src = match validity {
+        Some(bm) => bm,
+        None => return Ok(None),
+    };
+    let src_view = src.as_view();
+    let mut dst = splayed_format::Bitmap::zeros(total);
+    let mut out = 0usize;
+    for &(start, len) in runs {
+        let piece = src_view.slice(start, len).map_err(CoreError::from)?;
+        dst.copy_bits_from(out, &piece, len);
+        out += len;
+    }
+    if dst.count_ones() == total {
+        Ok(None) // 全有效：不落 validity 区
+    } else {
+        Ok(Some(dst))
+    }
+}
+
+/// 分区粗键：同 key ⇒ 同分区名（整数判别，避免逐行构造分区名字符串）。
+fn partition_key(scheme: PartitionScheme, value: i64, tt: TimeType) -> i64 {
+    match scheme {
+        PartitionScheme::Date => value_to_days(value, tt),
+        PartitionScheme::Year | PartitionScheme::Month => {
+            let (y, m, _) = civil_from_days(value_to_days(value, tt));
+            match scheme {
+                PartitionScheme::Year => y,
+                _ => y * 12 + i64::from(m) - 1,
+            }
+        }
+        PartitionScheme::None => 0,
+    }
+}
+
+/// 一次线性扫描 time 列，产出每个分区的**连续行片段**（片段按输入行序）。
+///
+/// 输入按 (sym ASC, time ASC) 契约有序 → sym run 内 time 单调 → 同名分区的行
+/// 在输入中连续成段（片段可跨 sym 边界，拼接后分区内仍保持 (sym, time) 序）；
+/// 分区名字符串只在换段时构造（段内用整数粗键判别，无逐行分配）。
+fn partition_spans(
     data: &Data,
     scheme: PartitionScheme,
+    tt: TimeType,
+) -> Result<Vec<(String, Vec<RowSpan>)>, CoreError> {
+    let time_view = data.column("time").unwrap().as_view();
+    let mut buckets: HashMap<String, Vec<RowSpan>> = HashMap::new();
+    let mut cur_key: Option<i64> = None;
+    let mut cur_first_t = 0i64;
+    let (mut cur_start, mut cur_len) = (0usize, 0usize);
+    for i in 0..data.length() {
+        let t = time_value_at(&time_view, i)?;
+        let key = partition_key(scheme, t, tt);
+        match cur_key {
+            Some(k) if k == key => cur_len += 1,
+            _ => {
+                if let Some(_) = cur_key {
+                    let name = partition_name(scheme, cur_first_t, tt);
+                    buckets.entry(name).or_default().push((cur_start, cur_len));
+                }
+                cur_key = Some(key);
+                cur_first_t = t;
+                cur_start = i;
+                cur_len = 1;
+            }
+        }
+    }
+    if cur_key.is_some() {
+        let name = partition_name(scheme, cur_first_t, tt);
+        buckets.entry(name).or_default().push((cur_start, cur_len));
+    }
+    let mut names: Vec<String> = buckets.keys().cloned().collect();
+    names.sort();
+    Ok(names
+        .into_iter()
+        .map(|n| {
+            let runs = buckets.remove(&n).expect("name from keys");
+            (n, runs)
+        })
+        .collect())
+}
+
+/// 创建完整 Table（`none` → 根目录 Dataset；year/month/date → 按 time 切分 Partition）。
+///
+/// 并发模型：主线程一次线性扫描产出分区**连续片段** → 分区并行创建（round-robin
+/// 分桶），并行预算切分 `P_part × P_field ≤ max_parallelism`（与 create_dataset
+/// 内部的 Field 级并行共享总预算，消除无上界嵌套）；分区 gather 在各工作线程内
+/// 批量拼接（连续片段 memcpy + validity word 级位拼接）。失败语义：单分区原子
+/// （tmp + rename），已创建分区保留、不回滚；不改变 Partition 内数据顺序。
+pub fn create_table(
+    table_path: &Path,
+    data: Data,
+    scheme: PartitionScheme,
+    options: TableOptions,
 ) -> Result<(), CoreError> {
     if table_path.exists() {
         return Err(CoreError::AlreadyExists(table_path.to_path_buf()));
@@ -384,42 +441,73 @@ pub fn create_table(
     if data.column("sym").is_none() || data.column("time").is_none() {
         return Err(CoreError::Invalid("table input requires sym and time columns".into()));
     }
-    if scheme == PartitionScheme::None {
-        return create_dataset(table_path, data.clone(), CreateDatasetOptions::default());
-    }
     let tt = infer_tt(data.column("time").unwrap().data_type)?;
-    let time_view = data.column("time").unwrap().as_view();
-    // 按 time 分桶（保持行序：输入 (sym,time) 有序 → 桶内有序）
-    let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
-    for i in 0..data.length() {
-        let t = time_value_at(&time_view, i)?;
-        buckets
-            .entry(partition_name(scheme, t, tt))
-            .or_default()
-            .push(i);
+    let max_p = options
+        .max_parallelism
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+        .max(1);
+    if data.length() == 0 {
+        // 空数据：仅创建根目录（无 META、无分区；open_table 发现为空表）
+        fs::create_dir_all(table_path).map_err(CoreError::Io)?;
+        return Ok(());
     }
-    let mut names: Vec<String> = buckets.keys().cloned().collect();
-    names.sort();
-    // 并行分区创建：每个分区独立目录，无共享状态
-    std::thread::scope(|scope| {
+    if scheme == PartitionScheme::None {
+        // 单 Dataset 快速路径：列所有权直接移动，不克隆
+        return create_dataset(table_path, data, CreateDatasetOptions { max_parallelism: max_p });
+    }
+    // ① 主线程：一次线性扫描 → 每分区连续行片段（分区名仅换段时构造）
+    let buckets = partition_spans(&data, scheme, tt)?;
+    // ② 并行创建分区：P_part × P_field ≤ max_parallelism 预算切分
+    let p_part = max_p.min(buckets.len());
+    if p_part <= 1 {
+        // 单分区 / 并行度 1：串行创建，Field 级并行拿满预算
+        for (name, runs) in buckets {
+            let sub = gather_runs(&data, &runs)?;
+            create_dataset(
+                &table_path.join(&name),
+                sub,
+                CreateDatasetOptions { max_parallelism: max_p },
+            )?;
+        }
+        return Ok(());
+    }
+    let p_field = (max_p / p_part).max(1);
+    let mut groups: Vec<Vec<(String, Vec<RowSpan>)>> = vec![Vec::new(); p_part];
+    for (i, bucket) in buckets.into_iter().enumerate() {
+        groups[i % p_part].push(bucket);
+    }
+    // 共享引用先行绑定：move 闭包只捕获 &Data，不移动本体
+    let data_ref = &data;
+    std::thread::scope(|s| {
         let mut handles = Vec::new();
-        for name in &names {
-            let indices = &buckets[name];
-            let sub = gather_data(data, indices)?;
-            if sub.length() == 0 {
-                continue;
-            }
-            let dir = table_path.join(name);
-            handles.push(scope.spawn(move || {
-                splayed_core::create_dataset(&dir, sub, splayed_core::CreateDatasetOptions::default())
+        for group in groups {
+            handles.push(s.spawn(move || -> Result<(), CoreError> {
+                for (name, runs) in group {
+                    // 分区内 gather（批量拼接）+ create_dataset（Field 级并行 p_field）
+                    let sub = gather_runs(data_ref, &runs)?;
+                    create_dataset(
+                        &table_path.join(&name),
+                        sub,
+                        CreateDatasetOptions { max_parallelism: p_field },
+                    )?;
+                }
+                Ok(())
             }));
         }
+        let mut first_err: Option<CoreError> = None;
         for h in handles {
-            h.join().map_err(|_| CoreError::Invalid("partition thread panicked".into()))??;
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(_) => {
+                    first_err.get_or_insert(CoreError::Invalid("partition thread panicked".into()));
+                }
+            }
         }
-        Ok::<_, CoreError>(())
-    })?;
-    Ok(())
+        first_err.map_or(Ok(()), Err)
+    })
 }
 
 /// 新增单个 Partition / Dataset（partition_name 必须符合既有 scheme 且不存在）。
@@ -448,9 +536,12 @@ pub fn create_table_partition(
     if data.length() == 0 {
         return Err(CoreError::Invalid("partition data must not be empty".into()));
     }
-    let indices: Vec<usize> = (0..data.length()).collect();
-    let sub = gather_data(&data, &indices)?;
-    splayed_core::create_dataset(&table_path.join(partition_name), sub, splayed_core::CreateDatasetOptions::default())
+    // 列所有权直接移交（整段数据无需 gather）
+    splayed_core::create_dataset(
+        &table_path.join(partition_name),
+        data,
+        splayed_core::CreateDatasetOptions::default(),
+    )
 }
 
 /// 删除整个 Table（根目录及全部 Partition Dataset）。
