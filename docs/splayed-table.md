@@ -91,7 +91,7 @@ pub struct TableOptions { /* max_parallelism: Option<usize> */ }
 pub struct TableScanRequest {
     pub sym: Option<String>,        // Table-level symbol 条件（不参与 Partition pruning）
     pub time: Option<(i64, i64)>,   // Table-level 时间条件（参与 pruning，同时下传做精确过滤）
-    pub predicate: Option<Predicate>, // Table 逻辑谓词（可提取 pruning 时间条件，其余 residual 下传）
+    pub predicate: Option<Predicate>, // Table 逻辑谓词（不参与 pruning，完整下传 Dataset 精确过滤）
     pub projection: Vec<String>,    // Table-level projection（跨 Partition 一致）
     pub limit: Option<u64>,         // Table-level 全局 limit
 }
@@ -101,7 +101,7 @@ pub struct TableScanRequest {
 - 独立于 core `ScanRequest`；Table 层不把 sym / time 条件提前转换成 row ranges——row range 由 Dataset scan 产生。
 - `sym`：不参与 Partition pruning，直接传给 Dataset scan。
 - `time`：参与 Partition pruning，同时继续传给 Dataset scan。
-- `predicate`：Table 逻辑条件；可从中提取可 pruning 的时间条件，其余作为 residual predicate 下传。
+- `predicate`：Table 逻辑条件；**不参与 Partition pruning**，完整下传 Dataset 做精确过滤（裁剪是粗筛，不能因已裁剪而剥离任何条件）。
 - `projection`：跨 Partition 保持一致。
 - `limit`：Table 级**全局** limit，按 Partition 顺序扫描时以剩余量下推。
 
@@ -119,7 +119,7 @@ pub struct PartitionRowRange {
 
 **接口定义**：
 ```rust
-impl TableScanner {
+impl TableScanner<'t> {
     pub fn next(&mut self) -> Result<Option<PartitionRowRange>, CoreError>
     pub fn close(self) -> Result<(), CoreError>
 }
@@ -143,6 +143,7 @@ pub struct TableMetadata {
     pub partitioning: Partitioning,         // { kind: "time", scheme: none|year|month|date }
     pub capabilities: Capabilities,         // { projection_pushdown, predicate_pushdown, limit_pushdown }
     pub partitions: Vec<PartitionInfo>,     // { name, time_min, time_max }；等价于 list_table_partitions
+                                            // time_min / time_max 为分区含端点名义范围（纯推导，非实际统计）
 }
 pub struct TableStatistics {
     pub row_count: u64,            // 各 Partition 求和
@@ -299,6 +300,12 @@ pub fn delete_table(table_path: &Path) -> Result<(), CoreError>
 | `table_path` | `&Path` | 输入 | Table 根目录 |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 根目录及全部 Partition 已删除 |
 
+**内部实现流程**：
+```
+① 主线程：table_path 存在性校验（不存在 → NotFound）
+② fs::remove_dir_all 递归删除（文件系统调用，无用户态遍历）
+```
+
 **说明**：
 - 删除 Table 根目录及全部 Partition Dataset；**不逐 Partition 并行删除**——文件系统级
   递归删除（remove_dir_all）比用户态遍历更快且无锁竞争。
@@ -320,6 +327,13 @@ pub fn rename_table(table_path: &Path, new_name: &str) -> Result<(), CoreError>
 | `table_path` | `&Path` | 输入 | Table 根目录 |
 | `new_name` | `&str` | 输入 | 新 Table 名（同一父目录内）；对应目录已存在 → Error |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 原子重命名完成 |
+
+**内部实现流程**：
+```
+① 主线程：new_name 合法性（非空 / 无路径分隔符 / 无 =）→ old_path 存在（NotFound）
+        → 目标不存在（AlreadyExists）
+② fs::rename 同目录原子重命名
+```
 
 **说明**：
 - 纯目录级 rename：Partition 目录名、META、Field 全部原样，不涉及 core 调用与数据改写——
@@ -346,9 +360,22 @@ impl TableHandle { pub fn close(mut self) -> Result<(), CoreError> }
 | `options` | `TableOptions` | 输入 | Table 级选项；`max_parallelism` 下沉为各 Partition DatasetHandle 的 Field 级并行上限 |
 | 返回 | `Result<TableHandle, CoreError>` | 输出 | Table 生命周期 Handle |
 
+**内部实现流程**：
+```
+open_table  ① 主线程：table_path 存在校验（NotFound）
+            ② scheme 推断：根目录含 .meta → none；否则按子目录前缀（year=/month=/date=）
+               推断（无任何分区 → Error「cannot infer partition scheme」——空表不可打开）
+            ③ 构造 TableHandle（datasets / stats_cache 均为空——Dataset 与逐分区统计
+               全部按需惰性打开 / memo）
+close_table ≡ handle.close()：drain 全部缓存的 DatasetHandle（逐个 close_field_handle
+               收尾 compressed 写路径）→ 关闭 META；close 后 Handle 不可再用
+```
+
 **说明**：
 - 只打开 Table 元信息与 Partition 组织信息；不提前打开任何 Dataset。
 - `partition_scheme` 记录在 `TableHandle` 中；`none` 模式记录为「Table 直接对应根目录 Dataset」。
+- 空表（0 行 create_table 产出的裸根目录）无 .meta、无分区目录 → open_table 报错；
+  需先 `create_table_partition` 建立分区或重新 `create_table`。
 - `close_table(handle)` 与 `handle.close()` 等价；close 后 Handle 不可再用。
 
 ### 4.6 Field 结构操作（create / delete / update / rename / cast / compress / decompress）
@@ -640,7 +667,7 @@ pub fn query_table(table: &TableHandle, request: TableScanRequest,
 | `table` | `&TableHandle` | 输入 | 已打开的 Table Handle |
 | `request` | `TableScanRequest` | 输入 | 语义与 `scan_table` 完全一致 |
 | `batch_size` | `Option<usize>` | 输入 | 语义与 `read_table` 完全一致 |
-| 返回 | `Result<TableReader, CoreError>` | 输出 | 组合入口 Reader（内部持有 Scanner 状态） |
+| 返回 | `Result<TableReader<'_>, CoreError>` | 输出 | 组合入口 Reader（内部持有 Scanner 状态，借用 table） |
 
 **内部实现**：
 ```
@@ -655,17 +682,33 @@ query_table(table, request, batch_size)
 - 输出顺序（Partition ASC + sym/time ASC）、batch 聚合、零拷贝多 segment 拼接等语义与分离使用时完全一致。
 - `scan_table` + `read_table` 分离形式保留：供需要两阶段控制的上层使用（先检查扫描范围再读取、跨 Table 交错调度等）。
 
-### 4.13 read_table_statistics 之外的辅助（peek_time_type）
+### 4.13 peek_time_type（内部辅助）
 
 **接口定义**：
 ```rust
 impl TableHandle {
-    pub(crate) fn peek_time_type(&self) -> TimeType   // 内部使用；来自任一 Partition META header
+    pub(crate) fn peek_time_type(&self) -> Result<TimeType, CoreError>
 }
 ```
 
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| 返回 | `Result<TimeType, CoreError>` | 输出 | META header 记录的时间类型（Date32 / TimestampUs）；无分区 → Error |
+
+**内部实现流程**：
+```
+① 缓存命中（time_type: RefCell<Option<TimeType>>）→ 直接返回
+② 未命中：none 模式读根目录 .meta；分区模式读第一个分区（名 ASC）.meta
+   → 仅读 64B META header（from_bytes + validate → time_type()），
+     不经 DatasetHandle 打开（保持 scan / 元数据读路径的惰性）
+③ 结果缓存，后续调用零 I/O
+```
+
 **说明**：
-- 供 scan_table / read_table_metadata 做 pruning 与 partition_range 计算；不作为 public API 暴露。
+- 供 `scan_table`（时间裁剪的 partition_range 计算）与 `read_table_metadata` 使用；不作为 public API 暴露。
+- TIME AXIS 不可变（META immutable），推断结果按 Handle 生命周期缓存安全。
 
 ### 4.14 write_table
 
@@ -733,7 +776,7 @@ write_table → locate_dataset_index + write_dataset → write_field_handle / lo
 | --- | --- |
 | `create_table` / `create_table_partition` | `create_dataset`（间接 `create_meta_file` / `create_field_file`） |
 | `delete_table` / `delete_table_partition` | `delete_dataset` |
-| `create / delete / update / rename / cast_table_field` | 对应 `create_dataset_field` / `delete_dataset_field` / `update_dataset_field_header` / `rename_dataset_field` / `cast_dataset_field` |
+| `create / delete / update / rename / cast / compress / decompress_table_field` | 对应 `create_dataset_field` / `delete_dataset_field` / `update_dataset_field_header` / `rename_dataset_field` / `cast_dataset_field` / `compress_dataset_field` / `decompress_dataset_field` |
 | `read_table_schema` / `read_table_statistics` | `read_dataset_schema` / `read_dataset_statistics` |
 | `scan_table` | `scan_dataset`（内部 `scan_index_handle` + `scan_field_handle`） |
 | `read_table` | `read_dataset`（内部 `read_field_handle`） |
@@ -749,7 +792,6 @@ Table 层只依赖 Dataset 级 API，不直接持有 MetaHandle / FieldHandle。
 | INSERT 追加到已有 Partition | 暂缓 | 扩大容量 / 新增 sym / 扩大 time 需要重建 Dataset（core 不提供原地 API）；新数据目前只能走 `create_table_partition` |
 | 行级 DELETE | 暂缓 | 无行级删除 API；整 Partition 删除可用 `delete_table_partition` |
 | UPSERT / MERGE INTO | 暂缓 | — |
-| `write_table` | 未实现 | 设计契约见 §4.14；实现前新数据走 `create_table_partition` |
 | `create_table_field` 的 data / stream 初始化 | 未实现 | 当前仅全 NULL 形态（`DatasetFieldInit::AllNull`） |
 
 ## 7. SQL 域映射（参考）
@@ -768,7 +810,7 @@ Table 层只依赖 Dataset 级 API，不直接持有 MetaHandle / FieldHandle。
 | `COPY TO`（初始化） | `create_table` | `create_dataset` |
 | `INSERT`（新 Partition） | `create_table_partition` | `create_dataset` |
 | `INSERT`（追加已有 Partition） | 暂缓 | 重建 Dataset |
-| `UPDATE`（覆盖已有行） | `write_table`（未实现） | `locate_dataset_index` + `write_dataset` |
+| `UPDATE`（覆盖已有行） | `write_table` | `locate_dataset_index` + `write_dataset` |
 | `DELETE`（按 Partition） | `delete_table_partition` | `delete_dataset` |
 | `DELETE`（行级） | 暂缓 | — |
 | `SELECT` | `query_table`（等价 `scan_table` + `read_table`） | `scan_dataset` + `read_dataset` |
