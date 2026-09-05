@@ -211,13 +211,20 @@ pub(crate) fn write_meta_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreErr
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    {
+    let result = (|| -> Result<(), CoreError> {
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&tmp)?;
         f.write_all(bytes)?;
+        // tmp 完整落盘后再原子替换：rename 生效时新 META 内容已持久
+        f.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return result;
     }
     fs::rename(&tmp, path)?;
     Ok(())

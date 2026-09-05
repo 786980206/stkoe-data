@@ -34,6 +34,8 @@
 ## 10. Benchmark vs Parquet（V2.0 首轮基线，2026-09）
 
 数据：64 sym × 250 行 = 16K 行 × 4 列（sym/time/price/volume），按月分区。
+首轮基线后已落地一批优化（Field 读/写、Scanner 批量管线、META 构建轴二分、
+close/cast/compress/decompress 流式化，见 §8 性能审查记录），尚未计入下表，待统一复测。
 基准：`crates/splayed-table/benches/vs_parquet.rs`（criterion；对照 arrow-rs parquet 56）。
 
 | 路径 | splayed | parquet | 差距 |

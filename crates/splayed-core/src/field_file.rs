@@ -69,29 +69,6 @@ fn map_io(path: &Path, e: std::io::Error) -> CoreError {
     }
 }
 
-/// 把一个 ColumnView 的内容克隆为拥有字节（values, validity, rows）。
-/// 无任何位图的列返回 `validity = None`（全有效）；混有位图的段按全 1 补齐。
-/// 注意：validity 为逐段字节对齐拼接，段边界非字节对齐时不能跨段按全局位消费。
-#[allow(dead_code)]
-pub(crate) fn clone_view(view: &ColumnView<'_>) -> (Vec<u8>, Option<Vec<u8>>, usize) {
-    let mut values = Vec::with_capacity(view.length() * view.data_type().size_of());
-    let mut bits: Vec<u8> = Vec::new();
-    let mut had_bitmap = false;
-    for seg in view.segments() {
-        values.extend_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
-        let packed = match seg.validity() {
-            Some(bm) => {
-                had_bitmap = true;
-                bm.to_packed_bytes()
-            }
-            None => vec![0xFFu8; (seg.rows() + 7) / 8],
-        };
-        bits.extend_from_slice(&packed);
-    }
-    let validity = had_bitmap.then_some(bits);
-    (values, validity, view.length())
-}
-
 /// 创建并初始化一个 Field 文件（创建完成后才可被 `open_field_file` 打开）。
 ///
 /// 统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填。

@@ -42,3 +42,16 @@ close()  -> Result<()>           // 任何时刻可安全调用
 ```
 
 **设计原则**：core API 保持薄，只有上层真正需要的能力才下沉到 core。
+
+**实现原则**（各 API 的内部流程见对应文档；性能审查记录见 [design-boundary](core/design-boundary.md)）：
+
+- 读零拷贝：`read_field_handle` 只做逻辑行范围 → `ColumnView` 转换（PLAIN mmap 切片 / compressed working 切片），
+  不复制、不合并、不求谓词；compressed 定位为 chunk_ends 二分。
+- 写批量位操作：values 逐段 memcpy；validity 按字节/word 批量（头尾掩码 RMW、中间同相位 memcpy、
+  word popcount），不逐 bit；null_count 按覆盖区前后 1 位数增量维护。
+- 扫描批量管线：候选 ranges 顺序直接消费（不 merge）；整段连续 values 类型化比较循环（可自动向量化）
+  → 0/1 字节掩码根部统一 validity 求交 → 打包位图 → word 级连续命中区输出。
+- META 构建连续子区间原则：每个 sym 的 time 必须是 TIME AXIS 的连续子区间，SYM INDEX 只存
+  `row_start + time_start + time_count`；轴定位二分（无哈希表），span == 数据行数构建期校验。
+- 结构操作流式：close（compressed 收尾）/ cast / compress / decompress 均 tmp 顺序写 + `sync_all`
+  后原子 rename，内存 O(批次 / 单个 chunk)，不全量物化、不全量解压；失败清理 tmp，原文件保持不变。

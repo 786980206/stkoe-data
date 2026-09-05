@@ -44,7 +44,8 @@ serialize  →  header(64B) + TIME AXIS + DICT OFFSETS(n+1)×u64
 
 **write_meta_atomic 内部实现**：
 ```
-File::create(path.tmp) → write_all(bytes) → drop → fs::rename(tmp, path)
+写 path.tmp（create + truncate）→ write_all(bytes) → sync_all（tmp 完整落盘）
+→ fs::rename(tmp, path) 原子替换；失败清理 tmp，旧 META 保持不变
 ```
 
 - `data`：按 `(sym ASC, time ASC)` 排序的 sym / time 两列逻辑数据。

@@ -21,13 +21,16 @@
 
 ### 5.1 create_field_file
 
-**内部实现**：
+**内部实现**（统一三阶段顺序写：HEADER 占位 → DATA 顺序写 → VALIDITY 顺序写 → HEADER 回填）：
 ```
-length(n)  →  File::create_new(path) → 写 64B header → set_len(64+data+validity)
-                （OS 零填充，无需显式写 NULL）
-data(col)  →  File::create_new → 写 header → write_all(values) → write_all(validity_bits)
-stream(r)  →  File::create_new → 写占位 header → 循环 write_all(values)+write_all(bits)
-                → seek(0) 回填 header（row_count/data_length/null_count）
+占位      →  写 64B 零填充 HEADER
+DATA      →  length(n)：set_len(64+data+validity)，DATA + VALIDITY 由 OS 零填充（全 NULL）
+              data(col) / stream(r)：循环 write_all(values)（stream 经两相迭代 next_values）
+VALIDITY  →  data(col)：write_all(validity_bits)（全有效不写 validity 区）
+              stream(r)：seek 至 VALIDITY 起 → 循环 next_validity 顺序写
+              → set_len 规整（不足零填充 = NULL；批尾越界填充字节截断）
+回填      →  seek(0) 回填 HEADER（row_count / data_length / null_count；
+              stream 的 null_count 由 validity 位 word 批量 popcount 精确统计）
 ```
 - 三种 init 共用 `File::options().write(true).create_new(true)` 防止覆盖已有文件
 - data 形态全有效时 `has_validity = 0`（不写 validity 区，文件更小）
