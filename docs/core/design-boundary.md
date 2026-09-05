@@ -29,6 +29,13 @@
   `Some(n)` = 聚合路径（range 级截断 + pending 剩余，恰好 n 行不超发——修正旧实现
   「拉满为止」的批次超发；多段 ColumnView 拼接保持零拷贝）；`Some(0)` 显式拒绝。
   pending 存 range 而非 DataView（不可变 → 延迟读等价，避免跨 next() 持有数据借用）。
+- Table 层收尾微优化：structural_for_each 按当前分区集过滤缓存句柄（排除外部删除后
+  的过期句柄——正确性边界）；Scanner/Reader 的 projection 贯通 `Vec<Arc<str>>`（消除
+  Reader 每次 next() 的 Vec<String> 克隆与 Scanner 每分区的 Arc 重建）；statistics
+  归并按缓存引用（无逐分区 DatasetStatistics clone，仅最终 sym 界各 clone 一次）；
+  write_table 分区存在性检查改 HashSet（O(P×B) → O(P+B)）。
+  已记录未做：write_table 的 pairs 逐行 String 分配需 core 提供按 sym-run 的
+  locate 变体方可消除（core API 保持薄，暂不引入）。
 - write_table 三阶段重写：主线程一次扫描（相邻 key 零分配校验 + 粗键分区 run 划分）
   → 全部定位与校验先于任何写入（key 缺失不产生部分写入——强于旧实现的逐分区
   先写后验）→ 分区级并行写（P_part × P_field ≤ max_parallelism 预算切分，Field 级

@@ -694,13 +694,18 @@ impl TableHandle {
     /// 归并（不依赖 default 的 0，修正此前 time_min 恒为 0 的聚合 bug）。
     pub fn read_table_statistics(&self) -> Result<TableStatistics, CoreError> {
         let partitions = self.discover_partitions();
+        // 先确保逐分区统计全部 memo（命中零 I/O），再按引用归并（无逐分区 clone）
+        for p in &partitions {
+            self.partition_stats(p)?;
+        }
+        let cache = self.stats_cache.borrow();
         let mut row_count: u64 = 0;
         let mut time_min: Option<i64> = None;
         let mut time_max: Option<i64> = None;
-        let mut sym_min: Option<String> = None;
-        let mut sym_max: Option<String> = None;
+        let mut sym_min: Option<&str> = None;
+        let mut sym_max: Option<&str> = None;
         for p in &partitions {
-            let s = self.partition_stats(p)?;
+            let s = &cache[p.as_str()];
             row_count = row_count
                 .checked_add(s.row_count)
                 .ok_or_else(|| CoreError::Invalid("row_count overflow in statistics".into()))?;
@@ -712,24 +717,22 @@ impl TableHandle {
                 (None, v) => Some(v),
                 (Some(a), b) => Some(a.max(b)),
             };
-            sym_min = match (&sym_min, &s.sym_min) {
-                (None, None) => None,
-                (opt, None) => opt.clone(),
-                (None, Some(x)) => Some(x.clone()),
-                (Some(a), Some(b)) => Some(a.min(b).clone()),
+            sym_min = match (sym_min, s.sym_min.as_deref()) {
+                (None, Some(x)) => Some(x),
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, None) => a,
             };
-            sym_max = match (&sym_max, &s.sym_max) {
-                (None, None) => None,
-                (opt, None) => opt.clone(),
-                (None, Some(x)) => Some(x.clone()),
-                (Some(a), Some(b)) => Some(a.max(b).clone()),
+            sym_max = match (sym_max, s.sym_max.as_deref()) {
+                (None, Some(x)) => Some(x),
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, None) => a,
             };
         }
         Ok(TableStatistics {
             row_count,
             partition_count: partitions.len() as u32,
-            sym_min,
-            sym_max,
+            sym_min: sym_min.map(str::to_owned),
+            sym_max: sym_max.map(str::to_owned),
             time_min: time_min.unwrap_or(0),
             time_max: time_max.unwrap_or(0),
         })
@@ -806,8 +809,13 @@ impl TableHandle {
             self.dataset_for(p)?;
         }
         let mut guard = self.datasets.borrow_mut();
-        let targets: Vec<&mut DatasetHandle> =
-            guard.values_mut().map(|b| &mut **b).collect();
+        // 仅当前分区集：排除分区被外部删除后残留在缓存的过期句柄
+        let name_set: std::collections::HashSet<&str> =
+            partitions.iter().map(|s| s.as_str()).collect();
+        let targets: Vec<&mut DatasetHandle> = guard
+            .iter_mut()
+            .filter_map(|(k, v)| name_set.contains(k.as_str()).then(|| &mut **v))
+            .collect();
         let p = self
             .options
             .max_parallelism

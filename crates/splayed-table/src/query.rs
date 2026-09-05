@@ -43,7 +43,7 @@ pub struct TableScanner<'t> {
     /// 组合好的**完整**谓词（sym + time + 用户谓词）——裁剪是粗筛，边界分区仍需
     /// Dataset 内精确过滤，不因已做时间裁剪而剥离时间条件
     predicate: Option<Predicate>,
-    pub(crate) projection: Vec<String>,
+    pub(crate) projection: Vec<Arc<str>>,
     /// 全局剩余 limit（逐分区下推 + 返回前防御性裁剪）
     remaining: Option<u64>,
 }
@@ -86,11 +86,7 @@ impl<'t> TableScanner<'t> {
             let ds = self.table.dataset_for(partition)?;
             let core_req = ScanRequest {
                 ranges: vec![],
-                projection: self
-                    .projection
-                    .iter()
-                    .map(|s| Arc::from(s.as_str()))
-                    .collect(),
+                projection: self.projection.clone(),
                 predicate: self.predicate.clone(),
                 limit: self.remaining,
             };
@@ -123,7 +119,7 @@ pub struct TableReader<'t> {
     table: &'t TableHandle,
     scanner: TableScanner<'t>,
     /// `Some(v)` 且 v 非空 = 已展开；`Some(vec![])` / `None` = 待首次 next() 展开。
-    projection: Option<Vec<String>>,
+    projection: Option<Vec<Arc<str>>>,
     batch_size: Option<usize>,
     /// 聚合路径的待消费剩余 range（分区 + 行范围）。
     pending: Option<PartitionRowRange>,
@@ -147,14 +143,14 @@ impl<'t> TableReader<'t> {
 
     /// 空投影 = 全字段（SELECT *）：首次 next() 时展开为最后 Partition Schema 的字段
     /// （sym / time 恒由 read_dataset 返回，不进 projection）。
-    fn resolve_projection(&mut self) -> Result<Vec<String>, splayed_core::CoreError> {
+    fn resolve_projection(&mut self) -> Result<Vec<Arc<str>>, splayed_core::CoreError> {
         if self.projection.as_ref().is_none_or(|p| p.is_empty()) {
             let schema = self.table.read_table_schema()?;
-            let full: Vec<String> = schema
+            let full: Vec<Arc<str>> = schema
                 .fields
                 .iter()
                 .filter(|f| f.name.as_ref() != "sym" && f.name.as_ref() != "time")
-                .map(|f| f.name.to_string())
+                .map(|f| Arc::from(f.name.as_ref()))
                 .collect();
             self.projection = Some(full);
         }
@@ -193,7 +189,7 @@ impl<'t> TableReader<'t> {
             return Ok(None);
         };
         let cols = self.resolve_projection()?;
-        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_ref()).collect();
         Ok(Some(self.read_rows(
             &prr.partition,
             prr.row_range.offset,
@@ -206,7 +202,7 @@ impl<'t> TableReader<'t> {
     /// Scanner 耗尽时允许最后一批小于 size。
     fn next_batch(&mut self, size: usize) -> Result<Option<DataView<'_>>, splayed_core::CoreError> {
         let cols = self.resolve_projection()?;
-        let cols: Vec<&str> = cols.iter().map(|s| s.as_str()).collect();
+        let cols: Vec<&str> = cols.iter().map(|s| s.as_ref()).collect();
         let mut schema: Option<splayed_format::Schema> = None;
         let mut column_segments: Vec<Vec<splayed_format::ColumnSegment<'_>>> = Vec::new();
         let mut total = 0usize;
@@ -327,7 +323,11 @@ pub fn scan_table<'t>(
         current_partition: None,
         current_scanner: None,
         predicate,
-        projection: request.projection.clone(),
+        projection: request
+            .projection
+            .iter()
+            .map(|s| Arc::from(s.as_str()))
+            .collect(),
         remaining: request.limit,
     })
 }

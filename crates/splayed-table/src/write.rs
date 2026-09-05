@@ -118,7 +118,8 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
 
     // 前置校验：分区存在性（write_table 不创建分区）
     let none_scheme = scheme == crate::partition::PartitionScheme::None;
-    let existing = table.discover_partitions();
+    let existing: std::collections::HashSet<String> =
+        table.discover_partitions().into_iter().collect();
     for name in buckets.keys() {
         if none_scheme {
             if !name.is_empty() {

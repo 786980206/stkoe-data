@@ -382,6 +382,7 @@ impl TableHandle {
      → 严格前置校验（逐 Partition 读缓存 Schema / 64B header 状态，
        任一不满足 → Error，不做任何修改）→ 串行 ensure 全部 Partition 打开（缓存复用）
 ② structural_for_each：values_mut 收集互不相交的 &mut DatasetHandle
+     （**按当前分区集过滤**——排除分区被外部删除后残留在缓存的过期句柄）
      → round-robin 分桶 std::thread::scope 并行执行（P = min(max_parallelism, 分区数)；
        单分区 / 并行度 1 串行快路径）——并行只跨 Partition，Table 层不管理 Field 级并发
 ③ 收尾：返回首个错误；已完成的 Partition 不回滚（best-effort，与 create_table 一致）
