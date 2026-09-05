@@ -1,6 +1,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::{Mmap, MmapMut};
 use splayed_codec::{decode_chunk, encode_chunk};
@@ -48,6 +49,15 @@ pub enum FieldInit {
 fn tmp_path(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// 唯一临时文件路径：`{path}.{tag}.{pid}.{n}.tmp`，并发的结构性操作互不覆盖。
+fn unique_tmp_path(path: &Path, tag: &str) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut s = path.as_os_str().to_os_string();
+    s.push(format!(".{tag}.{}.{}.tmp", std::process::id(), seq));
     PathBuf::from(s)
 }
 
@@ -718,30 +728,171 @@ fn write_field_atomic(
     Ok(())
 }
 
-/// 将 `path` 处 Field 原地转换为 `target_type`（临时文件 + 原子 rename；
-/// 失败时原文件保持不变）。逐行 `as` 语义转换（bool ↔ 数值 ↔ 浮点；Utf8 不支持）。
+/// cast 单批行数（限定批次内存：256K 行 × 8B ≈ 2MB values + 位级 validity）。
+const CAST_BATCH_ROWS: u64 = 1 << 18;
+
+/// cast 的流式 reader：批次读取源 Field → 逐批类型转换。
+///
+/// 拥有源 Handle（`create_field_file` 结束时随 reader 一起释放）。
+/// 两相输出：Phase 1 产出转换后的 values 批次，同时把 validity 位跨批拼接为
+/// 全局字节对齐位流（批尾填充位不计，O(total/8) 内存，远小于 values）；
+/// Phase 2 只做位流分块产出（64KB/批），不重读源。
+struct CastReader {
+    handle: FieldHandle,
+    src: DataType,
+    dst: DataType,
+    total: u64,
+    offset: u64,
+    phase: u8,
+    validity_stream: Vec<u8>,
+    bit_acc: u64,
+    acc_bits: u32,
+    validity_written: usize,
+}
+
+impl FieldChunkReader for CastReader {
+    fn next_values(&mut self) -> Result<Option<StreamValues>, CoreError> {
+        if self.offset >= self.total {
+            return Ok(None);
+        }
+        let n = CAST_BATCH_ROWS.min(self.total - self.offset) as usize;
+        let view = self.handle.read_field_handle(self.offset, n as u64)?;
+        // 逐段处理：values 按段转换拼接；validity 按段位级拼接进全局位流。
+        // （clone_view 的 validity 是逐段字节对齐拼接，段边界非字节对齐时不能跨段消费）
+        let mut converted = Vec::with_capacity(n * self.dst.size_of());
+        let mut rows = 0usize;
+        for seg in view.segments() {
+            let seg_rows = seg.rows();
+            let values = seg.fixed_bytes().expect("field files are fixed-width");
+            let (out, _, _) = convert_values(self.src, self.dst, values, None, seg_rows)?;
+            converted.extend_from_slice(&out);
+            let bits = match seg.validity() {
+                Some(bm) => bm.to_packed_bytes(),
+                None => vec![0xFFu8; (seg_rows + 7) / 8],
+            };
+            for i in 0..seg_rows {
+                let bit = (bits[i / 8] >> (i % 8)) & 1;
+                self.bit_acc |= (bit as u64) << self.acc_bits;
+                self.acc_bits += 1;
+                if self.acc_bits == 8 {
+                    self.validity_stream.push(self.bit_acc as u8);
+                    self.bit_acc = 0;
+                    self.acc_bits = 0;
+                }
+            }
+            rows += seg_rows;
+        }
+        // validity 不参与类型转换（原样保留在位流中）
+        self.offset += rows as u64;
+        Ok(Some(StreamValues { values: converted, rows }))
+    }
+
+    fn next_validity(&mut self) -> Result<Option<Vec<u8>>, CoreError> {
+        if self.phase == 0 {
+            self.phase = 1;
+        }
+        if self.validity_written < self.validity_stream.len() {
+            let end = (self.validity_written + 64 * 1024).min(self.validity_stream.len());
+            let chunk = self.validity_stream[self.validity_written..end].to_vec();
+            self.validity_written = end;
+            return Ok(Some(chunk));
+        }
+        if self.acc_bits > 0 {
+            // 收尾：不足 8 位的部分字节（高位零填充，与 validity_size 的零填充一致）
+            let last = self.bit_acc as u8;
+            self.bit_acc = 0;
+            self.acc_bits = 0;
+            return Ok(Some(vec![last]));
+        }
+        Ok(None)
+    }
+}
+
+/// 将 `path` 处 Field 原地转换为 `target_type`。
+///
+/// read → 逐批 cast → create tmp → sync_all → rename；失败清理 tmp，原文件保持不变。
+/// 逐批流式转换（`CAST_BATCH_ROWS` 行/批；uncompressed 源全程 O(一个批次) 内存）；
+/// validity / NULL 不参与类型转换、原样保留；保持原 Field 的压缩状态——
+/// uncompressed → uncompressed，compressed → 按原 encoding / compression / chunk
+/// 分组重新编码。header 仅更新 `data_type`（generation 保持源值）。
+/// 逐行 `as` 语义转换（bool ↔ 数值 ↔ 浮点；Utf8 不支持）。
 pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreError> {
-    let (rows, values, validity, src_type) = {
-        let handle = open_field_file(path, Mode::Read)?;
-        let dt = handle.data_type();
-        if dt == target_type {
-            return Ok(());
+    let tmp = unique_tmp_path(path, "cast");
+    let result = (|| -> Result<(), CoreError> {
+        let (source_gen, was_chunked, encoding, compression, chunk_starts) = {
+            let handle = open_field_file(path, Mode::Read)?;
+            let dt = handle.data_type();
+            if dt == target_type {
+                return Ok(());
+            }
+            if dt == DataType::Utf8 || target_type == DataType::Utf8 {
+                return Err(CoreError::Invalid("cast involving Utf8 is not supported".into()));
+            }
+            let chunk_starts: Vec<u64> = handle
+                .chunk_rows
+                .iter()
+                .scan(0u64, |acc, &r| {
+                    let start = *acc;
+                    *acc += r as u64;
+                    Some(start)
+                })
+                .collect();
+            let info = (
+                handle.header.generation,
+                handle.is_chunked(),
+                handle.header.encoding()?,
+                handle.header.compression()?,
+                chunk_starts,
+            );
+            let total = handle.row_count();
+            let reader = CastReader {
+                handle,
+                src: dt,
+                dst: target_type,
+                total,
+                offset: 0,
+                phase: 0,
+                validity_stream: Vec::new(),
+                bit_acc: 0,
+                acc_bits: 0,
+                validity_written: 0,
+            };
+            // 批次流式写出目标 Field（values → validity 三阶段顺序写；
+            // reader 拥有源 Handle，结束即释放）
+            create_field_file(&tmp, target_type, FieldInit::Stream { reader: Box::new(reader) })?;
+            info
+        };
+
+        // generation 保持源值（与 compress / decompress 一致；create 写 1，此处回填）
+        {
+            let mut f = File::options().read(true).write(true).open(&tmp)?;
+            let mut hb = [0u8; HEADER_SIZE];
+            f.read_exact(&mut hb)?;
+            let mut h = FieldHeader::from_bytes(&hb)?;
+            h.generation = source_gen;
+            f.seek(SeekFrom::Start(0))?;
+            f.write_all(&h.to_bytes())?;
         }
-        if dt == DataType::Utf8 || target_type == DataType::Utf8 {
-            return Err(CoreError::Invalid("cast involving Utf8 is not supported".into()));
+
+        // 保持压缩状态：compressed 源按原 encoding / compression / chunk 分组重编码
+        if was_chunked {
+            compress_field_file_encoded(&tmp, Some(chunk_starts), encoding, compression)?;
         }
-        let owned = clone_view(&handle.read_field_handle(0, handle.row_count())?);
-        (owned.2, owned.0, owned.1, dt)
-    };
-    let converted = convert_values(src_type, target_type, &values, validity, rows)?;
-    let (values, validity, rows) = converted;
-    let null_count = validity
-        .as_ref()
-        .map(|b| BitmapView::new(BufferView::new(b), 0, rows).unwrap().null_count() as u32)
-        .unwrap_or(0);
-    let header =
-        FieldHeader::new_uncompressed(target_type, 1, rows as u32, null_count, validity.is_some());
-    write_field_atomic(path, header, &values, validity.as_deref())
+
+        // tmp 完整落盘后再原子替换：rename 生效时新文件内容已持久
+        {
+            let f = File::options().write(true).open(&tmp)?;
+            f.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        // 失败清理：cast tmp 与 compress 步自身的 tmp，原文件保持不变
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp_path(&tmp));
+    }
+    result
 }
 
 fn scalar_to_f64(v: &Scalar) -> f64 {
@@ -798,11 +949,22 @@ fn convert_values(
     Ok((out, validity, rows))
 }
 
-/// 压缩已有 Field（uncompressed → compressed，保持 encoding、compression 置 ZSTD，
+/// 压缩已有 Field（uncompressed → compressed，encoding 置 PLAIN、compression 置 ZSTD，
 /// 临时文件 + 原子替换）。`offsets`：可选的 chunk 起始行号（升序、`offsets[0] == 0`，
 /// 末块隐含到 row_count）；省略时按固定 8192 行均匀分块。分块策略是调用方的职责
 /// （Dataset 层按 META 网格生成 sym 对齐边界）。
 pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError> {
+    compress_field_file_encoded(path, offsets, Encoding::Plain, Compression::Zstd)
+}
+
+/// [`compress_field_file`] 的参数化版本：encoding / compression 由调用方指定
+/// （cast 用它保持源 Field 的压缩配置）。
+fn compress_field_file_encoded(
+    path: &Path,
+    offsets: Option<Vec<u64>>,
+    encoding: Encoding,
+    compression: Compression,
+) -> Result<(), CoreError> {
     let (header, values, validity) = {
         let handle = open_field_file(path, Mode::Read)?;
         if handle.is_chunked() {
@@ -834,8 +996,8 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
     let dt = header.data_type()?;
     let size = dt.size_of();
     let mut new_header = header;
-    new_header.compression = Compression::Zstd.id();
-    new_header.encoding = Encoding::Plain.id();
+    new_header.compression = compression.id();
+    new_header.encoding = encoding.id();
     new_header.set_has_validity(false);
     new_header.validity_offset = 0;
     let mut out = Vec::with_capacity(HEADER_SIZE + values.len() / 2);
@@ -848,8 +1010,8 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
                 .to_packed_bytes()
         });
         out.extend_from_slice(&encode_chunk(
-            Encoding::Plain,
-            Compression::Zstd,
+            encoding,
+            compression,
             dt,
             &values[lo * size..hi * size],
             bits.as_deref(),
@@ -864,8 +1026,8 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
                 .to_packed_bytes()
         });
         out.extend_from_slice(&encode_chunk(
-            Encoding::Plain,
-            Compression::Zstd,
+            encoding,
+            compression,
             dt,
             &values[last * size..],
             bits.as_deref(),

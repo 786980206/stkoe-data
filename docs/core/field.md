@@ -218,10 +218,24 @@ write + compressed + 已修改      → 流式：header（编码前即完全确�
 cast_field_file(path, target_type) -> Result<()>
 ```
 
-- 读取 `path` 处 Field → 数据类型转换 → 写临时文件 → 原子 rename 替换原文件；对外表现为原地转换。
-- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换。
-- 转换失败时原文件保持不变。
-- 原文件的压缩状态对调用方透明；转换通过临时文件完成，不属于 `write_field_handle` 的原地覆盖。
+**内部实现**（read → 逐批 cast → create tmp → sync_all → rename）：
+```
+open(read)   →  target_type == src_type 直接返回；涉及 Utf8 → Error
+stream cast  →  CastReader 批次读取（CAST_BATCH_ROWS = 256K 行/批）：
+                  逐段 read_field_handle → 类型转换（逐行 as 语义）拼接
+                  → validity 逐段位级拼接为全局字节对齐位流（批尾填充位不计，
+                    O(total/8) 内存，远小于 values；段边界非字节对齐安全）
+                create_field_file(tmp, Stream) 三阶段顺序写出（不构造完整目标 Field）
+压缩状态     →  保持原 Field 压缩状态：uncompressed → uncompressed；
+                compressed → 按原 encoding / compression / chunk 分组重新编码
+收尾         →  header 仅更新 data_type（generation 保持源值）
+                → tmp sync_all → rename 原子替换（rename 生效时新文件内容已持久）
+                → 失败清理 tmp（含 compress 步 tmp），原文件保持不变
+```
+- 转换成功后该 Field 的 `data_type` 为 `target_type`，逻辑数据逐行完成类型转换；validity / NULL 原样保留，不参与类型转换。
+- 临时文件名唯一（`{path}.cast.{pid}.{n}.tmp`），并发 cast 互不覆盖。
+- uncompressed 源全程 O(一个批次) 内存；compressed 源受限于「open 即全量解压」（chunk 级惰性解码为后续优化项）。
+- 转换失败时原文件保持不变；转换通过临时文件完成，不属于 `write_field_handle` 的原地覆盖。
 
 ### 5.10 compress_field_file / decompress_field_file
 

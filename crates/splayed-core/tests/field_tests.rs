@@ -524,6 +524,83 @@ fn cast_converts_values_in_place() {
 }
 
 #[test]
+fn cast_preserves_validity_generation_and_compression() {
+    let dir = temp_dir("cast_keep");
+    let path = dir.join("price");
+    // [10, NULL, 60, NULL, 5]：写一次（generation 2）后 cast Int32
+    let values: Vec<f64> = vec![10.0, 0.0, 60.0, 0.0, 5.0];
+    let mut bm = Bitmap::ones(5);
+    bm.set(1, false);
+    bm.set(3, false);
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+    let mut handle = open_field_file(&path, Mode::Write).unwrap();
+    handle.write_field_handle(0, &f64_column(&[10.0], None).as_view()).unwrap();
+    close_field_handle(handle).unwrap();
+
+    cast_field_file(&path, DataType::Int32).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(handle.data_type(), DataType::Int32);
+    assert_eq!(handle.header().generation, 2); // generation 保持源值
+    assert_eq!(handle.header().null_count, 2); // validity 原样保留
+    assert!(!handle.is_chunked());
+    let view = handle.read_field_handle(0, 5).unwrap();
+    assert_eq!(view.null_count(), 2);
+    let got: Vec<i32> = bytemuck::cast_slice(view.segments()[0].fixed_bytes().unwrap()).to_vec();
+    assert_eq!(&got[0..1], &[10]);
+    assert_eq!(&got[2..3], &[60]);
+    assert_eq!(&got[4..5], &[5]);
+    close_field_handle(handle).unwrap();
+
+    // compress → cast：压缩状态与 chunk 分组保持
+    compress_field_file(&path, Some(vec![0, 2])).unwrap();
+    cast_field_file(&path, DataType::Int64).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(handle.data_type(), DataType::Int64);
+    assert!(handle.is_chunked());
+    assert_eq!(handle.header().generation, 2);
+    assert_eq!(handle.header().null_count, 2);
+    let view = handle.read_field_handle(0, 5).unwrap();
+    assert_eq!(view.null_count(), 2);
+    let got: Vec<i64> = bytemuck::cast_slice(view.segments()[0].fixed_bytes().unwrap()).to_vec();
+    assert_eq!(&got[0..1], &[10]);
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn cast_streams_across_batches() {
+    let dir = temp_dir("cast_batch");
+    let path = dir.join("price");
+    // > CAST_BATCH_ROWS(262144)，且 N % 8 == 1 触发 validity 部分字节收尾
+    const N: usize = 300_001;
+    let values: Vec<f64> = (0..N).map(|i| i as f64 * 2.0).collect();
+    let mut bm = Bitmap::ones(N);
+    for &r in &[0usize, 262143, 262144, N - 1] {
+        bm.set(r, false);
+    }
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+
+    cast_field_file(&path, DataType::Int64).unwrap();
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(handle.data_type(), DataType::Int64);
+    assert_eq!(handle.row_count(), N as u64);
+    assert_eq!(handle.header().null_count, 4);
+    // 批边界跨点 + 首尾行均为 NULL
+    for r in [0usize, 262143, 262144, N - 1] {
+        let view = handle.read_field_handle(r as u64, 1).unwrap();
+        assert_eq!(view.null_count(), 1, "row {r} should be NULL");
+    }
+    for r in [1usize, 262145, N - 2] {
+        let view = handle.read_field_handle(r as u64, 1).unwrap();
+        assert_eq!(view.null_count(), 0, "row {r} should be valid");
+        let got = bytemuck::cast_slice::<u8, i64>(view.segments()[0].fixed_bytes().unwrap())[0];
+        assert_eq!(got, (r as i64) * 2, "row {r}");
+    }
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
 fn rename_field_file_moves_atomically() {
     let dir = temp_dir("rename");
     let path = dir.join("old");
