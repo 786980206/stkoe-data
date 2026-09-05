@@ -10,5 +10,6 @@ description = "Splayed V2.0 Polars adapter: AnonymousScan lazy scanning"
 [dependencies]
 splayed-core = { path = "../splayed-core" }
 splayed-format = { path = "../splayed-format" }
+bytemuck = "1"
 splayed-table = { path = "../splayed-table" }
 polars = { version = "0.45", default-features = false, features = ["lazy", "strings", "dtype-i8", "dtype-i16", "dtype-u8", "dtype-u16"] }

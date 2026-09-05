@@ -107,7 +107,6 @@ pub fn create_field_file(
             // 数据区 + validity 区由 set_len 的 OS 零填充完成，无需显式写 NULL
             let total = HEADER_SIZE as u64 + header.data_length + validity_size(n as u32) as u64;
             f.set_len(total)?;
-            f.sync_all()?;
         }
         FieldInit::Data(col) => {
             if col.data_type != data_type {
@@ -131,7 +130,6 @@ pub fn create_field_file(
             if let Some(bm) = &col.validity {
                 f.write_all(bm.as_view().as_raw())?;
             }
-            f.sync_all()?;
         }
         FieldInit::Stream { chunk_rows, mut reader } => {
             if chunk_rows == 0 {
@@ -621,8 +619,6 @@ pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
             m.flush()?;
         }
         drop(backing);
-        let f = File::options().write(true).open(&path)?;
-        f.sync_all()?;
         return Ok(());
     }
     if !modified {
@@ -658,7 +654,6 @@ pub fn close_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
     let tmp = tmp_path(&path);
     let mut f = File::options().write(true).create(true).truncate(true).open(&tmp)?;
     f.write_all(&out)?;
-    f.sync_all()?;
     drop(f);
     fs::rename(&tmp, &path)?;
     Ok(())
@@ -704,7 +699,6 @@ fn write_field_atomic(
         if let Some(bits) = validity {
             f.write_all(bits)?;
         }
-        f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
     Ok(())

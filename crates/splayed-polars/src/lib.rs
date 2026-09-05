@@ -158,30 +158,59 @@ fn column_to_series(
     view: &splayed_format::ColumnView<'_>,
 ) -> Result<Series, CoreError> {
     let rows = view.length();
+    let dt = view.data_type();
+
+    // 快路径：单段 + 无 validity → 零逐行开销，直接 cast_slice
+    if view.segments().len() == 1 && dt != DataType::Utf8 && view.segments()[0].validity().is_none() {
+        let bytes = view.segments()[0].fixed_bytes().expect("fixed-width segment");
+        return Ok(match dt {
+            DataType::Bool => {
+                let v: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+                BooleanChunked::from_slice(name.into(), &v).into_series()
+            }
+            DataType::Int8 => Int8Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Int16 => Int16Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Int32 | DataType::Date32 => Int32Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Int64 | DataType::TimestampUs | DataType::Date64 => Int64Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::UInt8 => UInt8Chunked::from_slice(name.into(), bytes).into_series(),
+            DataType::UInt16 => UInt16Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::UInt32 => UInt32Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::UInt64 => UInt64Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Float32 => Float32Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Float64 => Float64Chunked::from_slice(name.into(), bytemuck::cast_slice(bytes)).into_series(),
+            DataType::Utf8 => {
+                // Utf8 无快路径：回退通用路径
+                let vals: Vec<Option<String>> = (0..rows)
+                    .map(|i| view.string_at(i).map(str::to_owned))
+                    .collect();
+                StringChunked::from_slice_options(name.into(), &vals).into_series()
+            }
+        });
+    }
+
+    // 通用路径：有 validity 或多段
     let validity = row_validity(view);
-    // 段游标表：全局行 → (段起始, 段行数, 段 idx)
-    let mut seg_cursor: Vec<(usize, usize, usize)> = Vec::new();
-    {
+    let seg_cursor: Vec<(usize, usize, usize)> = {
+        let mut out = Vec::new();
         let mut start = 0usize;
         for (idx, seg) in view.segments().iter().enumerate() {
-            seg_cursor.push((start, seg.rows(), idx));
+            out.push((start, seg.rows(), idx));
             start += seg.rows();
         }
-    }
-    let find = |i: usize| -> (usize, usize, usize) {
-        *seg_cursor
-            .iter()
-            .find(|(s, r, _)| i >= *s && i < s + r)
-            .expect("row within view")
+        out
     };
     let read_fixed = |i: usize| -> Vec<u8> {
-        let (s, r, idx) = find(i);
+        let (s, r, idx) = seg_cursor
+            .iter()
+            .find(|(s, r, _)| i >= *s && i < s + r)
+            .map(|(s, r, idx)| (*s, *r, *idx))
+            .expect("row within view");
         let seg = &view.segments()[idx];
         let bytes = seg.fixed_bytes().expect("fixed-width segment");
         let width = bytes.len() / r.max(1);
         bytes[i * width - s * width..i * width - s * width + width].to_vec()
     };
-    Ok(match view.data_type() {
+    Ok(match dt {
         DataType::Bool => {
             let vals: Vec<Option<bool>> = (0..rows)
                 .map(|i| validity[i].then(|| read_fixed(i)[0] != 0))
@@ -289,17 +318,12 @@ fn column_to_series(
         }
         DataType::Utf8 => {
             let vals: Vec<Option<String>> = (0..rows)
-                .map(|i| {
-                    validity[i]
-                        .then(|| view.string_at(i).map(str::to_owned))
-                        .flatten()
-                })
+                .map(|i| view.string_at(i).map(str::to_owned))
                 .collect();
             StringChunked::from_slice_options(name.into(), &vals).into_series()
         }
     })
 }
-
 /// 多列视图 → DataFrame。
 fn view_to_frame(view: &splayed_format::DataView<'_>) -> Result<DataFrame, CoreError> {
     let mut series = Vec::with_capacity(view.schema.fields.len());

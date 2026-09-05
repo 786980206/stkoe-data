@@ -156,26 +156,30 @@ fn bench_read_scan(c: &mut Criterion) {
     let mut group = c.benchmark_group("read");
     group.throughput(criterion::Throughput::Elements(TOTAL as u64));
 
-    // 全表读取（Table 层端到端 → DataView）
-    group.bench_function("splayed_table_full_scan", |b| {
-        b.iter(|| {
-            let table = open_table(&splayed_root, splayed_core::Mode::Read, TableOptions::default()).unwrap();
-            let req = TableScanRequest::default();
-            let mut reader = query_table(&table, req, Some(4096)).unwrap();
-            let mut rows = 0usize;
-            while let Some(view) = reader.next().unwrap() {
-                rows += view.length();
-                black_box(view.column("price").unwrap().length());
-            }
-            reader.close().unwrap();
-            assert_eq!(rows, TOTAL);
-        })
-    });
+    // 全表读取（Table 层端到端 → DataView）；open_table 在循环外
+    {
+        let table = open_table(&splayed_root, splayed_core::Mode::Read, TableOptions::default()).unwrap();
+        group.bench_function("splayed_table_full_scan", |b| {
+            b.iter(|| {
+                let req = TableScanRequest::default();
+                let mut reader = query_table(&table, req, Some(4096)).unwrap();
+                let mut rows = 0usize;
+                while let Some(view) = reader.next().unwrap() {
+                    rows += view.length();
+                    black_box(view.column("price").unwrap().length());
+                }
+                reader.close().unwrap();
+                assert_eq!(rows, TOTAL);
+            })
+        });
+        drop(table);
+    }
 
-    // 谓词扫描：price > 15（行级过滤，覆盖全部数据集）
-    group.bench_function("splayed_table_predicated_scan", |b| {
-        b.iter(|| {
-            let table = open_table(&splayed_root, splayed_core::Mode::Read, TableOptions::default()).unwrap();
+    // 谓词扫描：price > 15（行级过滤，覆盖全部数据集）；open_table 在循环外
+    {
+        let table = open_table(&splayed_root, splayed_core::Mode::Read, TableOptions::default()).unwrap();
+        group.bench_function("splayed_table_predicated_scan", |b| {
+            b.iter(|| {
             let req = TableScanRequest {
                 predicate: Some(splayed_core::Predicate::cmp(
                     "price",
@@ -191,8 +195,10 @@ fn bench_read_scan(c: &mut Criterion) {
             }
             reader.close().unwrap();
             black_box(rows);
-        })
-    });
+            })
+        });
+        drop(table);
+    }
 
     // parquet 全表读取（对照）
     group.bench_function("parquet_full_scan", |b| {

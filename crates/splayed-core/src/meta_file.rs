@@ -248,7 +248,6 @@ pub(crate) fn write_meta_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreErr
             .truncate(true)
             .open(&tmp)?;
         f.write_all(bytes)?;
-        f.sync_all()?;
     }
     fs::rename(&tmp, path)?;
     Ok(())

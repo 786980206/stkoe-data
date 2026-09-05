@@ -2075,6 +2075,7 @@ dependencies = [
 name = "splayed-polars"
 version = "0.2.0"
 dependencies = [
+ "bytemuck",
  "polars",
  "splayed-core",
  "splayed-format",
