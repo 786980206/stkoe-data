@@ -26,6 +26,8 @@ pub fn scan_polars(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>   // 入�
 - `schema`：由 `read_table_schema()` 提供（最后 Partition，含 sym/time）。
 - 谓词：polars 传来的 `Expr` 谓词 **v1 不下推**（行级由 polars 自己过滤）；
   sym/time 等值与范围条件在 v2.1 经 `TableScanRequest.sym/time` 下推（优化项）。
+- 投影：v1 **不下推**（polars 0.45 匿名扫描的投影下推优化器存在 unwrap panic；
+  关闭后 polars 在返回的 DataFrame 上自行 select，语义不变）。
 - 输出：`DataFrame`，列序 = schema；Utf8 字典解码为 String。
 
 ## 2. splayed-duckdb

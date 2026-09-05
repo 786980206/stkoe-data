@@ -1,249 +1,161 @@
-//! splayed-polars 集成测试：AnonymousScan 惰性扫描（投影裁剪 / 谓词下推 / 兜底）。
+//! splayed-polars 集成测试：scan_polars 端到端（含分区表、过滤、NULL）。
 
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 
-use arrow_array::{Float64Array, Int64Array, RecordBatch, StringArray as ArrowStringArray};
-use arrow_schema::{DataType as ArrowDT, Field, Schema};
-use polars::prelude::*;
-use splayed_arrow::create_table;
-use splayed_polars::splayed_lazyframe;
+use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
+use splayed_table::create_table;
 
-fn temp_dir(suffix: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "splayed_pl_{suffix}_{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+fn temp_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("splayed_polars_{}_{}", name, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     dir
 }
 
-/// time 0..2 × SYM01/02：close 100..102 / 200..202，vol 1..6（含一个 NULL）。
-fn make_batch() -> RecordBatch {
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("time", ArrowDT::Date32, false),
-            Field::new("sym", ArrowDT::Utf8, false),
-            Field::new("close", ArrowDT::Float64, true),
-            Field::new("vol", ArrowDT::Int64, true),
-        ])),
-        vec![
-            Arc::new(arrow_array::Date32Array::from(vec![0, 1, 2, 0, 1, 2])),
-            Arc::new(ArrowStringArray::from(vec![
-                "SYM01", "SYM01", "SYM01", "SYM02", "SYM02", "SYM02",
-            ])),
-            Arc::new(Float64Array::from(vec![
-                100.0, 101.0, 102.0, 200.0, 201.0, 202.0,
-            ])),
-            Arc::new(Int64Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), Some(6)])),
-        ],
+fn cleanup(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 2026-08 与 2026-09 各 4 行（2 sym × 2 天），time 为 Date32 天序号。
+fn month_sample_with_null() -> Data {
+    let d = |y: i32, m: u32, dd: u32| splayed_table::days_from_civil(y as i64, m, dd) as i32;
+    let rows: [(&str, i32, f64); 8] = [
+        ("AAPL", d(2026, 8, 3), 10.0),
+        ("AAPL", d(2026, 8, 4), 11.0),
+        ("MSFT", d(2026, 8, 3), 20.0),
+        ("MSFT", d(2026, 8, 4), 0.0), // NULL
+        ("AAPL", d(2026, 9, 1), 12.0),
+        ("AAPL", d(2026, 9, 2), 13.0),
+        ("MSFT", d(2026, 9, 1), 22.0),
+        ("MSFT", d(2026, 9, 2), 23.0),
+    ];
+    let mut dict: Vec<&str> = rows.iter().map(|r| r.0).collect();
+    dict.sort();
+    dict.dedup();
+    let mut offsets = vec![0u64];
+    let mut strings = Vec::new();
+    for s in &dict {
+        strings.extend_from_slice(s.as_bytes());
+        offsets.push(strings.len() as u64);
+    }
+    let keys: Vec<u32> = rows
+        .iter()
+        .map(|r| dict.iter().position(|x| *x == r.0).unwrap() as u32)
+        .collect();
+    let sym_col = Column::from_dict(keys, offsets, strings, None);
+    let mut price_bits = Bitmap::ones(8);
+    price_bits.set(3, false); // MSFT 08-04 为 NULL
+    let time_col = Column {
+        data_type: DataType::Date32,
+        values: Buffer::from_slice_copy(&rows.iter().map(|r| r.1).collect::<Vec<i32>>()),
+        validity: None,
+        dict: None,
+    };
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&rows.iter().map(|r| r.2).collect::<Vec<f64>>()),
+        validity: Some(price_bits),
+        dict: None,
+    };
+    Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+            FieldSchema::new("price", DataType::Float64),
+        ]),
+        vec![sym_col, time_col, price_col],
     )
     .unwrap()
 }
 
-fn values_f64(df: &DataFrame) -> Vec<f64> {
-    df.column("close")
-        .unwrap()
-        .f64()
-        .unwrap()
-        .iter()
-        .map(|v| v.unwrap())
-        .collect()
-}
-
 #[test]
-fn lazy_scan_full_collect() {
-    let dir = temp_dir("full");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-    // polars 0.45 的 anonymous-scan 在「无显式 select 的完整收集」下存在投影
-    // 优化 bug（reader_schema=None 被 unwrap）；显式全列 select 等价且避开。
+fn scan_polars_month_table_filter_and_nulls() {
+    let dir = temp_dir("month");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample_with_null(), splayed_table::PartitionScheme::Month).unwrap();
+
+    let lf = splayed_polars::scan_polars(&root).unwrap();
+    let df = lf.collect().unwrap();
+    assert_eq!(df.height(), 8);
+    assert_eq!(df.width(), 3); // sym / time / price
+
+    // 过滤：price > 15 → 20, 22, 23（NULL 行由 polars 排除）
+    let lf = splayed_polars::scan_polars(&root).unwrap();
     let df = lf
-        .select([col("time"), col("sym"), col("close"), col("vol")])
+        .filter(polars::prelude::col("price").gt(polars::prelude::lit(15.0)))
         .collect()
         .unwrap();
-    assert_eq!(df.shape(), (6, 4));
-    assert!(df.get_column_names().iter().any(|n| n.as_str() == "sym"));
-    std::fs::remove_dir_all(&dir).ok();
+    assert_eq!(df.height(), 3);
+
+    // 投影：只取 sym
+    let lf = splayed_polars::scan_polars(&root).unwrap();
+    let df = lf.select([polars::prelude::col("sym")]).collect().unwrap();
+    assert_eq!(df.width(), 1);
+    assert_eq!(df.height(), 8);
+
+    // 分区目录存在
+    assert!(root.join("month=2026-08").exists());
+    assert!(root.join("month=2026-09").exists());
+    cleanup(&dir);
 }
 
 #[test]
-fn projection_pushdown_selects_columns() {
-    let dir = temp_dir("proj");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-    let df = lf.select([col("close")]).collect().unwrap();
-    assert_eq!(df.shape(), (6, 1)); // 只读/只返一列
-    assert_eq!(values_f64(&df), vec![100.0, 101.0, 102.0, 200.0, 201.0, 202.0]);
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn predicate_pushdown_filter() {
-    let dir = temp_dir("pred");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-
-    // close > 150：核心层值过滤（同时被兜底），结果 = SYM02 的 3 行。
-    let df = lf
-        .clone()
-        .filter(col("close").gt(lit(150.0)))
-        .select([col("sym"), col("close")])
-        .collect()
-        .unwrap();
-    assert_eq!(df.shape(), (3, 2));
-    assert_eq!(values_f64(&df), vec![200.0, 201.0, 202.0]);
-
-    // sym = 'SYM01'：核心层 SymbolSelection 裁剪。
-    let df = lf
-        .filter(col("sym").eq(lit("SYM01")))
-        .select([col("close")])
-        .collect()
-        .unwrap();
-    assert_eq!(values_f64(&df), vec![100.0, 101.0, 102.0]);
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn predicate_fallback_for_complex_expr() {
-    let dir = temp_dir("fallback");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-
-    // 非简单「列 op 字面量」（表达式对比）→ 核心不裁剪，兜底过滤保证正确。
-    let df = lf
-        .filter(col("close").gt(col("close").mean()))
-        .select([col("sym"), col("close")])
-        .collect()
-        .unwrap();
-    // mean = (100+101+102+200+201+202)/6 = 151；close > 151 → 200,201,202 → 3 行。
-    assert_eq!(df.shape(), (3, 2));
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn null_values_survive_conversion() {
-    let dir = temp_dir("nulls");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-    let df = lf
-        .filter(col("vol").is_null())
-        .select([col("sym"), col("vol")])
-        .collect()
-        .unwrap();
-    assert_eq!(df.shape(), (1, 2)); // vol 恰一个 NULL（SYM01 day1）
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-#[test]
-fn group_by_aggregation_over_lazy_scan() {
-    let dir = temp_dir("group");
-    create_table(&dir, &make_batch(), true).unwrap();
-    let lf = splayed_lazyframe(&dir).unwrap();
-    let df = lf
-        .group_by([col("sym")])
-        .agg([col("close").sum()])
-        .sort(["sym"], Default::default())
-        .collect()
-        .unwrap();
-    assert_eq!(df.shape(), (2, 2));
-    let sums: Vec<f64> = df
-        .column("close")
-        .unwrap()
-        .f64()
-        .unwrap()
-        .iter()
-        .map(|v| v.unwrap())
-        .collect();
-    assert_eq!(sums, vec![303.0, 603.0]); // SYM01=303, SYM02=603（升序排列后）
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// 分区表惰性扫描：key=value 分区列进 schema、分区列过滤下推、常量列补回。
-#[test]
-fn lazy_table_scan_partition_columns() {
-    use splayed_polars::splayed_lazyframe_table;
-
-    let root = std::env::temp_dir().join(format!("splayed_pl_tbl_{}", std::process::id()));
+fn scan_polars_none_table() {
+    let dir = temp_dir("none");
+    let root = dir.join("tbl");
     let _ = std::fs::remove_dir_all(&root);
-    create_table(root.join("year=2024"), &make_batch(), true).unwrap(); // 6 行
-    create_table(root.join("year=2025"), &make_batch(), true).unwrap();
-
-    let lf = splayed_lazyframe_table(&root).unwrap();
-
-    // 分区列过滤 → 只扫 2024；year 投影为常量列。
-    let df = lf
-        .clone()
-        .filter(col("year").eq(lit(2024)))
-        .select([col("close"), col("year")])
-        .collect()
-        .unwrap();
-    assert_eq!(df.shape(), (6, 2));
-    let years: Vec<i64> = df.column("year").unwrap().i64().unwrap().iter().map(|v| v.unwrap()).collect();
-    assert!(years.iter().all(|&y| y == 2024));
-
-    // 字符串字面量同样剪裁（year = '2025'）由 core 层完成；此处用 String 分区列验证。
-    let root2 = std::env::temp_dir().join(format!("splayed_pl_tbl2_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root2);
-    create_table(root2.join("env=prod"), &make_batch(), true).unwrap();
-    create_table(root2.join("env=test"), &make_batch(), true).unwrap();
-    let lf2 = splayed_lazyframe_table(&root2).unwrap();
-    let df2 = lf2
-        .filter(col("env").eq(lit("prod")))
-        .select([col("close"), col("env")])
-        .collect()
-        .unwrap();
-    assert_eq!(df2.shape(), (6, 2));
-    let envs: Vec<&str> = df2
-        .column("env")
-        .unwrap()
-        .str()
-        .unwrap()
+    let d = |y: i32, m: u32, dd: u32| splayed_table::days_from_civil(y as i64, m, dd) as i32;
+    let rows: Vec<(&str, i32, f64)> = vec![
+        ("AAPL", d(2026, 8, 3), 10.0),
+        ("AAPL", d(2026, 8, 4), 11.0),
+        ("MSFT", d(2026, 8, 3), 20.0),
+        ("MSFT", d(2026, 8, 4), 0.0),
+    ];
+    // 复用 month_sample_with_null 的构造逻辑（截取前 4 行的有序版）
+    let mut dict: Vec<&str> = rows.iter().map(|r| r.0).collect();
+    dict.sort();
+    dict.dedup();
+    let mut offsets = vec![0u64];
+    let mut strings = Vec::new();
+    for s in &dict {
+        strings.extend_from_slice(s.as_bytes());
+        offsets.push(strings.len() as u64);
+    }
+    let keys: Vec<u32> = rows
         .iter()
-        .map(|v| v.unwrap())
+        .map(|r| dict.iter().position(|x| *x == r.0).unwrap() as u32)
         .collect();
-    assert!(envs.iter().all(|&e| e == "prod"));
-    std::fs::remove_dir_all(&root2).ok();
-
-    // count over 全表（两分区）。
-    let df3 = lf
-        .filter(col("close").gt(lit(150.0)))
-        .group_by([col("year")])
-        .agg([col("close").count()])
-        .sort(["year"], Default::default())
-        .collect()
-        .unwrap();
-    assert_eq!(df3.shape(), (2, 2));
-
-    std::fs::remove_dir_all(&root).ok();
-}
-
-#[test]
-fn lazy_scan_subset() {
-    let dir = temp_dir("subset");
-    create_table(&dir, &make_batch(), true).unwrap();
-    // SYM01 day {0,1} + SYM02 day {0}（多符号、多区间形态）。
-    splayed_core::create_subset(
-        &dir,
-        "hs300",
-        &[
-            splayed_core::SubsetInput::new("SYM01", vec![(0i64, 2u32)]),
-            splayed_core::SubsetInput::new("SYM02", vec![(0i64, 1u32)]),
-        ],
+    let sym_col = Column::from_dict(keys, offsets, strings, None);
+    let mut bits = Bitmap::ones(4);
+    bits.set(3, false);
+    let time_col = Column {
+        data_type: DataType::Date32,
+        values: Buffer::from_slice_copy(&rows.iter().map(|r| r.1).collect::<Vec<i32>>()),
+        validity: None,
+        dict: None,
+    };
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&rows.iter().map(|r| r.2).collect::<Vec<f64>>()),
+        validity: Some(bits),
+        dict: None,
+    };
+    let data = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+            FieldSchema::new("price", DataType::Float64),
+        ]),
+        vec![sym_col, time_col, price_col],
     )
     .unwrap();
-    let lf = splayed_polars::splayed_lazyframe_subset(&dir, "hs300").unwrap();
-    let df = lf
-        .select([col("time"), col("sym"), col("close")])
-        .collect()
-        .unwrap();
-    assert_eq!(df.shape(), (3, 3));
-    // 父全局行序：SYM01(0,1) 在前，SYM02(0) 在后。
-    assert_eq!(values_f64(&df), vec![100.0, 101.0, 200.0]);
-    std::fs::remove_dir_all(&dir).ok();
+    create_table(&root, data, splayed_table::PartitionScheme::None).unwrap();
+
+    let lf = splayed_polars::scan_polars(&root).unwrap();
+    let df = lf.collect().unwrap();
+    assert_eq!(df.height(), 4);
+    let price = df.column("price").unwrap();
+    assert_eq!(price.null_count(), 1);
+    cleanup(&dir);
 }
