@@ -47,6 +47,9 @@ DataView      { schema, columns: ColumnView[], length }
 ```
 
 - BufferView / BitmapView / ColumnSegment / ColumnView / DataView 均为 non-owning；生命周期不能超过底层 Buffer。
+- Bitmap / BitmapView 提供字节/word 批量位操作原语（`copy_bits_into` / `Bitmap::copy_bits_from` / `set_range` /
+  `bitmap_count_ones` / `bitmap_fill_bits`：头尾掩码 RMW、中间 word popcount、同相位整字节 memcpy）；
+  validity 写路径按字节批量操作，不逐 bit；`copy_bits` 返回覆盖前后 1 位数，供 null_count 增量维护。
 - ColumnSegment：一段连续行区间；段内连续是硬约束（SIMD 逐段求值的前提）；`validity = null` 表示该段全部有效。
 - ColumnView：单列视图，由一个或多个 segment 按逻辑行序组成。不变式：
   - `segments` 非空、按逻辑行序排列；

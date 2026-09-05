@@ -135,6 +135,72 @@ fn data_init_and_positional_overwrite() {
 }
 
 #[test]
+fn write_validity_batch_and_null_count_delta() {
+    let dir = temp_dir("write_validity");
+    let path = dir.join("price");
+    // 16 行：偶数行 NULL
+    let values: Vec<f64> = (0..16).map(|i| i as f64).collect();
+    let mut bm = Bitmap::ones(16);
+    for i in (0..16).step_by(2) {
+        bm.set(i, false);
+    }
+    create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm)))).unwrap();
+
+    let mut handle = open_field_file(&path, Mode::Write).unwrap();
+    assert_eq!(handle.header().null_count, 8);
+
+    // 覆盖 [4, 8)：全有效段 → 批量置 1 路径（行 4,6 由 NULL 变有效）
+    let patch = f64_column(&[100.0, 101.0, 102.0, 103.0], None);
+    handle.write_field_handle(4, &patch.as_view()).unwrap();
+    assert_eq!(handle.header().null_count, 6);
+
+    // 覆盖 [8, 12)：带 NULL 段 → 批量位复制路径（行 8,11 NULL；行 9,10 有效）
+    let mut pbm = Bitmap::ones(4);
+    pbm.set(0, false);
+    pbm.set(3, false);
+    let patch2 = f64_column(&[108.0, 109.0, 110.0, 111.0], Some(pbm));
+    handle.write_field_handle(8, &patch2.as_view()).unwrap();
+    // 旧区间有效位 {9, 11} → 新有效位 {9, 10}：null_count 不变
+    assert_eq!(handle.header().null_count, 6);
+
+    // 读回验证（值 + null_count）
+    let view = handle.read_field_handle(0, 16).unwrap();
+    assert_eq!(view.null_count(), 6);
+    assert_eq!(&view_values(&view)[4..8], &[100.0, 101.0, 102.0, 103.0]);
+    assert_eq!(&view_values(&view)[8..12], &[108.0, 109.0, 110.0, 111.0]);
+    close_field_handle(handle).unwrap();
+
+    // 落盘验证：null_count 与 generation 随 header 持久化（2 次写 → generation 3）
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(handle.header().null_count, 6);
+    assert_eq!(handle.header().generation, 3);
+    assert_eq!(handle.read_field_handle(0, 16).unwrap().null_count(), 6);
+    close_field_handle(handle).unwrap();
+
+    // compressed 路径：写带 NULL 段 → close 自动重压缩 → 读回
+    compress_field_file(&path, Some(vec![0, 8])).unwrap();
+    let mut handle = open_field_file(&path, Mode::Write).unwrap();
+    assert_eq!(handle.header().null_count, 6);
+    let mut pbm3 = Bitmap::ones(2);
+    pbm3.set(1, false);
+    let patch3 = f64_column(&[200.0, 201.0], Some(pbm3)); // [12,14)：行 12 有效、行 13 NULL
+    handle.write_field_handle(12, &patch3.as_view()).unwrap();
+    assert_eq!(handle.header().null_count, 6); // 旧有效位 {13} → 新有效位 {12}
+    close_field_handle(handle).unwrap();
+
+    let handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(handle.header().null_count, 6);
+    assert_eq!(handle.header().generation, 4);
+    let view = handle.read_field_handle(0, 16).unwrap();
+    assert_eq!(view.null_count(), 6);
+    assert_eq!(view_values(&view)[12], 200.0);
+    // 行 13 为 NULL（跨 chunk 单行读取校验）
+    assert_eq!(handle.read_field_handle(13, 1).unwrap().null_count(), 1);
+    close_field_handle(handle).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
 fn validity_roundtrip_and_null_write() {
     let dir = temp_dir("validity");
     let path = dir.join("price");

@@ -55,7 +55,7 @@ init = length(n) | data(ColumnView) | stream(reader)
 注意事项：
 
 - 创建完成后才可被 `open_field_file` 打开；create 不返回 Handle。
-- 带数据初始化时写真实 `null_count`。
+- 带数据初始化时写真实 `null_count`；stream 初始化由 validity 位 word 批量 popcount 精确统计（批内行尾填充位不计）。
 
 ### 5.2 open_field_file
 
@@ -115,15 +115,22 @@ compressed    →  chunk_ends（open 时累积行末）上 partition_point 二�
 write_field_handle(handle, offset, data: ColumnView) -> Result<()>
 ```
 
-**内部实现**（按物理表示分派）：
+**内部实现**（按物理表示分派；写入三原则：values 逐段 memcpy、validity 字节/word 批量、null_count 增量）：
 ```
-uncompressed  →  MmapMut 切片 values[offset×size .. ] ← copy_from_slice(data.values)
-                  + validity 区 [offset..offset+len] ← 逐 bit 设置（0/1）
-                  + header.generation += 1 → 写回 mmap[0..64]
-compressed    →  working.values 同上 copy_from_slice
+bounds        →  end = offset.checked_add(data.length)（溢出安全）→ end ≤ row_count
+length = 0    →  no-op（不改数据、不递增 generation）
+uncompressed  →  先校验后写入（无 validity 区的字段拒绝含 NULL 的段）
+                  → 逐段：values copy_from_slice（一次连续 memcpy）
+                  + validity：BitmapView::copy_bits_into / bitmap_fill_bits（按字节批量：
+                    头尾掩码 RMW，中间同相位 memcpy / 异相位逐字节移位，不逐 bit）
+                  + null_count 按（覆盖前 1 位数 − 覆盖后 1 位数）增量修正
+                  → generation += 1 → header 回写 mmap[0..64]（落盘即含新 generation / null_count）
+compressed    →  working.values 同上逐段 copy_from_slice
                   + 若段含 NULL 且 working 无位图 → 先物化全 1 位图
-                  + 逐位应用 → null_count 重算 → generation += 1 → modified = true
+                  + Bitmap::copy_bits_from / set_range（字节批量）
+                  + null_count 增量修正（基线 open 时由解压位图精确重建）→ modified = true
 ```
+- 复杂度 O(data.length)，实际执行以连续内存复制为主（接近 memcpy）；`generation` 每次 write 调用恰好 +1，不按段递增
 - write 路径不做 fsync（uncompressed 写入 mmap 即生效；compressed 在 close 时统一落盘）
 - 并发写非重叠区域安全：MmapMut 或 working 上按 offset 切片互不干扰
 
@@ -146,6 +153,7 @@ update_field_handle(handle, header: FieldHeader) -> Result<()>
 ```
 
 - 只修改 header，不修改 data；core 校验 header 与现有 data 的一致性（`row_count`、`data_type` 等）。
+- `null_count` 为派生统计，update 不接受调用方改写（保持现值，由写路径增量维护）。
 - 与 `write_field_handle` 的区别：write 改 data，update 改 header。
 - compressed Field 的 header 更新随 close 流程保持文件一致。
 

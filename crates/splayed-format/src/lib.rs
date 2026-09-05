@@ -13,7 +13,7 @@ pub mod meta;
 pub mod schema;
 pub mod types;
 
-pub use bitmap::{Bitmap, BitmapView};
+pub use bitmap::{Bitmap, BitmapView, bitmap_count_ones, bitmap_fill_bits};
 pub use buffer::{Buffer, BufferView};
 pub use column::{Column, ColumnSegment, ColumnValues, ColumnView, DictBuffers};
 pub use dataview::{Data, DataView};

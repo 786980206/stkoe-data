@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use memmap2::{Mmap, MmapMut};
 use splayed_codec::{decode_chunk, encode_chunk};
 use splayed_format::{
-    Bitmap, BitmapView, Buffer, BufferView, Column, ColumnSegment, ColumnView, Compression,
-    DataType, Encoding, FieldHeader, HEADER_SIZE, validity_size,
+    bitmap_count_ones, bitmap_fill_bits, Bitmap, BitmapView, Buffer, BufferView, Column,
+    ColumnSegment, ColumnView, Compression, DataType, Encoding, FieldHeader, HEADER_SIZE,
+    validity_size,
 };
 
 use crate::error::{CoreError, Mode};
@@ -61,16 +62,6 @@ fn map_io(path: &Path, e: std::io::Error) -> CoreError {
     }
 }
 
-fn pack_segment_bits(view: BitmapView<'_>, len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; (len + 7) / 8];
-    for i in 0..len {
-        if view.is_valid(i) {
-            out[i / 8] |= 1 << (i % 8);
-        }
-    }
-    out
-}
-
 /// 把一个 ColumnView 的内容克隆为拥有字节（values, validity, rows）。
 /// 无任何位图的列返回 `validity = None`（全有效）；混有位图的段按全 1 补齐。
 pub(crate) fn clone_view(view: &ColumnView<'_>) -> (Vec<u8>, Option<Vec<u8>>, usize) {
@@ -82,7 +73,7 @@ pub(crate) fn clone_view(view: &ColumnView<'_>) -> (Vec<u8>, Option<Vec<u8>>, us
         let packed = match seg.validity() {
             Some(bm) => {
                 had_bitmap = true;
-                pack_segment_bits(bm, bm.len())
+                bm.to_packed_bytes()
             }
             None => vec![0xFFu8; (seg.rows() + 7) / 8],
         };
@@ -161,26 +152,30 @@ pub fn create_field_file(
             }
             row_count = total;
 
-            // Phase 3: VALIDITY 顺序写
+            // Phase 3: VALIDITY 顺序写（顺带 word 批量 popcount 精确计 null_count）
             f.seek(SeekFrom::Start(HEADER_SIZE as u64 + data_length))?;
             let validity_bytes = validity_size(row_count);
+            let total_bits = row_count as u64;
+            let mut ones = 0u64;
+            let mut written_bits = 0u64;
             let mut written = 0usize;
             while written < validity_bytes {
                 match reader.next_validity()? {
                     Some(bits) => {
+                        // 批内行尾填充位（不足 8 的尾字节）不计入 1 位统计
+                        let take =
+                            (((bits.len() * 8) as u64).min(total_bits - written_bits)) as usize;
+                        ones += bitmap_count_ones(&bits, 0, take);
                         f.write_all(&bits)?;
+                        written_bits += bits.len() as u64 * 8;
                         written += bits.len();
                     }
                     None => break,
                 }
             }
-            // 补齐剩余 validity（不足时 OS 零填充 = NULL）
-            if written < validity_bytes {
-                f.set_len(HEADER_SIZE as u64 + data_length + validity_bytes as u64)?;
-            }
-            // null_count 由 OS 零填充 + 已写入位决定；stream 场景 NULL 由 validity 位控制
-            // 简化：stream init 不精确计数 null_count（validity 位已足够表达 NULL 语义）
-            null_count = 0;
+            // 规整文件长度（补齐不足 = OS 零填充 NULL；截去批尾越界的填充字节）
+            f.set_len(HEADER_SIZE as u64 + data_length + validity_bytes as u64)?;
+            null_count = (row_count - ones as u32).max(0);
         }
     }
 
@@ -285,6 +280,8 @@ impl FieldHandle {
     }
 
     /// 解压 compressed 文件字节为工作表示（open 时一次性完成）。
+    /// validity 按字节批量合并（copy_bits_from 处理 chunk 与全局位图的字节错位），
+    /// 不逐 bit；null_count 基线由解压位图精确重建（open_field_file 中回写 header）。
     fn decode_working(bytes: &[u8], header: &FieldHeader) -> Result<Working, CoreError> {
         let dt = header.data_type()?;
         let encoding = header.encoding()?;
@@ -292,7 +289,7 @@ impl FieldHandle {
         let size = dt.size_of();
         let mut values = Buffer::zeroed_aligned(header.row_count as usize * size, 8);
         let vsize = validity_size(header.row_count);
-        let mut bits: Option<Vec<u8>> = (vsize > 0).then(|| vec![0u8; vsize]);
+        let mut bits = (vsize > 0).then(|| Bitmap::zeros(header.row_count as usize));
         let mut pos = HEADER_SIZE;
         let mut decoded_rows = 0usize;
         while pos < bytes.len() {
@@ -305,17 +302,11 @@ impl FieldHandle {
                 .copy_from_slice(&chunk_values);
             match (&mut bits, chunk_validity) {
                 (Some(dst), Some(src)) => {
-                    // chunk 位与全局位图存在字节错位，必须逐位合并
-                    for i in 0..rows {
-                        if src[i / 8] >> (i % 8) & 1 == 1 {
-                            dst[(decoded_rows + i) / 8] |= 1 << ((decoded_rows + i) % 8);
-                        }
-                    }
+                    let view = BitmapView::new(BufferView::new(&src), 0, rows)?;
+                    dst.copy_bits_from(decoded_rows, &view, rows);
                 }
                 (Some(dst), None) => {
-                    for i in 0..rows {
-                        dst[(decoded_rows + i) / 8] |= 1 << ((decoded_rows + i) % 8);
-                    }
+                    dst.set_range(decoded_rows, rows, true);
                 }
                 (None, _) => {}
             }
@@ -327,8 +318,7 @@ impl FieldHandle {
                 header.row_count
             )));
         }
-        let validity = bits.map(|b| Bitmap::from_bytes(b, header.row_count as usize));
-        Ok(Working { values, validity })
+        Ok(Working { values, validity: bits })
     }
 
     // --------------------------------------------------------------- read
@@ -394,6 +384,10 @@ impl FieldHandle {
 
     /// 按逻辑行覆盖写入（positional overwrite）：values + validity 成对写入，
     /// 不改逻辑长度；成功后递增 generation。
+    ///
+    /// 写入三原则：values 每段一次连续 memcpy；validity 按字节/word 批量位操作
+    /// （不逐 bit）；null_count 只按覆盖区域的位变化增量维护（不重扫整列）。
+    /// 整体复杂度 O(data.length)，实际执行接近 memcpy。
     pub fn write_field_handle(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
         self.mode.require_write("write_field_handle")?;
         if data.data_type() != self.data_type() {
@@ -403,83 +397,126 @@ impl FieldHandle {
                 self.data_type()
             )));
         }
-        if offset + data.length() as u64 > self.row_count() {
+        // 边界检查溢出安全
+        let end = offset.checked_add(data.length() as u64).ok_or_else(|| {
+            CoreError::Invalid("write range offset + length overflows".into())
+        })?;
+        if end > self.row_count() {
             return Err(CoreError::Invalid("write range exceeds row_count".into()));
         }
-        if self.is_chunked() {
-            self.write_into_working(offset, data)?;
-        } else {
-            self.write_into_mmap(offset, data)?;
+        if data.length() == 0 {
+            // 空写入 no-op：不改数据、不递增 generation
+            return Ok(());
         }
+        if self.is_chunked() {
+            self.write_into_working(offset as usize, data)?;
+        } else {
+            self.write_into_mmap(offset as usize, data)?;
+        }
+        // generation 每次 write 调用恰好 +1（不按段递增）；header 回写在其后，落盘即含新值
         self.header.generation += 1;
         self.modified = true;
+        if let Backing::MmapMut(m) = &mut self.backing {
+            let bytes = self.header.to_bytes();
+            m[..HEADER_SIZE].copy_from_slice(&bytes);
+        }
         Ok(())
     }
 
-    fn write_into_mmap(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
-        let size = self.data_type().size_of();
+    fn write_into_mmap(&mut self, offset: usize, data: &ColumnView) -> Result<(), CoreError> {
+        let width = self.data_type().size_of();
         let has_validity = self.header.has_validity();
-        {
-            let (values, validity) = self.uncompressed_slices_mut()?;
-            let mut pos = offset as usize;
+        if !has_validity {
+            // 先校验后写入：无 validity 区的字段不接受含 NULL 的段
             for seg in data.segments() {
-                let rows = seg.rows();
-                values[pos * size..(pos + rows) * size]
-                    .copy_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
-                if has_validity {
-                    let region = &mut validity[pos..pos + rows];
-                    apply_segment_bits(region, seg.validity())?;
-                } else if let Some(bm) = seg.validity() {
-                    if bm.null_count() > 0 {
+                if let Some(src) = seg.validity() {
+                    if src.count_ones() < seg.rows() {
                         return Err(CoreError::Invalid(
                             "field has no validity region; cannot write NULLs".into(),
                         ));
                     }
                 }
-                pos += rows;
             }
         }
-        let header_bytes = self.header.to_bytes();
-        if let Backing::MmapMut(m) = &mut self.backing {
-            m[..HEADER_SIZE].copy_from_slice(&header_bytes);
+        let mut null_delta: i64 = 0;
+        {
+            let (values, validity) = self.uncompressed_slices_mut()?;
+            let mut row = offset;
+            for seg in data.segments() {
+                let rows = seg.rows();
+                // values：每段一次连续 memcpy
+                values[row * width..(row + rows) * width]
+                    .copy_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
+                match seg.validity() {
+                    Some(src) if has_validity => {
+                        // validity：按字节批量位复制；返回覆盖前后 1 位数做增量
+                        let (old_ones, new_ones) = src.copy_bits_into(validity, row, rows);
+                        null_delta += old_ones as i64 - new_ones as i64;
+                    }
+                    Some(_) => {}
+                    None if has_validity => {
+                        // 段全有效：目标区间批量置 1
+                        let old_ones = bitmap_fill_bits(validity, row, rows, true);
+                        null_delta += old_ones as i64 - rows as i64;
+                    }
+                    None => {}
+                }
+                row += rows;
+            }
+        }
+        if has_validity {
+            // null_count 增量维护：只按覆盖区域的位变化修正，不重扫整列
+            self.header.null_count = (self.header.null_count as i64 + null_delta).max(0) as u32;
         }
         Ok(())
     }
 
-    fn write_into_working(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
-        // 任一段携带含 NULL 的位图且当前无位图时，先物化全 1 位图
-        let needs_bits = data.segments().iter().any(|s| {
-            s.validity().map(|b| b.null_count() > 0).unwrap_or(false)
-        });
-        if needs_bits && self.working.as_ref().unwrap().validity.is_none() {
+    fn write_into_working(&mut self, offset: usize, data: &ColumnView) -> Result<(), CoreError> {
+        // 任一段携带 NULL 且当前无位图时，先物化全 1 位图
+        let needs_bits = data
+            .segments()
+            .iter()
+            .any(|s| s.validity().map(|b| b.count_ones() < b.len()).unwrap_or(false));
+        if needs_bits
+            && self
+                .working
+                .as_ref()
+                .expect("compressed open materializes working")
+                .validity
+                .is_none()
+        {
             self.working.as_mut().unwrap().validity =
                 Some(Bitmap::ones(self.header.row_count as usize));
         }
-        let size = self.data_type().size_of();
+        let width = self.data_type().size_of();
         let work = self.working.as_mut().expect("compressed open materializes working");
-        let mut pos = offset as usize;
+        let mut null_delta: i64 = 0;
+        let mut row = offset;
         for seg in data.segments() {
             let rows = seg.rows();
-            work.values.as_mut_slice()[pos * size..(pos + rows) * size]
+            // values：每段一次连续 memcpy
+            work.values.as_mut_slice()[row * width..(row + rows) * width]
                 .copy_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
-            if let Some(bm) = seg.validity() {
-                if let Some(full) = work.validity.as_mut() {
-                    for i in 0..rows {
-                        full.set(pos + i, bm.is_valid(i));
+            match seg.validity() {
+                Some(src) => {
+                    if let Some(full) = work.validity.as_mut() {
+                        // validity：按字节批量位复制；返回覆盖前后 1 位数做增量
+                        let (old_ones, new_ones) = full.copy_bits_from(row, &src, rows);
+                        null_delta += old_ones as i64 - new_ones as i64;
                     }
-                } else if bm.null_count() > 0 {
-                    return Err(CoreError::Invalid(
-                        "field has no validity region; cannot write NULLs".into(),
-                    ));
+                }
+                None => {
+                    if let Some(full) = work.validity.as_mut() {
+                        // 段全有效：目标区间批量置 1
+                        let old_ones = full.set_range(row, rows, true);
+                        null_delta += old_ones as i64 - rows as i64;
+                    }
                 }
             }
-            pos += rows;
+            row += rows;
         }
-        self.header.null_count = work
-            .validity
-            .as_ref()
-            .map(|b| b.as_view().null_count() as u32)
-            .unwrap_or(0);
+        // null_count 增量维护（基线在 open 时由解压位图精确重建）
+        self.header.null_count = (self.header.null_count as i64 + null_delta).max(0) as u32;
         Ok(())
     }
 
@@ -491,6 +528,8 @@ impl FieldHandle {
         header.version = self.header.version;
         header.data_type = self.header.data_type;
         header.row_count = self.header.row_count;
+        // null_count 是派生统计，由写路径增量维护，不接受调用方改写
+        header.null_count = self.header.null_count;
         header.generation = self.header.generation + 1;
         header.validate()?;
         // 结构派生字段按现值重算，防止调用方传入不一致的布局描述
@@ -574,26 +613,6 @@ impl FieldHandle {
         }
         end
     }
-}
-
-/// 把段的 validity 位应用到一个 bit 区间（`region[i]` ↔ 行 `pos+i`）。
-fn apply_segment_bits(region: &mut [u8], validity: Option<BitmapView<'_>>) -> Result<(), CoreError> {
-    match validity {
-        Some(bm) => {
-            if bm.len() != region.len() {
-                return Err(CoreError::Invalid("validity length does not match rows".into()));
-            }
-            for (i, slot) in region.iter_mut().enumerate() {
-                *slot = u8::from(bm.is_valid(i));
-            }
-        }
-        None => {
-            for slot in region.iter_mut() {
-                *slot = 1;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// 关闭 Handle：read 无写回；uncompressed write 已直接生效（flush + fsync）；
@@ -818,9 +837,11 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
     out.extend_from_slice(&new_header.to_bytes());
     for w in boundaries.windows(2) {
         let (lo, hi) = (w[0] as usize, w[1] as usize);
-        let bits = validity
-            .as_ref()
-            .map(|b| pack_segment_bits(BitmapView::new(BufferView::new(b), lo, hi - lo).unwrap(), hi - lo));
+        let bits = validity.as_ref().map(|b| {
+            BitmapView::new(BufferView::new(b), lo, hi - lo)
+                .expect("validity slice within bounds")
+                .to_packed_bytes()
+        });
         out.extend_from_slice(&encode_chunk(
             Encoding::Plain,
             Compression::Zstd,
@@ -832,9 +853,11 @@ pub fn compress_field_file(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
     }
     let last = *boundaries.last().unwrap() as usize;
     if last < rows {
-        let bits = validity
-            .as_ref()
-            .map(|b| pack_segment_bits(BitmapView::new(BufferView::new(b), last, rows - last).unwrap(), rows - last));
+        let bits = validity.as_ref().map(|b| {
+            BitmapView::new(BufferView::new(b), last, rows - last)
+                .expect("validity slice within bounds")
+                .to_packed_bytes()
+        });
         out.extend_from_slice(&encode_chunk(
             Encoding::Plain,
             Compression::Zstd,
@@ -873,7 +896,7 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
     let mut file = File::open(path).map_err(|e| map_io(path, e))?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     file.read_exact(&mut header_bytes)?;
-    let header = FieldHeader::from_bytes(&header_bytes)?;
+    let mut header = FieldHeader::from_bytes(&header_bytes)?;
     let file_len = file.metadata()?.len() as usize;
     drop(file);
     // 以只读 mmap 完成 chunk 分组读取与工作表示解压
@@ -904,6 +927,11 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
     } else {
         None
     };
+    // compressed 基线：null_count 从解压位图精确重建（word 批量 popcount，O(rows/64)），
+    // 后续写路径只做增量维护
+    if let Some(w) = &working {
+        header.null_count = w.validity.as_ref().map(|b| b.null_count() as u32).unwrap_or(0);
+    }
     drop(map);
     if mode == Mode::Read {
         let file = File::open(path)?;
