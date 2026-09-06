@@ -772,8 +772,28 @@ fn read_parquet_once(
 
 // ---------------------------------------------------------------- 主流程
 
+mod partition;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s == "--mode") .unwrap_or(false) && args.get(2).map(|s| s == "partition").unwrap_or(false) {
+        // partition 模式：--mode partition --scale <rows> --runs <n> --out <csv>
+        let mut scale = 0usize;
+        let mut runs = 3usize;
+        let mut out = PathBuf::from("results/partition_bench.csv");
+        let mut i = 3usize;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--scale" => { i += 1; scale = args[i].parse().unwrap(); }
+                "--runs" => { i += 1; runs = args[i].parse().unwrap(); }
+                "--out" => { i += 1; out = PathBuf::from(&args[i]); }
+                other => panic!("unknown arg {other}"),
+            }
+            i += 1;
+        }
+        partition::run_partition(&out, scale, runs);
+        return;
+    }
     let mut scales: Vec<usize> = vec![1, 5, 10, 20];
     let mut runs = 3usize;
     let mut out = PathBuf::from("results/bench.csv");

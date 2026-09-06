@@ -123,7 +123,27 @@
   sym 整体跳过（零 I/O），parquet 行组过滤仍需逐行组解码探测。
 - **R2 单列**：splayed 快 1.7–20×（读单 Field 文件 vs parquet 列裁剪）。
 
-## 10. Benchmark vs Parquet
+## 10.5 分区基准（docs/benchmark-partition.md，2026-09-06，Year 分区 / 20 列 / 1000 sym）
+
+三引擎同数据同分区粒度（year×4），ZSTD-3。中位数（3 次，ms）：
+
+| 规模 | 场景 | Splayed | DuckDB | Polars | Splayed/DuckDB | Splayed/Polars |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20M | PW1 写入 | **9.9 s** | 21.9 s | 35.8 s | 0.45× | 0.28× |
+| 20M | PR1 全扫描 | **63 ms** | 144 ms | 138 ms | 0.44× | 0.46× |
+| 20M | PR2 单分区 | **17.7 ms** | 64.0 ms | 34.4 ms | 0.28× | 0.51× |
+| 20M | PR3 范围 2 分区 | **34.7 ms** | 86.2 ms | 235.6 ms | 0.40× | 0.15× |
+| 20M | PR4 sym+year | **0.47 ms** | 26.7 ms | 5.2 ms | **0.02×** | 0.09× |
+| 20M | PR5 分区元数据 | **0.77 ms** | 5.3 ms | 12.7 ms | 0.15× | 0.06× |
+
+物理大小（20M）：splayed 1.18 GB / duckdb 1.22 GB / polars 1.21 GB；文件数 splayed 76（4×19）vs 4（各引擎 1 文件/分区）。
+
+**结论**：Splayed 分区表在写入、全扫描、分区裁剪、选择性查询、元数据查询全场景
+均快于 DuckDB 与 Polars 的 Hive 分区 Parquet（PW1 写入快 2–3.6×、PR4 高选择性快
+21–56×、PR5 元数据快 7–16×），且物理大小相当（略小 ~3%）。文件数劣势（76 vs 4）
+被 Splayed 的 META-only 元数据读与零 I/O 裁剪完全覆盖。
+
+
 
 > 基准方法论（数据生成规范 / 参数对齐 / 场景定义 W1+R1–R6 / 指标与校验）已独立成文：
 > **docs/benchmark.md**。正式复测按该文档执行（执行器 `crates/splayed-bench`）。
