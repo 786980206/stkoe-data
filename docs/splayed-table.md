@@ -393,7 +393,8 @@ close_table ≡ handle.close()：drain 全部缓存的 DatasetHandle（逐个 cl
 **接口定义**：
 ```rust
 impl TableHandle {
-    pub fn create_table_field(&self, field: &str, data_type: DataType) -> Result<(), CoreError>
+    pub fn create_table_field(&self, field: &str, data_type: DataType,
+        init: TableFieldInit) -> Result<(), CoreError>
     pub fn delete_table_field(&self, field: &str) -> Result<(), CoreError>
     pub fn update_table_field(&self, field: &str, header: splayed_format::FieldHeader) -> Result<(), CoreError>
     pub fn rename_table_field(&self, field: &str, new_name: &str) -> Result<(), CoreError>
@@ -444,7 +445,10 @@ impl TableHandle {
 
 各 API 语义：
 
-- `create_table_field(field, data_type)`：所有 Partition 新增**全 NULL** 字段
+- `create_table_field(field, data_type, init)`：`init` 支持 `AllNull`（全 NULL）、
+  `Data(col)`（带数据，总行数 = `Σ L_p`，按 Table 自然顺序排列，按各分区行数
+  `slice_rows` 切片后逐分区创建）、`Stream { reader }`（物化全量后按 Data 路径分发）。
+  缺省 AllNull 时
   （`DatasetFieldInit::AllNull` → core `FieldInit::Length`）。压缩策略（`TableOptions.compression`
   非缺省）时产出 **chunked 全 NULL** 字段（每 chunk values 零填充 + validity 全 0 位，
   chunk 边界按各分区自身的 META 网格 sym 对齐推导）——后续 `write_dataset` 写入走

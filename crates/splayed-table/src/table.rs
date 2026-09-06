@@ -47,6 +47,35 @@ pub struct TableHandle {
     stats_cache: RefCell<HashMap<String, DatasetStatistics>>,
 }
 
+/// Table 级字段初始化方式（对标 core `DatasetFieldInit` + 跨分区分发语义）。
+pub enum TableFieldInit {
+    /// 各分区新增全 NULL 字段。
+    AllNull,
+    /// 带数据初始化：总行数 = `Σ L_p`，按 Table 自然顺序（Partition ASC × 分区内
+    /// sym ASC）排列；按各分区行数切片后逐分区创建。
+    Data(Column),
+    /// 流式初始化：物化全量后按 Data 路径分发（两阶段协议不支持跨分区流式分桶）。
+    Stream { reader: Box<dyn splayed_core::FieldChunkReader> },
+}
+
+/// 多段 ColumnView → 拥有型 Column（定宽类型；拼接拷贝）。
+fn column_view_to_owned(view: &splayed_format::ColumnView<'_>, dt: DataType) -> Column {
+    let mut values = Vec::new();
+    let mut validity_bits: Option<Vec<u8>> = None;
+    for seg in view.segments() {
+        values.extend_from_slice(seg.fixed_bytes().unwrap_or(&[]));
+        if let Some(bv) = seg.validity() {
+            let packed = bv.to_packed_bytes();
+            match &mut validity_bits {
+                None => validity_bits = Some(packed),
+                Some(v) => v.extend_from_slice(&packed),
+            }
+        }
+    }
+    let validity = validity_bits.map(|b| splayed_format::Bitmap::from_bytes(b, view.length()));
+    Column { data_type: dt, values: Buffer::from_vec(values), validity, dict: None }
+}
+
 impl TableHandle {
     pub fn path(&self) -> &Path {
         &self.root
@@ -894,16 +923,22 @@ impl TableHandle {
         })
     }
 
-    /// 所有 Partition 新增全 NULL 字段（core `create_field_file(init = length(L_p))`）。
+
+    /// 所有 Partition 新增字段。
     ///
-    /// 最优路径：全 NULL 字段无需物化数据——core 以 `set_len` 稀疏零填充 DATA/VALIDITY
-    /// 区，成本 O(64B header + 稀疏扩展)/分区（非 O(total rows) 写入）。
-    /// 严格前置：所有 Partition 均不含 `field`（避免跨分区 schema 不一致）；
-    /// 失败不回滚，已创建的分区保留。
+    /// `TableFieldInit::AllNull`：各分区新增全 NULL 字段（稀疏 / chunked 取决于
+    /// compression 策略）。
+    /// `TableFieldInit::Data(col)`：带数据初始化——`col` 的总行数必须等于 `Σ L_p`
+    /// 且按 Table 自然顺序（Partition ASC × 分区内 sym ASC）排列；按各分区行数
+    /// 切片后逐分区创建（零拷贝 `slice_rows`）。
+    /// `TableFieldInit::Stream { reader }`：流式初始化——先物化全量（两阶段协议
+    /// 不支持跨分区流式分桶），再按 Data 路径分发。
+    /// 严格前置：所有 Partition 均不含 `field`；失败不回滚。
     pub fn create_table_field(
         &self,
         field: &str,
         data_type: DataType,
+        init: TableFieldInit,
     ) -> Result<(), CoreError> {
         if field == "sym" || field == "time" {
             return Err(CoreError::Invalid(format!("'{field}' is managed by META")));
@@ -921,9 +956,22 @@ impl TableHandle {
             .compression
             .unwrap_or(splayed_format::Compression::None);
         let chunk_target_rows = self.options.chunk_target_rows.unwrap_or(8192);
-        self.structural_for_each(|ds| {
-            // 创建即压缩：按各分区自身的 META 网格自动规划 sym 对齐 chunk 边界
-            let field_options = if matches!(compression, splayed_format::Compression::None) {
+
+        // 逐分区行数（Partition ASC）
+        let part_rows: Vec<usize> = partitions
+            .iter()
+            .map(|p| {
+                self.dataset_for(p)
+                    .and_then(|ds| ds.read_dataset_statistics())
+                    .map(|s| s.row_count as usize)
+                    .unwrap_or(0)
+            })
+            .collect();
+
+        // 压缩选项按分区推导（sym 对齐 chunk 边界由各分区 META 网格决定）
+        let total: usize = part_rows.iter().sum();
+        let make_field_options = |ds: &DatasetHandle| {
+            if matches!(compression, splayed_format::Compression::None) {
                 splayed_core::CreateFieldOptions::default()
             } else {
                 splayed_core::CreateFieldOptions {
@@ -932,17 +980,114 @@ impl TableHandle {
                         ds.sym_aligned_chunk_offsets(chunk_target_rows, splayed_core::CHUNK_ROW_CAP),
                     ),
                 }
-            };
-            ds.create_dataset_field(
-                field,
-                data_type,
-                splayed_core::DatasetFieldInit::AllNull,
-                field_options,
-            )
-        })
+            }
+        };
+
+        match init {
+            TableFieldInit::AllNull => {
+                self.structural_for_each(|ds| {
+                    let fo = make_field_options(ds);
+                    ds.create_dataset_field(
+                        field,
+                        data_type,
+                        splayed_core::DatasetFieldInit::AllNull,
+                        fo,
+                    )
+                })
+            }
+            TableFieldInit::Data(col) => {
+                if col.data_type != data_type {
+                    return Err(CoreError::Invalid(format!(
+                        "init data type {:?} does not match requested {data_type:?}",
+                        col.data_type
+                    )));
+                }
+                let total: usize = part_rows.iter().sum();
+                if col.length() != total {
+                    return Err(CoreError::Invalid(format!(
+                        "column length {} != total partition rows {total}",
+                        col.length()
+                    )));
+                }
+                // 按分区行数切片，逐分区创建
+                // 收集互不相交 &mut DatasetHandle（values_mut 模式，同 structural_for_each）
+                let mut guard = self.datasets.borrow_mut();
+                let mut handles: HashMap<&str, &mut DatasetHandle> = guard
+                    .iter_mut()
+                    .map(|(k, v)| (k.as_str(), &mut **v))
+                    .collect();
+                let mut off = 0usize;
+                for (p, &lp) in partitions.iter().zip(&part_rows) {
+                    let ds = handles.get_mut(p.as_str()).expect("partition handle");
+                    let fo = make_field_options(ds);
+                    let sliced = col.as_view().slice_rows(off, lp).map_err(CoreError::from)?;
+                    let sliced_col = column_view_to_owned(&sliced, data_type);
+                    ds.create_dataset_field(
+                        field,
+                        data_type,
+                        splayed_core::DatasetFieldInit::Data(sliced_col),
+                        fo,
+                    )?;
+                    off += lp;
+                }
+                Ok(())
+            }
+            TableFieldInit::Stream { mut reader } => {
+                // 两阶段协议使跨分区流式分发需物化全列——先物化再走 Data 路径
+                let mut values = Vec::new();
+                let mut validity: Option<Vec<u8>> = None;
+                let mut total_values = 0usize;
+                while let Some(batch) = reader.next_values()? {
+                    values.extend_from_slice(&batch.values);
+                    total_values += batch.rows;
+                }
+                while let Some(bits) = reader.next_validity()? {
+                    match &mut validity {
+                        None => validity = Some(bits),
+                        Some(v) => v.extend_from_slice(&bits),
+                    }
+                }
+                drop(reader);
+                let per_row = if total_values > 0 { values.len() / total_values } else { 0 };
+                let col = Column {
+                    data_type,
+                    values: Buffer::from_vec(values),
+                    validity: validity.map(|b| splayed_format::Bitmap::from_bytes(b, total_values)),
+                    dict: None,
+                };
+                let _ = per_row;
+                if col.length() != total {
+                    return Err(CoreError::Invalid(format!(
+                        "stream produced {} rows != total partition rows {total}",
+                        col.length()
+                    )));
+                }
+                // 按 Data 路径分发
+                let mut guard = self.datasets.borrow_mut();
+                let mut handles: HashMap<&str, &mut DatasetHandle> = guard
+                    .iter_mut()
+                    .map(|(k, v)| (k.as_str(), &mut **v))
+                    .collect();
+                let mut off = 0usize;
+                for (p, &lp) in partitions.iter().zip(&part_rows) {
+                    let ds = handles.get_mut(p.as_str()).expect("partition handle");
+                    let fo = make_field_options(ds);
+                    let sliced = col.as_view().slice_rows(off, lp).map_err(CoreError::from)?;
+                    let sliced_col = column_view_to_owned(&sliced, data_type);
+                    ds.create_dataset_field(
+                        field,
+                        data_type,
+                        splayed_core::DatasetFieldInit::Data(sliced_col),
+                        fo,
+                    )?;
+                    off += lp;
+                }
+                Ok(())
+            }
+        }
     }
 
-    /// 删除所有 Partition 中的同名字段（直接删物理文件，不打开 Field）。
+    /// 删除所有 Partition 中的同名字段。    /// 删除所有 Partition 中的同名字段（直接删物理文件，不打开 Field）。
     /// 严格前置：所有 Partition 均含该字段（先全量校验再执行，避免部分删除后
     /// Table schema 不一致）；失败不回滚。
     pub fn delete_table_field(&self, field: &str) -> Result<(), CoreError> {

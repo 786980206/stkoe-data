@@ -665,7 +665,7 @@ fn create_dataset_with_compression() {
         two_field_data(),
         splayed_core::CreateDatasetOptions {
             compression: splayed_format::Compression::Zstd,
-            chunk_syms: 1,
+            chunk_target_rows: 1,
             ..Default::default()
         },
     )

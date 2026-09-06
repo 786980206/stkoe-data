@@ -356,11 +356,11 @@ fn table_field_structure_operations() {
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // create：全 NULL
-    table.create_table_field("volume", DataType::Int64).unwrap();
+    table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).unwrap();
     let schema = table.read_table_schema().unwrap();
     assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
     // 重复创建 → Error
-    assert!(table.create_table_field("volume", DataType::Int64).is_err());
+    assert!(table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).is_err());
 
     // update：header（volume 保持 Int64，行数由 core 强制）
     // update 需要合法 FieldHeader：用 core 的 new_uncompressed 构造
@@ -635,9 +635,9 @@ fn table_field_struct_ops_parallel_and_state_checks() {
 
     let table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
     // create：并行全分区新增（全 NULL = 稀疏 set_len，非逐行写入）
-    table.create_table_field("volume", DataType::Int64).unwrap();
+    table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).unwrap();
     assert_eq!(table.read_table_schema().unwrap().data_type_of("volume"), Some(DataType::Int64));
-    assert!(table.create_table_field("volume", DataType::Int64).is_err()); // 已存在 → Invalid
+    assert!(table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).is_err()); // 已存在 → Invalid
     assert!(table.delete_table_field("nope").is_err()); // 缺字段 → Invalid
 
     // compress / decompress：并行重操作；64B header 状态前置校验
@@ -969,7 +969,7 @@ fn create_table_compression_and_partition_override() {
         PartitionScheme::Month,
         TableOptions {
             compression: Some(splayed_format::Compression::Zstd),
-            chunk_syms: Some(1),
+            chunk_target_rows: Some(1),
             ..Default::default()
         },
     )
