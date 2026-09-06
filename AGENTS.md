@@ -12,8 +12,6 @@ Splayed V2.0 is a Rust columnar storage engine for `SYM × TIME × FIELD` financ
 
 Before changing any format, header, or function signature, read the relevant section; update the corresponding doc in the same change.
 
-V1.0 归档于 git 分支（`f572500` 快照），`plan.md` 为 V1 规格——不要再以它为准。
-
 ## Workspace Layout
 
 ```
@@ -25,7 +23,6 @@ crates/
   splayed-table/           # depends on core — 表层 API（Partition = Dataset 1:1、Hive 式分区、query/write/结构操作）
   splayed-arrow/           # depends on core — Arrow 类型映射与零拷贝转换（column_to_arrow / data_to_record_batch / scan_to_arrow）
   splayed-polars/          # depends on core + polars 0.45 — AnonymousScan 惰性扫描（分区发现 / vstack 合并）
-# V1 遗留 crate 在 Cargo.toml exclude 中（splayed / adbc / datafusion / duckdb / cli / python），待模块对齐阶段回归
 ```
 
 **Dependency invariant:** `splayed-core` must NEVER depend on Arrow. Arrow-related functions live in `splayed-arrow`; engine adapters depend on core directly.
@@ -100,5 +97,5 @@ cargo test         # all tests must pass
 - 设计文档（format / codec / core / table / arrow / adapters）：**Complete**（docs/）。
 - format / codec / core / table / arrow / polars 实现 + 对齐审查：**Complete**。
 - 性能优化批次：read/write 零拷贝与批量位操作、Scanner 批量管线（向量化谓词 + word 级命中区）、META 构建轴二分 + 连续子区间校验、close/cast/compress/decompress 流式化：**Complete**。
-- 循环7c splayed-duckdb（IPC 桥）与 循环7d splayed-adbc（DataFusion provider）：**Pending**（V1 实现参考归档分支）。
+- 循环7c splayed-duckdb（IPC 桥）与 循环7d splayed-adbc（DataFusion provider）：**Pending**。
 - Benchmark 复测（首轮基线后的一批优化未计入）：**Pending**。

@@ -334,7 +334,7 @@ fn agg_splayed(table: &TableHandle, sc: &str, year: usize) -> (usize, i64, i64) 
 pub fn run_partition(out: &PathBuf, total_rows: usize, runs: usize) {
     let gen = PartitionGen::new(total_rows);
     let years = gen.years();
-    let year_rows = gen.year_rows();
+    let _year_rows = gen.year_rows();
     let exists_new = !out.exists();
     let mut csv = PCsv::open(out);
 

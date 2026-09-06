@@ -2,8 +2,6 @@
 
 Rust 列式存储引擎：`SYM × TIME × FIELD` 金融时序数据。容量网格逻辑行空间、validity bitmap NULL 语义、PLAIN/DELTA/RLE/BITPACK + ZSTD/LZ4 chunk 压缩、零拷贝 `ColumnView`/`DataView` 交换结构。
 
-> V1.0 归档于 git 分支（快照 `f572500`，其完整 README 随分支保留）。V2.0 为重写实现，本 README 只做导航。
-
 ## 文档（权威）
 
 | 文档 | 内容 |
@@ -30,8 +28,6 @@ crates/
   splayed-arrow/    # Arrow 类型映射与零拷贝转换
   splayed-polars/   # Polars AnonymousScan 惰性扫描
 ```
-
-V1 遗留 crate（umbrella / adbc / datafusion / duckdb / cli / python）在 `Cargo.toml` exclude 中，待模块对齐阶段回归。
 
 ## Build & Test
 

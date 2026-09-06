@@ -35,7 +35,7 @@ SELECT sym, avg(close) FROM read_splayed('data/2024')
 ```
 
 > 扫描当前为「全列 + 全时间」；谓词下推（时间范围/分区列）、写入、物化视图等
-> 逐步在 Rust 层 C ABI 扩展，壳只跟进新入口（见 plan.md §10.4）。
+> 逐步在 Rust 层 C ABI 扩展，壳只跟进新入口。
 
 ## 文件
 

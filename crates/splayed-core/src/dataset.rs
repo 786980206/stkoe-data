@@ -29,7 +29,7 @@ const SCAN_PARALLEL_MIN_ROWS: u64 = 1 << 16;
 /// ```text
 /// dataset/
 /// ├── .meta          // Index：sym/time → 逻辑行
-/// └── <name>         // 字段数据文件（字段名即文件名，沿用 V1.0 约定）
+/// └── <name>         // 字段数据文件（字段名即文件名）
 /// ```
 pub const META_FILE_NAME: &str = ".meta";
 /// 保留字段名：sym / time 由 META 管理，不作为普通 Field。

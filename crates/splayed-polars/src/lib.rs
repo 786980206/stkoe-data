@@ -1,7 +1,7 @@
 //! splayed-polars：V2.0 Polars 适配层（AnonymousScan 惰性扫描）。
 //!
-//! 权威设计见 `docs/splayed-adapters.md` §1。v1 为拷贝级列转换（列 → polars
-//! Series）；谓词 v1 不下推（polars 行级过滤兜底，`allows_predicate_pushdown = false`）；
+//! 权威设计见 `docs/splayed-adapters.md` §1。当前为拷贝级列转换（列 → polars
+//! Series）；谓词暂不下推（polars 行级过滤兜底，`allows_predicate_pushdown = false`）；
 //! sym/time 下推与零拷贝转换为 v2.1 优化项。
 
 use std::any::Any;
@@ -349,7 +349,7 @@ impl AnonymousScan for SplayedTable {
     }
 
     fn allows_predicate_pushdown(&self) -> bool {
-        // 谓词 v1 不下推（polars 行级过滤兜底）
+        // 谓词暂不下推（polars 行级过滤兜底）
         false
     }
 

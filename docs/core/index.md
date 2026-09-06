@@ -141,4 +141,4 @@ row(sym_i, time_index) = row_start(i) + (time_index - time_start(i))
 - sym 区间内缺失的时间点**仍然是逻辑行**（Field 预分配容量的一部分），值为 NULL（validity = 0）。
 - 「实际有效行数」通过 validity / `null_count` 表达，不改变逻辑长度。
 
-> 规范说明：草稿中「缺失位置不构成 META 的逻辑行」与「META 将逻辑 row range 映射为各 Field 物理 range」相互矛盾；且 META 只保存 sym 区间，无法得知区间内哪些时间点真实存在。故统一采用容量网格语义（与 V1.0 一致，零拷贝路径最短）。
+> 规范说明：草稿中「缺失位置不构成 META 的逻辑行」与「META 将逻辑 row range 映射为各 Field 物理 range」相互矛盾；且 META 只保存 sym 区间，无法得知区间内哪些时间点真实存在。故统一采用容量网格语义（零拷贝路径最短）。
