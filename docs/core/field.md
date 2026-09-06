@@ -139,7 +139,7 @@ write     →  MmapMut 挂载
 - 打开时校验 magic / version。
 - `read`：允许 read / scan；不修改原文件；compressed Field 的解压对上层隐藏。
 - `write`：允许 read / scan / write / update。uncompressed 直接原地修改；compressed 内部进入解压后的 working representation，发生修改后由 close 自动重压缩写回。
-- compressed 打开即全量解压是当前实现策略；chunk 级惰性解码为后续优化项（见 design-boundary）。
+- compressed 打开即全量解压是当前实现策略；chunk 级惰性解码为后续优化项（见 splayed-core 性能审查记录）。
 
 ### 5.4 delete_field_file
 

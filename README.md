@@ -14,7 +14,7 @@ Rust 列式存储引擎：`SYM × TIME × FIELD` 金融时序数据。容量网�
 | [docs/core/field.md](docs/core/field.md) | Field 层 API 与内部实现流程（create/open/read/write/scan/close/cast/compress/decompress） |
 | [docs/core/meta.md](docs/core/meta.md) | META 层 API 与内部实现流程（MetaBuilder、index 读取/扫描/定位） |
 | [docs/core/dataset.md](docs/core/dataset.md) | Dataset 层 API 与内部实现流程 |
-| [docs/core/design-boundary.md](docs/core/design-boundary.md) | 设计边界、性能审查记录、Benchmark vs Parquet 基线 |
+| [docs/benchmark.md](docs/benchmark.md) | 基准方法论与结果（Splayed vs Parquet / DuckDB / Polars） |
 | [docs/splayed-table.md](docs/splayed-table.md) | 表层设计（Partition = Dataset 1:1、Hive 式分区） |
 | [docs/splayed-arrow.md](docs/splayed-arrow.md) | Arrow 类型映射与零拷贝边界 |
 | [docs/splayed-codec.md](docs/splayed-codec.md) | 编码/压缩设计与 chunk 布局 |

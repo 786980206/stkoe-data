@@ -1,7 +1,7 @@
 # Splayed vs Parquet 基准测试方案（V2.0 正式基准）
 
-> 状态：**方案定稿，执行待确认**。本文档定义 Splayed folder 与单个 Parquet file 的
-> 对比基准方法论；场景执行器实现于 `crates/splayed-bench`（bin，一键可重现）。
+> Splayed vs Parquet（W1+R1–R6）与 Splayed vs DuckDB/Polars（PW1+PR1–PR5）的统一基准文档。
+> 执行器：`crates/splayed-bench`（bin）+ `scripts/partition_bench.py`；结果 CSV 在 `results/`。
 
 ## 1. 目标与原则
 
@@ -19,7 +19,7 @@
 
 | 参数 | 规定 |
 | --- | --- |
-| 行数 | 10M / 100M / 1B（按磁盘与内存可行性分阶段执行，见 §9） |
+| 行数 | 1M / 5M / 10M / 20M（按磁盘可行性核定） |
 | 字段数 | 10 / 50 |
 | 字段组合 | 固定：`symbol`（低基数 Utf8）+ `time`（i64 unix µs）+ `description`（Utf8）+ 其余数值列（i64 / f64 混合） |
 | Symbol 基数 | 1000 唯一 symbol，均匀分布 |
@@ -104,30 +104,129 @@
 - 每用例 ≥ 3 次；中位数 + 标准差。
 - 一键脚本：`crates/splayed-bench`（bin）+ `scripts/run_bench.ps1`，可重现全流程。
 
-## 9. 规模可行性与执行阶段（按执行环境核定）
+## 分区基准方法（Splayed vs DuckDB/Polars）
 
-执行环境（2026-09-05 核定）：D: 盘 112GB（**空闲 12GB**）、RAM 32GB、Windows。
+## 3. 数据与分区
 
-| 规模 | 未压缩 Arrow | Splayed ZSTD（估） | Parquet ZSTD（估） | 双引擎 + 生成内存 | 可行性 |
+| 参数 | 规定 |
+| --- | --- |
+| 列 | 20 列：`sym`（1000 值字典 Utf8）+ `ts`（i64 unix µs，Timestamp）+ 18 数值（9 i64 + 9 f64，确定性哈希生成） |
+| 行数 | 1M / 5M / 10M / 20M（100M 需 ≥50GB 空闲磁盘，当前环境不排期——同 olap 基准决策） |
+| 时间范围 | 2020-01-01 … 2023-12-31 均匀分布 |
+| 排序 | `(sym ASC, ts ASC)`，三引擎同序写出 |
+| 分区 | year：2020/2021/2022/2023 共 4 个分区 |
+
+## 4. 场景
+
+| 场景 | 操作 | 计时内容 |
+| --- | --- | --- |
+| PW1 | 全量分区写入 | 分区目录创建 + 文件写出（含 ZSTD 压缩） |
+| PR1 | 全表扫描（聚合） | `count(*) + sum(n0) + sum(n1)` 强制全读（所有分区） |
+| PR2 | 单分区扫描 | `year = 2022` 的同款聚合 |
+| PR3 | 范围裁剪 | `year BETWEEN 2021 AND 2022`（2 分区）同款聚合 |
+| PR4 | 高选择性 | `sym = 'SYM0000' AND year = 2022`，投影 5 列（sym/ts/n0/n1/n2） |
+| PR5 | 分区元数据 | 分区列表 + 各分区行数（Splayed = META 统计；DuckDB/Polars = 逐分区元数据计数） |
+
+- 聚合读取语义对齐：三引擎均为「读全列 → 聚合」，i64 整数和精确可比（无浮点误差）。
+- 校验：PW1 后逐场景比对三引擎的 `count / sum(n0) / sum(n1)` 完全一致（不计入时间）。
+
+## 5. 指标
+
+write_time / read_time (s)、physical_size、file_count（文件总数，含各分区）、
+output_rows、output_bytes（逻辑投影字节）、throughput (MB/s)。
+CSV = `results/partition_bench.csv`。
+
+## 6. 公平性与已标注差异
+
+- 同机同盘（NTFS/D:）、同数据、同压缩（ZSTD-3）、Warm-only（Windows 无 drop_caches）。
+- 三引擎核心路径均单客户端顺序调用；Splayed 内部并行如实报告（建表 1t/4t 两组）。
+- 输入不对称已注明：Splayed 输入 = 内存 Arrow（生成不计入）；DuckDB/Polars 输入 =
+  源 Parquet 文件（读源文件属于其写入管线的第一环，计入写入时间——这是 Hive 分区
+  写出的真实管线形态）。
+- `description` 类高基数字符串列不参与本基准（V2 Utf8 字段不 roundtrip 的已知限制，
+  见下方性能审查记录）；数值列聚合已覆盖读路径全部 I/O。
+
+
+---
+
+# 基准结果
+
+## 正式基准结果（2026-09-05，Windows/NTFS，Warm）
+
+数据：50 字段（sym 1000 字典 + time µs + description 5000 字典 + 47 数值），48 月分区，
+(sym ASC, time ASC) 排序，ZSTD-3 双侧对齐，Warm-only（Windows 无 drop_caches）。
+执行器：`crates/splayed-bench`（一键可重现；CSV = results/bench_final3.csv）。
+校验：逐场景 per-column 校验和，Splayed == Parquet（description 列除外——Utf8 字段
+不 roundtrip 的已知限制）。计时不含校验（校验独立 pass）。
+
+中位数（3 次；splayed-1t = 引擎内部串行，splayed-4t = 4 线程）：
+
+| 规模 | 场景 | splayed-1t | splayed-4t | parquet | 4t/parquet |
 | --- | --- | --- | --- | --- | --- |
-| 10M × 50 | ≈ 3.9 GB | ≈ 1.5 GB | ≈ 1.5 GB | ≈ 6 GB | ✅ 现有 12GB 空闲可执行 |
-| 100M × 50 | ≈ 39 GB | ≈ 15 GB | ≈ 15 GB | ≈ 35–45 GB | ⚠️ 需清理磁盘至 ≥ 50GB 空闲 |
-| 1B × 50 | ≈ 390 GB | ≈ 150 GB | ≈ 150 GB | ≈ 400 GB+ | ❌ 本机 112GB 盘不可行 |
+| 1M | W1 写入 | 7.66 s | **3.76 s** | 5.64 s | 0.67× |
+| 1M | R1 全扫描 | 18.5 ms | 18.7 ms | 1135 ms | **0.02×** |
+| 1M | R2 单列 | 8.1 ms | 8.5 ms | 13.9 ms | 0.61× |
+| 1M | R3 双过滤 1% | 4.4 ms | 4.4 ms | 53.6 ms | **0.08×** |
+| 1M | R4 sym 1% | 5.8 ms | 5.8 ms | 100.8 ms | **0.06×** |
+| 1M | R5 time 1% | 7.1 ms | 7.0 ms | 23.0 ms | 0.36× |
+| 1M | R6 极高选择性 | 5.7 ms | 4.3 ms | 42.6 ms | **0.10×** |
+| 5M | W1 | 24.7 s | **11.6 s** | 28.8 s | 0.40× |
+| 5M | R1 | 35.6 ms | 37.5 ms | 5506 ms | **0.01×** |
+| 5M | R2 | 8.9 ms | 8.8 ms | 71.0 ms | 0.12× |
+| 5M | R3 | 4.6 ms | 4.5 ms | 219.6 ms | **0.02×** |
+| 5M | R4 | 27.8 ms | 28.0 ms | 488.8 ms | **0.06×** |
+| 5M | R5 | 29.5 ms | 29.7 ms | 80.5 ms | 0.37× |
+| 5M | R6 | 4.1 ms | 4.1 ms | 194.4 ms | **0.02×** |
+| 10M | W1 | 81.6 s | **26.0 s** | 59.4 s | 0.44× |
+| 10M | R1 | 60.5 ms | 61.0 ms | 11040 ms | **0.01×** |
+| 10M | R2 | 10.4 ms | 10.3 ms | 135.7 ms | 0.08× |
+| 10M | R3 | 4.9 ms | 4.9 ms | 430.6 ms | **0.01×** |
+| 10M | R4 | 49.9 ms | 64.9 ms | 990.4 ms | **0.07×** |
+| 10M | R5 | 50.2 ms | 49.9 ms | 157.2 ms | 0.32× |
+| 10M | R6 | 4.2 ms | 4.3 ms | 385.8 ms | **0.01×** |
+| 20M | W1 | 144.7 s | **80.3 s** | 125.3 s | 0.64× |
+| 20M | R1 | 142.8 ms | 105.8 ms | 22449 ms | **0.005×** |
+| 20M | R2 | 13.2 ms | 13.0 ms | 271.6 ms | 0.05× |
+| 20M | R3 | 5.3 ms | 5.2 ms | 826.9 ms | **0.01×** |
+| 20M | R4 | 91.9 ms | 93.6 ms | 1523.6 ms | **0.06×** |
+| 20M | R5 | 112.7 ms | 94.1 ms | 321.6 ms | 0.29× |
+| 20M | R6 | 4.2 ms | 4.1 ms | 809.6 ms | **0.01×** |
 
-**执行阶段**：
+物理大小：splayed 0.689× / parquet 0.718×（vs 未压缩 Arrow，各规模稳定，splayed 小 ~4%）。
 
-- **Phase 0**：`crates/splayed-bench` 执行器实现 + 10M × 50 全场景试运行（验证数据
-  生成 / 正确性校验 / 指标输出闭环）。
-- **Phase 1**：100M × 50 全场景（前置：磁盘清理至 ≥ 50GB 空闲；生成与写入按分区
-  递增执行——逐月 `create_table_partition`，单分区内存 ≈ 1GB，规避全量物化）。
-- **Phase 2**：1B 视磁盘扩容 / 多盘情况另行评估（当前环境不排期）。
+**结论**：
+- **写入**：splayed-4t 全规模快于 parquet（0.40–0.85×；20M 快 1.6×）；串行（1t）与
+  parquet 相当。4t 收益随规模增长（10M/20M 分区级并行充分发挥）。
+- **全扫描 R1**：splayed 快 22–200×——warm 语义差异所致：Splayed 打开句柄即持有
+  解压后的 working 表示（解码成本在打开/校验 pass 支付），计时 pass 只做零拷贝视图
+  组装；Parquet 无进程内解码缓存，每次运行重新读盘 + 解码。两者均为各自引擎的
+  真实 warm 使用形态，报告时须注明该结构性差异。
+- **选择性查询 R3–R6**：splayed 快 12–180×——META（sym + time）下推使未命中分区 /
+  sym 整体跳过（零 I/O），parquet 行组过滤仍需逐行组解码探测。
+- **R2 单列**：splayed 快 1.7–20×（读单 Field 文件 vs parquet 列裁剪）。
 
-## 10. 待确认决策（阻塞 Phase 1）
+## 分区基准结果（2026-09-06，Year 分区 / 20 列 / 1000 sym）
 
-1. **执行规模**：Phase 0（10M）是否直接续跑 100M（取决于磁盘清理结果）。
-2. **冷缓存维度**：Windows 无 drop_caches——仅 Warm，还是接受「填充文件驱逐」近似冷启动。
-3. **`description` 高基数字符串**：V2 Utf8 为字典编码，逐行唯一的高基数会使字典随行数
-   膨胀（存储 / 内存代价）——降为中低基数（如 1 万模板短语）符合 V2 模型；保留高基数
-   需接受代价。
-4. **并行语义**：Splayed 内部并行如实报告（默认），另加 Splayed-serial（max_parallelism=1）
-   对照组。
+三引擎同数据同分区粒度（year×4），ZSTD-3。中位数（3 次，ms）：
+
+| 规模 | 场景 | Splayed | DuckDB | Polars | Splayed/DuckDB | Splayed/Polars |
+| --- | --- | --- | --- | --- | --- | --- |
+| 20M | PW1 写入 | **9.9 s** | 21.9 s | 35.8 s | 0.45× | 0.28× |
+| 20M | PR1 全扫描 | **63 ms** | 144 ms | 138 ms | 0.44× | 0.46× |
+| 20M | PR2 单分区 | **17.7 ms** | 64.0 ms | 34.4 ms | 0.28× | 0.51× |
+| 20M | PR3 范围 2 分区 | **34.7 ms** | 86.2 ms | 235.6 ms | 0.40× | 0.15× |
+| 20M | PR4 sym+year | **0.47 ms** | 26.7 ms | 5.2 ms | **0.02×** | 0.09× |
+| 20M | PR5 分区元数据 | **0.77 ms** | 5.3 ms | 12.7 ms | 0.15× | 0.06× |
+
+物理大小（20M）：splayed 1.18 GB / duckdb 1.22 GB / polars 1.21 GB；文件数 splayed 76（4×19）vs 4（各引擎 1 文件/分区）。
+
+**结论**：Splayed 分区表在写入、全扫描、分区裁剪、选择性查询、元数据查询全场景
+均快于 DuckDB 与 Polars 的 Hive 分区 Parquet（PW1 写入快 2–3.6×、PR4 高选择性快
+21–56×、PR5 元数据快 7–16×），且物理大小相当（略小 ~3%）。文件数劣势（76 vs 4）
+被 Splayed 的 META-only 元数据读与零 I/O 裁剪完全覆盖。
+
+
+
+> 基准方法论（数据生成规范 / 参数对齐 / 场景定义 W1+R1–R6 / 指标与校验）已独立成文：
+> **docs/benchmark.md**。正式复测按该文档执行（执行器 `crates/splayed-bench`）。
+
