@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
 use splayed_core::{CmpOp, Mode, Predicate, Scalar};
 use splayed_table::{
-    create_table, create_table_partition, delete_table, delete_table_partition, open_table,
-    query_table, rename_table, scan_table, write_table, PartitionScheme, TableOptions,
+    create_table, create_table_columns, create_table_partition, delete_table, delete_table_partition,
+    open_table, query_table, rename_table, scan_table, write_table, PartitionScheme, TableOptions,
     TableScanRequest,
 };
 
@@ -35,6 +35,14 @@ fn i32s(view: &splayed_format::ColumnView<'_>) -> Vec<i32> {
     view.segments()
         .iter()
         .flat_map(|s| bytemuck::cast_slice::<u8, i32>(s.fixed_bytes().unwrap()).to_vec())
+        .collect()
+}
+
+/// 取 i64 列全部行值（跨段拼接）。
+fn i64s(view: &splayed_format::ColumnView<'_>) -> Vec<i64> {
+    view.segments()
+        .iter()
+        .flat_map(|s| bytemuck::cast_slice::<u8, i64>(s.fixed_bytes().unwrap()).to_vec())
         .collect()
 }
 
@@ -997,5 +1005,182 @@ fn create_table_compression_and_partition_override() {
     }
     reader.close().unwrap();
     assert_eq!(got, vec![10.0, 11.0, 20.0, 21.0, 30.0, 40.0]);
+    cleanup(&dir);
+}
+
+/// 构造带额外列的 Data：sym/time 来自 (sym, day) 对，cols 为 (name, 定宽列) 列表。
+/// 调用方保证 (sym, day) 有序唯一；cols 列长度 = rows 长度。
+fn build_multi_col_data(rows: &[(&str, i32)], cols: Vec<(&str, Column)>) -> Data {
+    let syms: Vec<&str> = rows.iter().map(|r| r.0).collect();
+    let times: Vec<i32> = rows.iter().map(|r| r.1).collect();
+    let mut dict: Vec<&str> = syms.clone();
+    dict.sort();
+    dict.dedup();
+    let mut offsets = vec![0u64];
+    let mut strings = Vec::new();
+    for s in &dict {
+        strings.extend_from_slice(s.as_bytes());
+        offsets.push(strings.len() as u64);
+    }
+    let keys: Vec<u32> = syms
+        .iter()
+        .map(|s| dict.iter().position(|x| x == s).unwrap() as u32)
+        .collect();
+    let sym_col = Column::from_dict(keys, offsets, strings, None);
+    let time_col = Column {
+        data_type: DataType::Date32,
+        values: Buffer::from_slice_copy(&times),
+        validity: None,
+        dict: None,
+    };
+    let mut fields = vec![
+        FieldSchema::new("sym", DataType::Utf8),
+        FieldSchema::new("time", DataType::Date32),
+    ];
+    let mut columns = vec![sym_col, time_col];
+    for (name, col) in cols {
+        fields.push(FieldSchema::new(name, col.data_type));
+        columns.push(col);
+    }
+    Data::new(Schema::new(fields), columns).unwrap()
+}
+
+/// 定宽列构造：全有效 + 给定值。
+fn fixed_col(dt: DataType, bytes: Vec<u8>) -> Column {
+    Column {
+        data_type: dt,
+        values: Buffer::from_vec(bytes),
+        validity: None,
+        dict: None,
+    }
+}
+
+/// create_table_columns：子集输入为新缺失列建列，未覆盖行为 NULL，已有列不被改写。
+#[test]
+fn create_table_columns_creates_missing_columns_subset() {
+    let dir = temp_dir("crc_subset");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+
+    // 子集输入：只覆盖 08 分区的 AAPL/MSFT 各一行（08-03）；新增 volume(i64)/qty(i32)
+    let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
+    let i64v: Vec<i64> = vec![111, 222];
+    let i32v: Vec<i32> = vec![11, 22];
+    let data = build_multi_col_data(
+        &[("AAPL", d803), ("MSFT", d803)],
+        vec![
+            ("volume", fixed_col(DataType::Int64, bytemuck::cast_slice(&i64v).to_vec())),
+            ("qty", fixed_col(DataType::Int32, bytemuck::cast_slice(&i32v).to_vec())),
+        ],
+    );
+    create_table_columns(&table, &data.as_view()).unwrap();
+
+    // schema 含新列且类型正确
+    let schema = table.read_table_schema().unwrap();
+    assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
+    assert_eq!(schema.data_type_of("qty"), Some(DataType::Int32));
+    assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
+
+    // 08 分区：volume/qty 覆盖行有值，未覆盖行为 NULL；price 未被改写
+    let req = TableScanRequest {
+        time: Some((d803 as i64, (d803 + 1) as i64)),
+        ..Default::default()
+    };
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut vol = Vec::new();
+    let mut qty = Vec::new();
+    let mut price = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        vol.extend(i64s(view.column("volume").unwrap()));
+        qty.extend(i32s(view.column("qty").unwrap()));
+        price.extend(f64s(view.column("price").unwrap()));
+    }
+    reader.close().unwrap();
+    assert_eq!(vol, vec![111, 222]);
+    assert_eq!(qty, vec![11, 22]);
+    assert_eq!(price, vec![10.0, 20.0]); // price 未被动
+
+    // 09 分区：volume/qty 已建且全 NULL（无输入行覆盖）
+    let d901 = splayed_table::days_from_civil(2026, 9, 1) as i32;
+    let req = TableScanRequest {
+        time: Some((d901 as i64, (d901 + 1) as i64)),
+        ..Default::default()
+    };
+    let mut reader = query_table(&table, req, None).unwrap();
+    while let Some(view) = reader.next().unwrap() {
+        let v = view.column("volume").unwrap();
+        for i in 0..view.length() {
+            assert!(!is_valid_at(v, i), "volume row {i} should be NULL");
+        }
+    }
+    reader.close().unwrap();
+    drop(table);
+    cleanup(&dir);
+}
+
+/// create_table_columns：已有列同类型 → 不报错且不覆盖；新列正常创建。
+#[test]
+fn create_table_columns_skips_existing_same_type() {
+    let dir = temp_dir("crc_skip");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+
+    // 输入含已有 price(Float64) + 新 volume(Int64)，覆盖 08-04 两行
+    let d804 = splayed_table::days_from_civil(2026, 8, 4) as i32;
+    let pr: Vec<f64> = vec![999.0, 888.0];
+    let vv: Vec<i64> = vec![1, 2];
+    let data = build_multi_col_data(
+        &[("AAPL", d804), ("MSFT", d804)],
+        vec![
+            ("price", fixed_col(DataType::Float64, bytemuck::cast_slice(&pr).to_vec())),
+            ("volume", fixed_col(DataType::Int64, bytemuck::cast_slice(&vv).to_vec())),
+        ],
+    );
+    create_table_columns(&table, &data.as_view()).unwrap();
+
+    // price 未被改写（仍是 11.0 / 21.0），volume 正确创建
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut price = Vec::new();
+    let mut volume = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        price.extend(f64s(view.column("price").unwrap()));
+        if let Some(v) = view.column("volume") {
+            volume.extend(i64s(v));
+        }
+    }
+    reader.close().unwrap();
+    assert_eq!(price, vec![10.0, 11.0, 20.0, 21.0, 12.0, 13.0, 22.0, 23.0]);
+    // volume 已在各分区创建：08-04 覆盖行有值（1,2），其余行 NULL
+    assert_eq!(volume, vec![0, 1, 0, 2, 0, 0, 0, 0]);
+    drop(table);
+    cleanup(&dir);
+}
+
+/// create_table_columns：已有列类型冲突 → Invalid，且无任何建列残留。
+#[test]
+fn create_table_columns_refuses_conflicting_type() {
+    let dir = temp_dir("crc_type");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+
+    // 输入把已有 price 声明为 Int64（类型冲突）→ 应前置报错
+    let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
+    let iv: Vec<i64> = vec![1, 2];
+    let data = build_multi_col_data(
+        &[("AAPL", d803), ("MSFT", d803)],
+        vec![("price", fixed_col(DataType::Int64, bytemuck::cast_slice(&iv).to_vec()))],
+    );
+    let err = create_table_columns(&table, &data.as_view()).unwrap_err();
+    assert!(matches!(err, splayed_core::CoreError::Invalid(_)));
+
+    // 无残留：schema 仍是 price(Float64)，无新增列
+    let schema = table.read_table_schema().unwrap();
+    assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
+    assert_eq!(schema.data_type_of("volume"), None);
+    drop(table);
     cleanup(&dir);
 }

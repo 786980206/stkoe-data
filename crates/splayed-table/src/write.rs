@@ -1,13 +1,15 @@
 //! Table 级写入：对已有 `(sym, time)` 行执行批量覆盖写入（`.lock` 互斥）。
+//! `create_table_columns`：按分区 + 按 index 对齐，只为缺失列建列（绝不覆盖已有列）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 
-use splayed_core::{CoreError, DatasetHandle, RowRange};
-use splayed_format::{DataView, Schema};
+use splayed_core::{CoreError, DatasetFieldInit, DatasetHandle, RowRange};
+use splayed_format::{Bitmap, Buffer, Column, DataType, DataView, Schema};
 
-use crate::table::{partition_key, TableHandle};
+use crate::partition::PartitionScheme;
+use crate::table::{field_options, partition_key, TableHandle};
 
 /// `.lock` 守卫：Drop 时释放（删除锁文件）。进程崩溃会留下残留锁，需人工删除。
 struct LockGuard {
@@ -44,33 +46,16 @@ struct PartitionWrite {
     writes: Vec<(u64, usize, usize)>,
 }
 
-/// 对 Table 中**已存在**的 `(sym, time)` 行执行批量覆盖写入。
+/// 阶段①：一次扫描校验输入排序 + 划分分区 run。
 ///
-/// 并发模型（三阶段）：
-/// ① 主线程一次扫描：相邻 key 严格递增校验（零分配，`string_at` 借用比较）+
-///    分区 run 划分（整数粗键判别，分区名仅换段时构造——同一分区可因 sym 优先
-///    出现多个 run，全部收集）；
-/// ② 主线程定位全部：逐分区 `locate_dataset_index`（Dataset 缓存复用）+ 匹配行数
-///    校验——**任何写入前**完成全部定位与校验，key 缺失 / 分区不存在 /
-///    定位不足都不产生部分写入；
-/// ③ 写入：单分区 / 并行度 1 → 串行；否则分区级并行（`std::thread::scope`
-///    round-robin 分桶，Field 级预算切分 `P_field = max(1, max_parallelism / P_part)`
-///    并在完成后恢复——消除 Table → Dataset 两层并发叠加）。
-/// 不保证跨 Partition 原子性：并行写入中某分区失败，已成功分区保留，返回首个错误。
-pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
-    table.mode().require_write("write_table")?;
-    let _lock = LockGuard::acquire(table.path())?;
-
-    // ① 主线程：一次扫描完成校验 + 分区 run 划分
-    if data.column("sym").is_none() || data.column("time").is_none() {
-        return Err(CoreError::Invalid(
-            "write_table requires sym and time columns".into(),
-        ));
-    }
+/// 相邻 key 严格递增校验（零分配，`string_at` 借用比较）+ 分区 run 划分
+/// （整数粗键判别，分区名仅换段时构造——同一分区可因 sym 优先出现多个 run，全部收集）。
+/// 供 `write_table` 与 `create_table_columns` 共享；调用方需先保证 `data` 含 sym/time 且非空。
+fn scan_partition_runs(
+    table: &TableHandle,
+    data: &DataView<'_>,
+) -> Result<HashMap<String, Vec<(usize, usize)>>, CoreError> {
     let rows = data.length();
-    if rows == 0 {
-        return Ok(());
-    }
     let scheme = table.scheme();
     let tt = table.peek_time_type()?;
     let sym_view = data.column("sym").unwrap();
@@ -89,8 +74,7 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
         if let (Some(ps), Some(pt)) = (prev_sym, prev_t) {
             if sym < ps || (sym == ps && t <= pt) {
                 return Err(CoreError::Invalid(
-                    "write_table input must be strictly sorted and unique by (sym ASC, time ASC)"
-                        .into(),
+                    "input must be strictly sorted and unique by (sym ASC, time ASC)".into(),
                 ));
             }
         }
@@ -115,11 +99,23 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
         let name = crate::partition::partition_name(scheme, cur_first_t, tt);
         buckets.entry(name).or_default().push((cur_start, cur_len));
     }
+    Ok(buckets)
+}
 
-    // 前置校验：分区存在性（write_table 不创建分区）
-    let none_scheme = scheme == crate::partition::PartitionScheme::None;
-    let existing: std::collections::HashSet<String> =
-        table.discover_partitions().into_iter().collect();
+/// 阶段②：分区存在性校验 + 逐分区定位，把输入行段映射回网格偏移。
+///
+/// 逐分区 `locate_dataset_index`（Dataset 缓存复用）+ 匹配行数校验——**任何写入/建列前**
+/// 完成全部定位与校验，key 缺失 / 分区不存在 / 定位不足都不产生部分修改。
+/// 返回按分区名 ASC 排序的 `PartitionWrite`（网格偏移对齐）。
+fn locate_partition_plan(
+    table: &TableHandle,
+    data: &DataView<'_>,
+    buckets: &HashMap<String, Vec<(usize, usize)>>,
+) -> Result<Vec<PartitionWrite>, CoreError> {
+    // 前置校验：分区存在性（不创建分区）
+    let scheme = table.scheme();
+    let none_scheme = scheme == PartitionScheme::None;
+    let existing: HashSet<String> = table.discover_partitions().into_iter().collect();
     for name in buckets.keys() {
         if none_scheme {
             if !name.is_empty() {
@@ -129,12 +125,14 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
             }
         } else if !existing.contains(name) {
             return Err(CoreError::Invalid(format!(
-                "partition '{name}' does not exist; write_table does not create partitions"
+                "partition '{name}' does not exist; input spans a missing partition"
             )));
         }
     }
 
-    // ② 主线程：逐分区定位 + 匹配校验（全部完成后才进入写入）
+    // 主线程：逐分区定位 + 匹配校验（全部完成后才进入修改）
+    let sym_view = data.column("sym").unwrap();
+    let time_view = data.column("time").unwrap();
     let mut names: Vec<String> = buckets.keys().cloned().collect();
     names.sort();
     let mut plan: Vec<PartitionWrite> = Vec::with_capacity(names.len());
@@ -193,6 +191,33 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
             writes,
         });
     }
+    Ok(plan)
+}
+
+/// 对 Table 中**已存在**的 `(sym, time)` 行执行批量覆盖写入。
+///
+/// 并发模型（三阶段）：
+/// ① 主线程一次扫描（`scan_partition_runs`：相邻 key 严格递增校验 + 分区 run 划分）
+/// ② 主线程定位全部（`locate_partition_plan`：逐分区 locate + 匹配校验，
+///    任何写入前完成——key 缺失 / 分区不存在不产生部分写入）
+/// ③ 写入：单分区 / 并行度 1 → 串行；否则分区级并行（`std::thread::scope`
+///    round-robin 分桶，Field 级预算切分 `P_field = max(1, max_parallelism / P_part)`
+///    并在完成后恢复——消除 Table → Dataset 两层并发叠加）。
+/// 不保证跨 Partition 原子性：并行写入中某分区失败，已成功分区保留，返回首个错误。
+pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
+    table.mode().require_write("write_table")?;
+    let _lock = LockGuard::acquire(table.path())?;
+
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid(
+            "write_table requires sym and time columns".into(),
+        ));
+    }
+    if data.length() == 0 {
+        return Ok(());
+    }
+    let buckets = scan_partition_runs(table, data)?;
+    let plan = locate_partition_plan(table, data, &buckets)?;
 
     // ③ 写入：单分区 / 并行度 1 → 串行（Field 级并行拿满预算）；
     //    否则分区级并行，Field 级预算切分（P_field = max(1, max_parallelism / P_part)）
@@ -210,6 +235,9 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
         return Ok(());
     }
     let p_field = (max_par / p_part).max(1);
+    let names: Vec<&str> = plan.iter().map(|pw| pw.name.as_str()).collect();
+    let writes_by_name: HashMap<&str, &Vec<(u64, usize, usize)>> =
+        plan.iter().map(|pw| (pw.name.as_str(), &pw.writes)).collect();
     let olds: Vec<(String, usize)> = {
         let mut guard = table.datasets.borrow_mut();
         // 互不相交 &mut DatasetHandle（iter_mut 一次遍历收集；RefMut 只在主线程存活）
@@ -229,8 +257,8 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
             (0..p_part).map(|_| Vec::new()).collect();
         for (i, name) in names.iter().enumerate() {
             // remove 逐个移出 &mut（每个值恰好移动一次，与后续 remove 无借用冲突）
-            let handle = targets.remove(name.as_str()).expect("target partition handle");
-            groups[i % p_part].push((name.as_str(), handle));
+            let handle = targets.remove(name).expect("target partition handle");
+            groups[i % p_part].push((name, handle));
         }
         let data_ref = data;
         let writes_ref = &writes_by_name;
@@ -307,4 +335,132 @@ fn write_partition(
         ds.write_dataset(offset, &sliced)?;
     }
     Ok(())
+}
+
+/// 为 Table 中**不存在的列**建列（按分区 + 按 index 对齐），**绝不覆盖已有列数据**。
+///
+/// 接口与 `write_table` 一致（`(sym ASC, time ASC)` 严格有序唯一、`sym/time` 必含、
+/// `.lock` 写互斥）；输入行数可**少于** Table 总行数（子集）。
+/// 流程：
+/// ① 一次扫描校验（`scan_partition_runs`）
+/// ② 逐分区定位对齐（`locate_partition_plan`：把输入行段映射回各分区 META 网格偏移，
+///    任何建列前完成全部定位与校验）
+/// ③ 规划（只读）：逐分区确定缺失列 + 类型校验 + 预构建全长度对齐列
+/// ④ 执行：逐分区 `create_dataset_field(Data(full_lp_col), field_options)`
+/// 语义：
+/// - 新列在**所有已发现分区统一创建**（表 Schema 一致）：新列铺满该分区 `L_p` 逻辑行，
+///   输入覆盖的网格行有值、未覆盖的分区/行为 NULL（validity=0）。
+/// - 列在分区中已存在且类型一致 → 跳过（不建不写，绝不覆盖）。
+/// - 列在分区中已存在但类型不一致 → `Invalid`（前置报错，无任何修改）。
+/// - 建列失败不回滚：已建成的列保留，返回首个错误。
+pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
+    table.mode().require_write("create_table_columns")?;
+    let _lock = LockGuard::acquire(table.path())?;
+
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid(
+            "create_table_columns requires sym and time columns".into(),
+        ));
+    }
+    if data.length() == 0 {
+        return Ok(());
+    }
+    let buckets = scan_partition_runs(table, data)?;
+    let plan = locate_partition_plan(table, data, &buckets)?;
+
+    let compression = table
+        .options
+        .compression
+        .unwrap_or(splayed_format::Compression::None);
+    let chunk_target_rows = table.options.chunk_target_rows.unwrap_or(8192);
+
+    // ③ 规划（只读，不改）：跨全部分区确定缺失列 + 类型校验 + 预构建对齐列
+    //    （任何类型冲突 / 校验失败 → 提前返回，无任何建列残留）。
+    //    新列在所有已发现分区统一创建（表 Schema 一致）；输入未覆盖的分区全 NULL。
+    let partitions = table.discover_partitions();
+    let mut queue: Vec<(String, String, DataType, Column)> = Vec::new();
+    for p in &partitions {
+        let ds = table.dataset_for(p)?;
+        let l_p = ds.read_dataset_statistics()?.row_count as usize;
+        // 该分区在输入中的对齐段（输入未覆盖的分区为空）
+        let pw = plan.iter().find(|w| &w.name == p);
+        let writes: &[(u64, usize, usize)] = pw.map(|w| w.writes.as_slice()).unwrap_or(&[]);
+        for field in &data.schema.fields {
+            let name = field.name.as_ref();
+            if name == "sym" || name == "time" {
+                continue;
+            }
+            match ds.read_dataset_schema().data_type_of(name) {
+                Some(dt) if dt != field.data_type => {
+                    return Err(CoreError::Invalid(format!(
+                        "field '{name}' exists with type {dt:?}, but input has type {:?}",
+                        field.data_type
+                    )));
+                }
+                Some(_) => {} // 已存在同类型 → 不触碰
+                None => {
+                    let full = build_aligned_column(data, writes, name, field.data_type, l_p)?;
+                    queue.push((p.clone(), name.to_string(), field.data_type, full));
+                }
+            }
+        }
+    }
+    if queue.is_empty() {
+        return Ok(());
+    }
+
+    // ④ 执行（&mut DatasetHandle）：逐分区 create_dataset_field
+    let mut guard = table.datasets.borrow_mut();
+    let mut handles: HashMap<&str, &mut DatasetHandle> = guard
+        .iter_mut()
+        .map(|(k, v)| (k.as_str(), &mut **v))
+        .collect();
+    for (pname, name, dtype, full) in queue {
+        let ds = handles.get_mut(pname.as_str()).expect("plan partition handle");
+        let fo = field_options(compression, chunk_target_rows, ds);
+        ds.create_dataset_field(&name, dtype, DatasetFieldInit::Data(full), fo)?;
+    }
+    Ok(())
+}
+
+/// 构建分区级全长度（`l_p`）拥有型列：把输入行段按 index 对齐拷入对应网格偏移，
+/// 未覆盖的网格行保持 NULL（validity=0）。定宽类型（与 `column_view_to_owned` 一致；
+/// dict / Utf8 新列暂不支持）。
+fn build_aligned_column(
+    data: &DataView<'_>,
+    writes: &[(u64, usize, usize)],
+    name: &str,
+    dtype: DataType,
+    l_p: usize,
+) -> Result<Column, CoreError> {
+    let size = dtype.size_of();
+    let mut values = vec![0u8; l_p * size];
+    let mut validity = Bitmap::zeros(l_p);
+    let src = data
+        .column(name)
+        .ok_or_else(|| CoreError::Invalid(format!("input column '{name}' missing")))?;
+    for &(grid_offset, input_start, len) in writes {
+        let seg = src.slice_rows(input_start, len).map_err(CoreError::from)?;
+        let mut pos = (grid_offset as usize) * size;
+        for s in seg.segments() {
+            match s.fixed_bytes() {
+                Some(bytes) => {
+                    values[pos..pos + bytes.len()].copy_from_slice(bytes);
+                    pos += bytes.len();
+                }
+                None => {
+                    return Err(CoreError::Invalid(format!(
+                        "create_table_columns supports fixed-width columns only (column '{name}')"
+                    )));
+                }
+            }
+        }
+        validity.set_range(grid_offset as usize, len, true);
+    }
+    Ok(Column {
+        data_type: dtype,
+        values: Buffer::from_vec(values),
+        validity: Some(validity),
+        dict: None,
+    })
 }

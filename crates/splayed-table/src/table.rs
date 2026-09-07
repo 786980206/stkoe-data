@@ -76,6 +76,28 @@ fn column_view_to_owned(view: &splayed_format::ColumnView<'_>, dt: DataType) -> 
     Column { data_type: dt, values: Buffer::from_vec(values), validity, dict: None }
 }
 
+/// New-field creation options derived from the Table compression strategy.
+/// Uncompressed -> default; compressed -> sym-aligned chunk offsets from the
+/// partition's own META grid (`chunk_target_rows` default 8192; syms exceeding the
+/// chunk row cap are split). Parameterized (does not capture `&self`) so it can be
+/// captured safely by `structural_for_each`'s `Sync` closure.
+pub(crate) fn field_options(
+    compression: splayed_format::Compression,
+    chunk_target_rows: usize,
+    ds: &DatasetHandle,
+) -> splayed_core::CreateFieldOptions {
+    if matches!(compression, splayed_format::Compression::None) {
+        splayed_core::CreateFieldOptions::default()
+    } else {
+        splayed_core::CreateFieldOptions {
+            compression,
+            chunk_offsets: Some(
+                ds.sym_aligned_chunk_offsets(chunk_target_rows, splayed_core::CHUNK_ROW_CAP),
+            ),
+        }
+    }
+}
+
 impl TableHandle {
     pub fn path(&self) -> &Path {
         &self.root
@@ -970,23 +992,11 @@ impl TableHandle {
 
         // 压缩选项按分区推导（sym 对齐 chunk 边界由各分区 META 网格决定）
         let total: usize = part_rows.iter().sum();
-        let make_field_options = |ds: &DatasetHandle| {
-            if matches!(compression, splayed_format::Compression::None) {
-                splayed_core::CreateFieldOptions::default()
-            } else {
-                splayed_core::CreateFieldOptions {
-                    compression,
-                    chunk_offsets: Some(
-                        ds.sym_aligned_chunk_offsets(chunk_target_rows, splayed_core::CHUNK_ROW_CAP),
-                    ),
-                }
-            }
-        };
 
         match init {
             TableFieldInit::AllNull => {
                 self.structural_for_each(|ds| {
-                    let fo = make_field_options(ds);
+                    let fo = field_options(compression, chunk_target_rows, ds);
                     ds.create_dataset_field(
                         field,
                         data_type,
@@ -1019,7 +1029,7 @@ impl TableHandle {
                 let mut off = 0usize;
                 for (p, &lp) in partitions.iter().zip(&part_rows) {
                     let ds = handles.get_mut(p.as_str()).expect("partition handle");
-                    let fo = make_field_options(ds);
+                    let fo = field_options(compression, chunk_target_rows, ds);
                     let sliced = col.as_view().slice_rows(off, lp).map_err(CoreError::from)?;
                     let sliced_col = column_view_to_owned(&sliced, data_type);
                     ds.create_dataset_field(
@@ -1071,7 +1081,7 @@ impl TableHandle {
                 let mut off = 0usize;
                 for (p, &lp) in partitions.iter().zip(&part_rows) {
                     let ds = handles.get_mut(p.as_str()).expect("partition handle");
-                    let fo = make_field_options(ds);
+                    let fo = field_options(compression, chunk_target_rows, ds);
                     let sliced = col.as_view().slice_rows(off, lp).map_err(CoreError::from)?;
                     let sliced_col = column_view_to_owned(&sliced, data_type);
                     ds.create_dataset_field(

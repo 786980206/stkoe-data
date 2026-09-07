@@ -191,6 +191,7 @@ pub struct TableStatistics {
 |  | `scan_table` | 定位跨 Partition 的 `PartitionRowRange` |
 |  | `read_table` | 消费 Scanner，输出批量 `DataView` |
 | Write | `write_table` | 对已有 `(sym, time)` 行批量覆盖写入（见 §4.14） |
+|  | `create_table_columns` | 为缺失列按分区 + index 对齐建列（绝不覆盖已有列；见 §4.15） |
 
 ### 4.1 create_table
 
@@ -455,7 +456,8 @@ impl TableHandle {
   working 表示、close 按原分组重压缩，字段生命周期保持压缩；缺省策略下 DATA/VALIDITY
   区由 OS `set_len` 稀疏零填充（成本 O(64B header)/分区）。带数据（data / stream）
   初始化形式为设计预留——要求总行数等于 `Σ L_p` 且按 Table 自然顺序排列、从第一个
-  Partition 顺序填充——**当前未实现**。
+  Partition 顺序填充——**当前未实现**；如需对既有网格按 index 对齐补数据填新列，
+  请使用 `create_table_columns`（§4.15，跨分区统一建列 + 已实现的数据对齐填充）。
 - `delete_table_field`：直接删除物理文件，不打开 Field；META 与 sym / time 不受影响。
 - `rename_table_field`：本质是每分区一次文件 rename（纯元数据操作）。
 - `cast_table_field`：已为目标类型的 Partition 再次转换是无害 no-op；中途失败会造成
@@ -779,6 +781,45 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
   映射按通用消费路径防御性处理。
 - `.lock` 崩溃残留需人工删除；锁等待 / 超时策略属实现层。
 
+### 4.15 create_table_columns
+
+**接口定义**：
+```rust
+pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>
+```
+
+**参数**：
+
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `table` | `&TableHandle` | 输入 | 已打开的 Table Handle（write mode） |
+| `data` | `&DataView<'_>` | 输入 | 必须含 `sym` 与 `time`（整体按 `(sym ASC, time ASC)` 严格有序唯一且已存在于目标 META）；其余列为要新增的 Fields（支持定宽类型；`sym / time` 不作为字段；重复列名拒绝） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 缺失列已在相关分区建好 |
+
+**职责（与 write_table 的差异）**：`write_table` 对**已有行**做 positional overwrite；`create_table_columns` 只针对**不存在的列**按分区 + index 对齐建列，**绝不覆盖 / 改写任何已有列的数据**。输入行数可**少于** Table 总行数（子集）。
+
+**内部实现流程**：
+```
+① 一次扫描校验（scan_partition_runs：同 write_table 的排序 / 去重 + 分区 run 划分）
+② 主线程定位全部（locate_partition_plan：把输入行段映射回各分区 META 网格偏移；
+   任何建列前完成全部定位与校验——key 缺失 / 分区不存在 → Error，无残留）
+③ 规划（只读）：跨全部分区确定缺失列 + 类型校验 + 预构建全长度对齐列
+     - 分区中列缺失 → 列入待建；列已存在且类型一致 → 跳过（不触碰）；
+       列已存在但类型不一致 → Invalid（前置报错，无任何修改）
+     - 新列在**所有已发现分区统一创建**（表 Schema 一致）；输入未覆盖的分区全 NULL
+④ 执行（逐分区 create_dataset_field(Data(full_lp_col), field_options)）
+     - full_lp_col：分区全长度 L_p 的拥有型列，输入覆盖的网格行有值，其余 NULL（validity=0）
+```
+
+**语义 / 约束**：
+- 新列统一铺满每个已发现分区（长度 = 该分区 `L_p`），输入覆盖的网格行填充输入值、
+  未覆盖行为 NULL（validity=0）→ 表 Schema 在各分区一致，`read_table_schema`（最后分区）可见新列。
+- 列在分区中已存在且类型一致 → 跳过（不建不写，绝不覆盖）。
+- 列在分区中已存在但类型不一致 → `Invalid`（前置校验，无任何修改 / 残留）。
+- 支持定宽类型新列；dict / Utf8 新列暂不支持（与 `column_view_to_owned` 限制一致）。
+- 无事务：建列失败不回滚，已建成的列保留，返回首个错误。
+- `.lock` 写互斥贯穿全程（与 write_table 一致）。
+
 ## 5. 与 core 的调用关系
 
 ```
@@ -799,6 +840,7 @@ write_table → locate_dataset_index + write_dataset → write_field_handle / lo
 | `read_table` | `read_dataset`（内部 `read_field_handle`） |
 | `query_table` | `scan_table` + `read_table`（组合入口） |
 | `write_table` | `locate_dataset_index` + `write_dataset`（内部 `write_field_handle` / `locate_index_handle`） |
+| `create_table_columns` | `locate_dataset_index`（对齐）+ `create_dataset_field`（`Data(full)`，内部 `create_field_file`） |
 
 Table 层只依赖 Dataset 级 API，不直接持有 MetaHandle / FieldHandle。
 
@@ -809,7 +851,7 @@ Table 层只依赖 Dataset 级 API，不直接持有 MetaHandle / FieldHandle。
 | INSERT 追加到已有 Partition | 暂缓 | 扩大容量 / 新增 sym / 扩大 time 需要重建 Dataset（core 不提供原地 API）；新数据目前只能走 `create_table_partition` |
 | 行级 DELETE | 暂缓 | 无行级删除 API；整 Partition 删除可用 `delete_table_partition` |
 | UPSERT / MERGE INTO | 暂缓 | — |
-| `create_table_field` 的 data / stream 初始化 | 未实现 | 当前仅全 NULL 形态（`DatasetFieldInit::AllNull`） |
+| `create_table_field` 的 data / stream 初始化 | 未实现 | `create_table_field` 当前仅全 NULL 形态（`DatasetFieldInit::AllNull`）；带数据对齐建列请用 `create_table_columns`（§4.15，已实现） |
 
 ## 7. SQL 域映射（参考）
 

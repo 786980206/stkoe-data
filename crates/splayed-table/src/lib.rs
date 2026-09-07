@@ -20,4 +20,4 @@ pub use table::{
     TableOptions, TableStatistics,
 };
 
-pub use write::write_table;
+pub use write::{create_table_columns, write_table};
