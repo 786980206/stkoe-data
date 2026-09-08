@@ -140,8 +140,9 @@ fn locate_partition_plan(
     for name in &names {
         let ds = table.dataset_for(name)?;
         let runs = &buckets[name];
-        // 分区内的 pairs 按输入序拼接（跨 run 仍满足 (sym ASC, time ASC) 有序唯一）
-        let mut pairs: Vec<(String, i64)> = Vec::new();
+        // 分区内的 pairs 按输入序拼接（跨 run 仍满足 (sym ASC, time ASC) 有序唯一），借用 &str 零多余分配
+        let total_rows_in_runs: usize = runs.iter().map(|&(_, l)| l).sum();
+        let mut pairs: Vec<(&str, i64)> = Vec::with_capacity(total_rows_in_runs);
         for &(start, len) in runs {
             for i in start..start + len {
                 pairs.push((
@@ -149,13 +150,12 @@ fn locate_partition_plan(
                         .string_at(i)
                         .ok_or_else(|| {
                             CoreError::Invalid(format!("sym value at row {i} is NULL"))
-                        })?
-                        .to_owned(),
+                        })?,
                     crate::table::time_value_at(&time_view, i)?,
                 ));
             }
         }
-        let located = ds.locate_dataset_index(&pairs)?;
+        let located = ds.locate_dataset_index_borrowed(&pairs)?;
         let total: u64 = located.iter().map(|r| r.length).sum();
         if total as usize != pairs.len() {
             return Err(CoreError::InvalidState(format!(

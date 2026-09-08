@@ -631,8 +631,15 @@ impl DatasetHandle {
     }
 
     /// `(sym, time)` 联合键批量定位（转发 META，供 Table 层 write_table 使用）。
+    #[inline]
     pub fn locate_dataset_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
-        self.meta.locate_index_handle(pairs)
+        self.meta.locate_index(pairs)
+    }
+
+    /// 零拷贝借用 `&str` 的联合键批量定位。
+    #[inline]
+    pub fn locate_dataset_index_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.meta.locate_index_borrowed(pairs)
     }
 
     /// sym 对齐的压缩 chunk 边界（创建即压缩 / compress 共用）——**自动规划**：
@@ -916,12 +923,11 @@ impl Default for CreateDatasetOptions {
 /// 按 sym 边界累积行数，达到 `target_rows` 即收口（chunk 保持整 sym、行数
 /// ≈ target）；行数超过 `row_cap` 的 sym 按 cap 劈开。输入 (sym ASC, time ASC)
 /// ⇒ sym run 行数 = 该 sym 的容量网格行数，边界与 META 网格一致。
-fn sym_chunk_offsets_from_data(
-    view: &splayed_format::Column,
+fn sym_chunk_offsets_from_view(
+    view: &ColumnView<'_>,
     target_rows: usize,
     row_cap: u64,
 ) -> Result<Vec<u64>, CoreError> {
-    let view = view.as_view();
     let seg = view.segments().first().ok_or_else(|| {
         CoreError::Invalid("sym column is empty".into())
     })?;
@@ -968,12 +974,10 @@ fn sym_chunk_offsets_from_data(
     Ok(offsets)
 }
 
-/// 创建完整 Dataset：META 单线程先行（一次扫描完成全局合法性校验），
-/// Field 文件并行创建（各字段完全独立，列所有权零拷贝移动），
-/// 临时目录中全部成功后原子 rename 到目标路径。
-pub fn create_dataset(
+/// 基于 `&DataView` 直接创建完整 Dataset（零拷贝视图贯通，无数据多余分配）。
+pub fn create_dataset_from_view(
     path: &Path,
-    data: Data,
+    data: &DataView<'_>,
     options: CreateDatasetOptions,
 ) -> Result<(), CoreError> {
     if path.exists() {
@@ -983,39 +987,33 @@ pub fn create_dataset(
         return Err(CoreError::Invalid("dataset input requires sym and time columns".into()));
     }
     // ① META 单线程先行：一次扫描完成全局校验（排序 / 连续子区间 / 容量网格）+ 构建；
-    //    失败时不落任何盘上痕迹
-    let meta = MetaBuilder::build(&data.as_view())?;
+    let meta = MetaBuilder::build(data)?;
     // ② 创建即压缩：compression != None 时由输入 sym run 推导 sym 对齐 chunk 边界
-    //    （全部 Field 复用同一网格边界），随 CreateFieldOptions 下发
     let field_options = if matches!(options.compression, Compression::None) {
         CreateFieldOptions::default()
     } else if options.chunk_target_rows == 0 {
-        // chunk_target_rows = 0 → 均匀 8192 行分块（不按 sym 对齐）
         CreateFieldOptions { compression: options.compression, chunk_offsets: None }
     } else {
         CreateFieldOptions {
             compression: options.compression,
-            chunk_offsets: Some(sym_chunk_offsets_from_data(
+            chunk_offsets: Some(sym_chunk_offsets_from_view(
                 data.column("sym").unwrap(),
                 options.chunk_target_rows.max(1),
                 CHUNK_ROW_CAP,
             )?),
         }
     };
-    // ③ 抽走非 sym/time 列（owned 移动，零拷贝）——Field 之间完全独立，是并行创建的基本单元
-    let mut data = data;
-    let names: Vec<String> = data.schema.fields.iter().map(|f| f.name.to_string()).collect();
-    let types: Vec<DataType> = data.schema.fields.iter().map(|f| f.data_type).collect();
-    let columns = std::mem::take(&mut data.columns);
-    let field_cols: Vec<(String, DataType, Column)> = names
-        .into_iter()
-        .zip(types)
-        .zip(columns)
-        .filter(|((name, _), _)| !is_reserved(name))
-        .map(|((name, data_type), col)| (name, data_type, col))
-        .collect();
+    // ③ 收集非 sym/time 列视图引用
+    let mut field_cols = Vec::new();
+    for f in &data.schema.fields {
+        if !is_reserved(&f.name) {
+            if let Some(col_view) = data.column(&f.name) {
+                field_cols.push((f.name.as_ref(), f.data_type, col_view));
+            }
+        }
+    }
 
-    // ③ 临时目录保证最终原子发布
+    // ④ 临时目录保证最终原子发布
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()
@@ -1025,7 +1023,7 @@ pub fn create_dataset(
     fs::create_dir_all(&tmp).map_err(|e| map_io_path(&tmp, e))?;
 
     let result = (|| {
-        // ④ META 字节直写（已构建，不二次扫描）+ fsync
+        // META 字节直写 + fsync
         {
             let mut f = File::options()
                 .write(true)
@@ -1035,21 +1033,19 @@ pub fn create_dataset(
             f.write_all(&meta)?;
             f.sync_all()?;
         }
-        // ⑤ Field 并行创建：桶内顺序、桶间并行；P = min(max_parallelism, 字段数)
+        // Field 并行创建：桶内顺序、桶间并行；P = min(max_parallelism, 字段数)
         let p = options.max_parallelism.max(1).min(field_cols.len()).max(1);
         if p <= 1 {
-            for (name, data_type, col) in field_cols {
-                // Utf8 字段不支持 chunk 压缩（encode_chunk 定宽值域）→ 未压缩创建
+            for (col_name, data_type, col_view) in field_cols {
                 let fo = if data_type == DataType::Utf8 {
                     CreateFieldOptions::default()
                 } else {
                     field_options.clone()
                 };
-                create_field_file(&tmp.join(&name), data_type, FieldInit::Data(col), fo)?;
+                crate::field_file::create_field_file_from_view(&tmp.join(col_name), col_view, &fo)?;
             }
         } else {
-            // round-robin 分桶（列大小不均时负载更均匀）；列所有权移动，零拷贝
-            let mut buckets: Vec<Vec<(String, DataType, Column)>> = vec![Vec::new(); p];
+            let mut buckets: Vec<Vec<(&str, DataType, &ColumnView<'_>)>> = vec![Vec::new(); p];
             for (i, item) in field_cols.into_iter().enumerate() {
                 buckets[i % p].push(item);
             }
@@ -1059,19 +1055,13 @@ pub fn create_dataset(
                     let tmp = &tmp;
                     let fo = &field_options;
                     handles.push(s.spawn(move || -> Result<(), CoreError> {
-                        for (name, data_type, col) in bucket {
-                            // Utf8 字段不支持 chunk 压缩 → 未压缩创建
+                        for (col_name, data_type, col_view) in bucket {
                             let fo = if data_type == DataType::Utf8 {
                                 CreateFieldOptions::default()
                             } else {
                                 fo.clone()
                             };
-                            create_field_file(
-                                &tmp.join(&name),
-                                data_type,
-                                FieldInit::Data(col),
-                                fo,
-                            )?;
+                            crate::field_file::create_field_file_from_view(&tmp.join(col_name), col_view, &fo)?;
                         }
                         Ok(())
                     }));
@@ -1091,6 +1081,15 @@ pub fn create_dataset(
     }
     fs::rename(&tmp, path).map_err(|e| map_io_path(path, e))?;
     Ok(())
+}
+
+/// 创建完整 Dataset。
+pub fn create_dataset(
+    path: &Path,
+    data: Data,
+    options: CreateDatasetOptions,
+) -> Result<(), CoreError> {
+    create_dataset_from_view(path, &data.as_view(), options)
 }
 
 /// 创建 / 重建 Dataset 的 Index（即 `.meta`）；只创建 META，不创建 Field。
@@ -1123,14 +1122,13 @@ pub fn data_view_to_owned_data(view: &DataView<'_>) -> Result<Data, CoreError> {
     Data::new(view.schema.clone(), cols).map_err(CoreError::from)
 }
 
-/// 连带数据直接初始化创建数据集。
+/// 连带数据直接初始化创建数据集（零拷贝直写，无多余内存分配）。
 pub fn init_dataset(
     path: &Path,
     data: &DataView<'_>,
     options: Option<CreateDatasetOptions>,
 ) -> Result<DatasetHandle, CoreError> {
-    let owned = data_view_to_owned_data(data)?;
-    create_dataset(path, owned, options.unwrap_or_default())?;
+    create_dataset_from_view(path, data, options.unwrap_or_default())?;
     open_dataset(path, Mode::Read)
 }
 

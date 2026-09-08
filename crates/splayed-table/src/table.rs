@@ -10,7 +10,7 @@ use splayed_core::{
     CreateDatasetOptions, CoreError, DatasetHandle, DatasetStatistics, Mode, create_dataset,
     delete_dataset, open_dataset,
 };
-use splayed_format::{Buffer, Column, Data, DataType, DictBuffers, Schema, TimeType};
+use splayed_format::{Buffer, Column, Data, DataView, DataType, DictBuffers, Schema, TimeType};
 
 use crate::partition::{civil_from_days, partition_name, partition_range, value_to_days, PartitionScheme};
 
@@ -626,6 +626,60 @@ pub fn create_table_partition(
     //    分区的创建即压缩策略（可与既有分区差异化——冷热分层）；
     //    失败语义与 create_table 一致——不回滚，已写入文件保留
     create_dataset(&partition_path, data, options)
+}
+
+/// 连带数据直接初始化创建完整 Table 并返回 TableHandle（零拷贝入参）。
+pub fn init_table(
+    table_path: &Path,
+    scheme: PartitionScheme,
+    data: &DataView<'_>,
+    options: Option<TableOptions>,
+) -> Result<TableHandle, CoreError> {
+    let opts = options.unwrap_or_default();
+    let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
+    create_table(table_path, owned, scheme, opts.clone())?;
+    open_table(table_path, Mode::Read, opts)
+}
+
+/// 创建仅含骨架的空 Table 并返回 TableHandle。
+pub fn create_table_skeleton(
+    table_path: &Path,
+    schema: &Schema,
+    scheme: PartitionScheme,
+    options: Option<TableOptions>,
+) -> Result<TableHandle, CoreError> {
+    if table_path.exists() {
+        return Err(CoreError::AlreadyExists(table_path.to_path_buf()));
+    }
+    fs::create_dir_all(table_path).map_err(CoreError::Io)?;
+    let opts = options.unwrap_or_default();
+    if scheme == PartitionScheme::None {
+        create_dataset_skeleton(table_path, schema)?;
+    }
+    open_table(table_path, Mode::Write, opts)
+}
+
+fn create_dataset_skeleton(path: &Path, schema: &Schema) -> Result<(), CoreError> {
+    let time_field = schema.fields.iter().find(|f| f.name.as_ref() == "time").ok_or_else(|| {
+        CoreError::Invalid("schema must contain 'time' column".into())
+    })?;
+    let tt = match time_field.data_type {
+        DataType::Date32 => TimeType::Date32,
+        DataType::TimestampUs => TimeType::TimestampUs,
+        _ => return Err(CoreError::Invalid("unsupported time column type".into())),
+    };
+    fs::create_dir_all(path).map_err(CoreError::Io)?;
+    splayed_core::create_index(&path.join(".meta"), tt)?;
+    for f in &schema.fields {
+        if f.name.as_ref() != "sym" && f.name.as_ref() != "time" {
+            let field_path = path.join(f.name.as_ref().replace('.', "/"));
+            if let Some(p) = field_path.parent() {
+                fs::create_dir_all(p).map_err(CoreError::Io)?;
+            }
+            splayed_core::create_field(&field_path, f.data_type)?;
+        }
+    }
+    Ok(())
 }
 
 /// 销毁并删除 Table 根目录（关闭句柄并删除物理目录）。

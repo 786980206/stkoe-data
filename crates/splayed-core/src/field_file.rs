@@ -38,6 +38,42 @@ pub struct StreamValues {
 /// 创建即压缩的默认 chunk 行数（与 `compress_field_file` 均匀分块一致）。
 const CREATE_CHUNK_ROWS: usize = 8192;
 
+pub(crate) fn compute_chunk_boundaries(
+    rows_total: usize,
+    chunk_offsets: Option<&[u64]>,
+) -> Result<Vec<(usize, usize)>, CoreError> {
+    match chunk_offsets {
+        Some(list) => {
+            if list.first() != Some(&0) {
+                return Err(CoreError::Invalid("chunk offsets must start at 0".into()));
+            }
+            let mut list = list.to_vec();
+            list.sort_unstable();
+            list.dedup();
+            if list.windows(2).any(|w| w[0] >= w[1])
+                || list.iter().any(|&o| o >= rows_total as u64)
+            {
+                return Err(CoreError::Invalid(
+                    "chunk offsets must be strictly ascending within [0, row_count)".into(),
+                ));
+            }
+            let mut ranges: Vec<(usize, usize)> = list
+                .windows(2)
+                .map(|w| (w[0] as usize, w[1] as usize))
+                .collect();
+            let last = *list.last().unwrap() as usize;
+            if last < rows_total {
+                ranges.push((last, rows_total));
+            }
+            Ok(ranges)
+        }
+        None => Ok((0..rows_total)
+            .step_by(CREATE_CHUNK_ROWS)
+            .map(|o| (o, (o + CREATE_CHUNK_ROWS).min(rows_total)))
+            .collect()),
+    }
+}
+
 /// 拥有型 Data 的**单遍 chunked 直接创建**（压缩创建主路径）：
 /// 占位 header → 按 `CREATE_CHUNK_ROWS` 行切 chunk、逐 chunk `encode_chunk`
 /// 顺序直写（values 零拷贝切片、validity 按位切片重打包）→ 回填 header。
@@ -59,36 +95,7 @@ fn create_field_file_chunked(
             return Err(CoreError::Invalid("chunked creation requires Data/Length init".into()))
         }
     };
-    let boundaries: Vec<(usize, usize)> = match &options.chunk_offsets {
-        Some(list) => {
-            if list.first() != Some(&0) {
-                return Err(CoreError::Invalid("chunk offsets must start at 0".into()));
-            }
-            let mut list = list.clone();
-            list.sort_unstable();
-            list.dedup();
-            if list.windows(2).any(|w| w[0] >= w[1])
-                || list.iter().any(|&o| o >= rows_total as u64)
-            {
-                return Err(CoreError::Invalid(
-                    "chunk offsets must be strictly ascending within [0, row_count)".into(),
-                ));
-            }
-            let mut ranges: Vec<(usize, usize)> = list
-                .windows(2)
-                .map(|w| (w[0] as usize, w[1] as usize))
-                .collect();
-            let last = *list.last().unwrap() as usize;
-            if last < rows_total {
-                ranges.push((last, rows_total));
-            }
-            ranges
-        }
-        None => (0..rows_total)
-            .step_by(CREATE_CHUNK_ROWS)
-            .map(|o| (o, (o + CREATE_CHUNK_ROWS).min(rows_total)))
-            .collect(),
-    };
+    let boundaries = compute_chunk_boundaries(rows_total, options.chunk_offsets.as_deref())?;
     match init {
         FieldInit::Data(col) => {
             create_field_file_chunked_data(path, data_type, col, compression, &boundaries)
@@ -316,15 +323,173 @@ pub fn create_field(path: &Path, field_type: DataType) -> Result<(), CoreError> 
     create_field_file(path, field_type, FieldInit::Length(0), CreateFieldOptions::default())
 }
 
-/// 连带数据初始化创建字段文件（带数据一步直写，全 NULL 产出 64B Header-Only 文件）。
+/// 连带数据初始化创建字段文件（带数据一步直写，全 NULL 产出 64B Header-Only 文件，零缓冲内存分配）。
 pub fn init_field(
     path: &Path,
     column: &ColumnView<'_>,
     options: Option<CreateFieldOptions>,
 ) -> Result<(), CoreError> {
-    let dt = column.data_type();
+    create_field_file_from_view(path, column, &options.unwrap_or_default())
+}
+
+/// 直接基于 `&ColumnView` 零拷贝写入 Field 文件。
+pub fn create_field_file_from_view(
+    path: &Path,
+    column: &ColumnView<'_>,
+    options: &CreateFieldOptions,
+) -> Result<(), CoreError> {
+    if path.exists() {
+        return Err(CoreError::AlreadyExists(path.to_path_buf()));
+    }
+    let data_type = column.data_type();
+    let rows = column.length();
+    let null_count = column.null_count();
+
+    // 1. 全 NULL 字段：仅写 64B Header 骨架
+    if rows > 0 && null_count == rows {
+        if matches!(options.compression, Compression::None) {
+            return create_field_file_plain(path, data_type, FieldInit::Length(rows as u64));
+        } else if data_type != DataType::Utf8 {
+            return create_field_file_chunked(path, data_type, FieldInit::Length(rows as u64), options);
+        }
+    }
+
+    // 2. 未压缩或 Utf8 字段：走单遍直写
+    if matches!(options.compression, Compression::None) || data_type == DataType::Utf8 {
+        return create_field_file_view_plain(path, column);
+    }
+
+    // 3. 压缩单段：直接在原有内存上切片逐 chunk 编码直写（零多余分配）
+    if column.segments().len() == 1 {
+        return create_field_file_view_chunked(path, column, options);
+    }
+
+    // 多段回退路径
     let col = column_view_to_owned_column(column);
-    create_field_file(path, dt, FieldInit::Data(col), options.unwrap_or_default())
+    create_field_file_chunked(path, data_type, FieldInit::Data(col), options)
+}
+
+fn create_field_file_view_plain(path: &Path, column: &ColumnView<'_>) -> Result<(), CoreError> {
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io(path, e))?;
+
+    // Phase 1: 占位 Header
+    f.write_all(&[0u8; HEADER_SIZE])?;
+
+    let dt = column.data_type();
+    let rows = column.length();
+    let null_count = column.null_count();
+    let mut has_validity = false;
+    let mut data_len = 0u64;
+
+    // Phase 2: DATA 顺序写
+    for seg in column.segments() {
+        if let Some(b) = seg.fixed_bytes() {
+            f.write_all(b)?;
+            data_len += b.len() as u64;
+        } else if let splayed_format::ColumnValues::Dict { keys, .. } = seg.values() {
+            let kb = keys.as_slice();
+            f.write_all(kb)?;
+            data_len += kb.len() as u64;
+        }
+        if seg.validity().is_some() {
+            has_validity = true;
+        }
+    }
+
+    // Phase 3: VALIDITY 顺序写
+    if has_validity {
+        if column.segments().len() == 1 {
+            if let Some(bm) = column.segments()[0].validity() {
+                f.write_all(bm.as_raw())?;
+            }
+        } else {
+            let mut bit_bm = Bitmap::ones(rows);
+            let mut curr_row = 0;
+            for s in column.segments() {
+                if let Some(v) = s.validity() {
+                    for i in 0..s.rows() {
+                        bit_bm.set(curr_row + i, v.is_valid(i));
+                    }
+                }
+                curr_row += s.rows();
+            }
+            f.write_all(bit_bm.as_view().as_raw())?;
+        }
+    }
+
+    let mut header = FieldHeader::new_uncompressed(
+        dt,
+        1,
+        rows as u32,
+        null_count as u32,
+        has_validity,
+    );
+    header.data_length = data_len;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&header.to_bytes())?;
+    Ok(())
+}
+
+fn create_field_file_view_chunked(
+    path: &Path,
+    column: &ColumnView<'_>,
+    options: &CreateFieldOptions,
+) -> Result<(), CoreError> {
+    let seg = &column.segments()[0];
+    let data_type = column.data_type();
+    let rows = column.length();
+    let values_bytes = seg.fixed_bytes().ok_or_else(|| {
+        CoreError::Invalid("chunked field requires fixed width values".into())
+    })?;
+    let per_row = if rows > 0 { values_bytes.len() / rows } else { 0 };
+
+    let boundaries = compute_chunk_boundaries(rows, options.chunk_offsets.as_deref())?;
+
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io(path, e))?;
+
+    // Phase 1: 占位 Header
+    f.write_all(&[0u8; HEADER_SIZE])?;
+
+    // Phase 2: 逐 chunk 编码直写
+    let bits = seg.validity();
+    for &(lo, hi) in &boundaries {
+        let take = hi - lo;
+        let values = &values_bytes[lo * per_row..hi * per_row];
+        let validity = bits.map(|b| {
+            b.slice(lo, take).and_then(|v| Ok(v.to_packed_bytes()))
+        }).transpose()?;
+        let chunk = encode_chunk(
+            Encoding::Plain,
+            options.compression,
+            data_type,
+            values,
+            validity.as_deref(),
+            take,
+        )?;
+        f.write_all(&chunk)?;
+    }
+
+    // Phase 3: Header 回填
+    let mut header = FieldHeader::new_uncompressed(
+        data_type,
+        1,
+        rows as u32,
+        column.null_count() as u32,
+        false,
+    );
+    header.compression = options.compression.id();
+    header.data_length = values_bytes.len() as u64;
+    f.seek(SeekFrom::Start(0))?;
+    f.write_all(&header.to_bytes())?;
+    Ok(())
 }
 
 /// 打开已有 Field（open 不负责创建）。

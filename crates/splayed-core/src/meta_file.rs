@@ -474,6 +474,11 @@ impl MetaHandle {
         self.locate_index_handle(pairs)
     }
 
+    #[inline]
+    pub fn locate_index_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_index_generic(pairs)
+    }
+
     pub fn read_index_schema(&self) -> Schema {
         let time_type = self.header.time_type().unwrap_or(TimeType::TimestampUs);
         Schema::new(vec![
@@ -656,68 +661,93 @@ impl MetaHandle {
     ///
     /// `pairs` 按 `(sym ASC, time ASC)` 排序且唯一；返回合并后的连续 RowRanges，
     /// `sum(length) == pairs.len()` 是定位成功的充要条件；key 不存在 → Error。
+    #[inline]
     pub fn locate_index_handle(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_index_generic(pairs)
+    }
+
+    /// 通用借用与拥有键定位实现。
+    pub fn locate_index_generic<S: AsRef<str>>(&self, pairs: &[(S, i64)]) -> Result<Vec<RowRange>, CoreError> {
         if pairs.is_empty() {
             return Ok(Vec::new());
         }
 
+        let axis = self.axis_bytes();
+        let time_type = self.header.time_type()?;
+        let ts = self.header.time_type_size();
         let mut ranges: Vec<RowRange> = Vec::new();
         let mut sym_cursor = 0usize;   // SYM INDEX 游标（单调，只前进）
         let mut time_cursor = 0usize;  // TIME AXIS 游标（sym 切换时重置到 time_start）
         let mut cached_rec = SymIndexRecord { time_start: 0, time_count: 0, row_start: 0 };
         let mut cached_sym_id = usize::MAX;
 
+        let time_at_fast = |idx: usize| -> u64 {
+            let bytes = &axis[idx * ts..idx * ts + ts];
+            match time_type {
+                TimeType::Date32 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
+                TimeType::TimestampUs => u64::from_le_bytes(bytes.try_into().unwrap()),
+            }
+        };
+
         for i in 0..pairs.len() {
             let (sym, time) = &pairs[i];
+            let sym_str = sym.as_ref();
             let time_u = *time as u64;
 
+            let mut same_sym = false;
             // 排序校验（内联，无额外遍历）
             if i > 0 {
                 let (ps, pt) = &pairs[i - 1];
-                if ps.as_str() > sym.as_str() || (ps == sym && *pt >= *time) {
+                let ps_str = ps.as_ref();
+                if ps_str > sym_str || (ps_str == sym_str && *pt >= *time) {
                     return Err(CoreError::Invalid(
                         "locate input must be sorted and unique by (sym ASC, time ASC)".into(),
                     ));
                 }
-            }
-
-            // sym 游标单调推进（O(S) 总计，两指针）
-            while sym_cursor < self.header.sym_count as usize {
-                let s = self.sym_str(sym_cursor as u32)?;
-                match s.as_bytes().cmp(sym.as_bytes()) {
-                    std::cmp::Ordering::Less => { sym_cursor += 1; }
-                    std::cmp::Ordering::Equal => break,
-                    std::cmp::Ordering::Greater => {
-                        return Err(CoreError::Invalid(format!(
-                            "locate: sym '{sym}' does not exist in META"
-                        )));
-                    }
+                if ps_str == sym_str {
+                    same_sym = true;
                 }
             }
-            if sym_cursor >= self.header.sym_count as usize {
-                return Err(CoreError::Invalid(format!(
-                    "locate: sym '{sym}' does not exist in META"
-                )));
-            }
 
-            // sym 切换时刷新 record 缓存 + 重置 time 游标
-            if cached_sym_id != sym_cursor {
-                cached_rec = self.sym_record(sym_cursor as u32)?;
-                cached_sym_id = sym_cursor;
-                time_cursor = cached_rec.time_start as usize;
+            if !same_sym {
+                // sym 游标单调推进（O(S) 总计，两指针）
+                while sym_cursor < self.header.sym_count as usize {
+                    let s = self.sym_str(sym_cursor as u32)?;
+                    match s.as_bytes().cmp(sym_str.as_bytes()) {
+                        std::cmp::Ordering::Less => { sym_cursor += 1; }
+                        std::cmp::Ordering::Equal => break,
+                        std::cmp::Ordering::Greater => {
+                            return Err(CoreError::Invalid(format!(
+                                "locate: sym '{sym_str}' does not exist in META"
+                            )));
+                        }
+                    }
+                }
+                if sym_cursor >= self.header.sym_count as usize {
+                    return Err(CoreError::Invalid(format!(
+                        "locate: sym '{sym_str}' does not exist in META"
+                    )));
+                }
+
+                // sym 切换时刷新 record 缓存 + 重置 time 游标
+                if cached_sym_id != sym_cursor {
+                    cached_rec = self.sym_record(sym_cursor as u32)?;
+                    cached_sym_id = sym_cursor;
+                    time_cursor = cached_rec.time_start as usize;
+                }
             }
 
             // time 游标单调推进（sym 区间内 O(1) amortized）
             let interval_end = cached_rec.time_start as usize + cached_rec.time_count as usize;
             while time_cursor < interval_end {
-                let axis_t = self.time_at(time_cursor as u32)?;
+                let axis_t = time_at_fast(time_cursor);
                 if axis_t >= time_u { break; }
                 time_cursor += 1;
             }
 
             // 精确匹配
             if time_cursor >= interval_end
-                || self.time_at(time_cursor as u32)? != time_u
+                || time_at_fast(time_cursor) != time_u
             {
                 return Err(CoreError::Invalid(format!(
                     "locate: (sym, time) key does not exist: time {time} for sym '{}'",
