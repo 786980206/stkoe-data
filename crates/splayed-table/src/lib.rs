@@ -15,9 +15,8 @@ pub use query::{
 };
 pub use table::{
     close_table, create_table, create_table_partition, delete_table, delete_table_partition,
-    open_table, rename_table, Capabilities, PartitionInfo, Partitioning, TableFieldInit,
-    TableHandle, TableMetadata,
-    TableOptions, TableStatistics,
+    drop_table, open_table, rename_table, Capabilities, PartitionInfo, Partitioning, TableFieldInit,
+    TableHandle, TableMetadata, TableOptions, TableStatistics,
 };
 
 pub use write::{create_table_columns, write_table};

@@ -628,6 +628,13 @@ pub fn create_table_partition(
     create_dataset(&partition_path, data, options)
 }
 
+/// 销毁并删除 Table 根目录（关闭句柄并删除物理目录）。
+pub fn drop_table(handle: TableHandle) -> Result<(), CoreError> {
+    let path = handle.root.clone();
+    close_table(handle)?;
+    fs::remove_dir_all(&path).map_err(|e| CoreError::Io(e))
+}
+
 /// 删除整个 Table（根目录及全部 Partition Dataset）。
 ///
 /// 不逐 Partition 并行删除——文件系统级递归删除（remove_dir_all）比用户态遍历
@@ -1219,5 +1226,13 @@ impl TableHandle {
             }
         }
         self.structural_for_each(|ds| ds.decompress_dataset_field(field))
+    }
+
+    /// 删除指定 Partition（释放句柄并删除物理分区目录）。
+    pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError> {
+        delete_table_partition(&self.root, partition_name)?;
+        self.datasets.borrow_mut().remove(partition_name);
+        self.stats_cache.borrow_mut().remove(partition_name);
+        Ok(())
     }
 }

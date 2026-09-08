@@ -11,18 +11,23 @@ pub mod meta_file;
 pub mod scan;
 
 pub use dataset::{
-    create_dataset, create_dataset_index, delete_dataset, open_dataset, CreateDatasetOptions,
-    DatasetFieldInit, DatasetHandle, DatasetScanner, DatasetStatistics,
-    RESERVED_FIELD_NAMES, CHUNK_ROW_CAP,
+    close_dataset, create_dataset, create_dataset_index, delete_dataset, drop_dataset,
+    init_dataset, open_dataset, CreateDatasetOptions, DatasetFieldInit, DatasetHandle,
+    DatasetScanner, DatasetStatistics, CHUNK_ROW_CAP, RESERVED_FIELD_NAMES,
 };
 pub use error::{CoreError, Mode};
 pub use field_file::{
-    cast_field_file, close_field_handle, compress_field_file, create_field_file,
-    CreateFieldOptions, delete_field_file, decompress_field_file, open_field_file,
-    rename_field_file, FieldChunkReader,
-    FieldHandle, FieldInit, FieldScanner, StreamValues,
+    cast_field, cast_field_file, cast_field_path, close_field, close_field_handle,
+    column_view_to_owned_column, compress_field, compress_field_file, compress_field_path,
+    create_field, create_field_file, decompress_field, decompress_field_file,
+    decompress_field_path, delete_field_file, drop_field, drop_field_path, init_field,
+    open_field, open_field_file, read_field_schema, rename_field, rename_field_file,
+    CreateFieldOptions, FieldChunkReader, FieldHandle, FieldInit, FieldScanner, StreamValues,
 };
-pub use meta_file::{create_meta_file, delete_meta_file, MetaBuilder, MetaHandle, MetaInfo};
+pub use meta_file::{
+    close_index, create_index, create_meta_file, delete_meta_file, drop_index, init_index,
+    open_index, IndexHandle, MetaBuilder, MetaHandle, MetaInfo,
+};
 pub use scan::{merge_ranges, CmpOp, Predicate, RowRange, Scalar, ScanRequest};
 
 /// crate 统一 Result 别名。

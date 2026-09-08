@@ -1115,6 +1115,38 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
     })
 }
 
+pub fn data_view_to_owned_data(view: &DataView<'_>) -> Result<Data, CoreError> {
+    let mut cols = Vec::with_capacity(view.columns.len());
+    for col in &view.columns {
+        cols.push(crate::field_file::column_view_to_owned_column(col));
+    }
+    Data::new(view.schema.clone(), cols).map_err(CoreError::from)
+}
+
+/// 连带数据直接初始化创建数据集。
+pub fn init_dataset(
+    path: &Path,
+    data: &DataView<'_>,
+    options: Option<CreateDatasetOptions>,
+) -> Result<DatasetHandle, CoreError> {
+    let owned = data_view_to_owned_data(data)?;
+    create_dataset(path, owned, options.unwrap_or_default())?;
+    open_dataset(path, Mode::Read)
+}
+
+/// 关闭 DatasetHandle。
+#[inline]
+pub fn close_dataset(handle: DatasetHandle) -> Result<(), CoreError> {
+    handle.close_dataset()
+}
+
+/// 销毁并删除 Dataset 目录。
+pub fn drop_dataset(handle: DatasetHandle) -> Result<(), CoreError> {
+    let path = handle.root.clone();
+    handle.close_dataset()?;
+    delete_dataset(&path)
+}
+
 /// 删除完整 Dataset 根目录（META + 全部 Field）。
 pub fn delete_dataset(path: &Path) -> Result<(), CoreError> {
     fs::remove_dir_all(path).map_err(|e| map_io_path(path, e))

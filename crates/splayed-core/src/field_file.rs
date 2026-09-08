@@ -7,8 +7,8 @@ use memmap2::{Mmap, MmapMut};
 use splayed_codec::{decode_chunk, encode_chunk};
 use splayed_format::{
     bitmap_count_ones, bitmap_fill_bits, Bitmap, BitmapView, Buffer, BufferView, Column,
-    ColumnSegment, ColumnView, Compression, DataType, Encoding, FieldHeader, HEADER_SIZE,
-    validity_size,
+    ColumnSegment, ColumnView, Compression, DataType, Encoding, FieldHeader, FieldSchema,
+    HEADER_SIZE, validity_size,
 };
 
 use crate::error::{CoreError, Mode};
@@ -247,6 +247,163 @@ impl Default for CreateFieldOptions {
     fn default() -> Self {
         CreateFieldOptions { compression: Compression::None, chunk_offsets: None }
     }
+}
+
+pub fn column_view_to_owned_column(view: &ColumnView<'_>) -> Column {
+    let dt = view.data_type();
+    if view.segments().len() == 1 {
+        let seg = &view.segments()[0];
+        let validity = seg.validity().map(|b| Bitmap::from_bytes(b.to_packed_bytes(), b.len()));
+        match (dt, seg.values()) {
+            (DataType::Utf8, splayed_format::ColumnValues::Dict { keys, dict_offsets, dict_strings }) => {
+                let keys: Vec<u32> = keys
+                    .as_slice()
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                let offs: Vec<u64> = dict_offsets
+                    .as_slice()
+                    .chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                Column::from_dict(keys, offs, dict_strings.as_slice().to_vec(), validity)
+            }
+            (DataType::Utf8, splayed_format::ColumnValues::RepeatDict { dict_offsets, dict_strings, dict_index }) => {
+                let offs: Vec<u64> = dict_offsets
+                    .as_slice()
+                    .chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                let keys: Vec<u32> = vec![*dict_index; seg.rows()];
+                Column::from_dict(keys, offs, dict_strings.as_slice().to_vec(), validity)
+            }
+            _ => Column {
+                data_type: dt,
+                values: Buffer::from_vec(seg.fixed_bytes().unwrap_or(&[]).to_vec()),
+                validity,
+                dict: None,
+            },
+        }
+    } else {
+        let total_rows = view.length();
+        let mut vals = Vec::new();
+        let mut bit_bm = Bitmap::ones(total_rows);
+        let mut has_null = false;
+        let mut curr_row = 0;
+        for s in view.segments() {
+            if let Some(b) = s.fixed_bytes() {
+                vals.extend_from_slice(b);
+            }
+            if let Some(v) = s.validity() {
+                has_null = true;
+                for i in 0..s.rows() {
+                    bit_bm.set(curr_row + i, v.is_valid(i));
+                }
+            }
+            curr_row += s.rows();
+        }
+        Column {
+            data_type: dt,
+            values: Buffer::from_vec(vals),
+            validity: if has_null { Some(bit_bm) } else { None },
+            dict: None,
+        }
+    }
+}
+
+/// 创建仅包含 64 字节文件头的空字段骨架（row_count = 0, null_count = 0, data_length = 0）。
+pub fn create_field(path: &Path, field_type: DataType) -> Result<(), CoreError> {
+    create_field_file(path, field_type, FieldInit::Length(0), CreateFieldOptions::default())
+}
+
+/// 连带数据初始化创建字段文件（带数据一步直写，全 NULL 产出 64B Header-Only 文件）。
+pub fn init_field(
+    path: &Path,
+    column: &ColumnView<'_>,
+    options: Option<CreateFieldOptions>,
+) -> Result<(), CoreError> {
+    let dt = column.data_type();
+    let col = column_view_to_owned_column(column);
+    create_field_file(path, dt, FieldInit::Data(col), options.unwrap_or_default())
+}
+
+/// 打开已有 Field（open 不负责创建）。
+#[inline]
+pub fn open_field(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError> {
+    open_field_file(path, mode)
+}
+
+/// 关闭 Handle。
+#[inline]
+pub fn close_field(handle: FieldHandle) -> Result<(), CoreError> {
+    close_field_handle(handle)
+}
+
+/// 销毁删除字段（自动释放句柄并删除物理文件）。
+pub fn drop_field(handle: FieldHandle) -> Result<(), CoreError> {
+    let path = handle.path.clone();
+    close_field(handle)?;
+    fs::remove_file(&path).map_err(|e| map_io(&path, e))
+}
+
+/// 路径删除物理文件。
+#[inline]
+pub fn drop_field_path(path: &Path) -> Result<(), CoreError> {
+    delete_field_file(path)
+}
+
+/// 读取字段元数据结构。
+pub fn read_field_schema(handle: &FieldHandle) -> Result<FieldSchema, CoreError> {
+    let name = handle.path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    Ok(FieldSchema::new(name, handle.data_type()))
+}
+
+/// 同目录内重命名 Field 文件。
+#[inline]
+pub fn rename_field(path: &Path, new_name: &str) -> Result<(), CoreError> {
+    rename_field_file(path, new_name)
+}
+
+/// 字段类型就地转换（流式批次转换）。
+pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(), CoreError> {
+    let path = handle.path.clone();
+    let mode = handle.mode;
+    cast_field_file(&path, target_type)?;
+    *handle = open_field(&path, mode)?;
+    Ok(())
+}
+
+#[inline]
+pub fn cast_field_path(path: &Path, target_type: DataType) -> Result<(), CoreError> {
+    cast_field_file(path, target_type)
+}
+
+/// 字段压缩。
+pub fn compress_field(handle: &mut FieldHandle, offsets: Option<Vec<u64>>) -> Result<(), CoreError> {
+    let path = handle.path.clone();
+    let mode = handle.mode;
+    compress_field_file(&path, offsets)?;
+    *handle = open_field(&path, mode)?;
+    Ok(())
+}
+
+#[inline]
+pub fn compress_field_path(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError> {
+    compress_field_file(path, offsets)
+}
+
+/// 字段解压。
+pub fn decompress_field(handle: &mut FieldHandle) -> Result<(), CoreError> {
+    let path = handle.path.clone();
+    let mode = handle.mode;
+    decompress_field_file(&path)?;
+    *handle = open_field(&path, mode)?;
+    Ok(())
+}
+
+#[inline]
+pub fn decompress_field_path(path: &Path) -> Result<(), CoreError> {
+    decompress_field_file(path)
 }
 
 /// 创建 Field 文件。
@@ -524,13 +681,38 @@ impl FieldHandle {
 
     // --------------------------------------------------------------- read
 
+    #[inline]
+    pub fn read_field(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
+        self.read_field_handle(offset, length)
+    }
+
+    #[inline]
+    pub fn write_field(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
+        self.write_field_handle(offset, data)
+    }
+
+    #[inline]
+    pub fn scan_field(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
+        self.scan_field_handle(request)
+    }
+
+    pub fn update_field(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError> {
+        self.mode.require_write("update_field")?;
+        if data.data_type() != self.data_type() {
+            return Err(CoreError::Invalid("update data type mismatch".into()));
+        }
+        let tmp = tmp_path(&self.path);
+        let _ = fs::remove_file(&tmp);
+        init_field(&tmp, data, None)?;
+        self.backing = Backing::Empty;
+        self.working = None;
+        fs::rename(&tmp, &self.path)?;
+        let reloaded = open_field(&self.path, self.mode)?;
+        *self = reloaded;
+        Ok(())
+    }
+
     /// 按逻辑行（= 物理行）读取，返回 zero-copy ColumnView。
-    ///
-    /// 职责边界：只把逻辑行范围转换为 ColumnView —— 不做解压（open 时一次完成）、
-    /// 数据复制、段合并或谓词求值（归 Scanner / Dataset 层）。
-    /// PLAIN + NONE 为单段 mmap 切片；compressed 跨 chunk 的读取返回多段。
-    /// compressed 定位复杂度 O(log C + 交叠 chunk 数)：chunk_ends 上二分首个 chunk，
-    /// `cstart ≥ end` 即停；不从头遍历 chunk、不做逐 chunk 前缀和。
     pub fn read_field_handle(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
         let row_count = self.row_count();
         // 边界检查溢出安全

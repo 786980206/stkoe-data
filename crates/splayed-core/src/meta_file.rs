@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use memmap2::Mmap;
 use splayed_format::{
     BufferView, ColumnSegment, ColumnView, DataView, FieldSchema, MetaHeader, Schema,
-    SymIndexRecord, TimeType, DataType, DATA_OFFSET, HEADER_SIZE,
+    SymIndexRecord, TimeType, DataType, DATA_OFFSET, HEADER_SIZE, META_HEADER_SIZE,
 };
 
 use crate::error::{map_io_path, CoreError};
@@ -230,6 +230,66 @@ pub(crate) fn write_meta_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreErr
     Ok(())
 }
 
+/// Index 句柄（与 MetaHandle 等价）。
+pub type IndexHandle = MetaHandle;
+
+/// 创建仅包含 64 字节 MetaHeader 的空主索引文件（骨架）。
+pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, CoreError> {
+    if path.exists() {
+        return Err(CoreError::AlreadyExists(path.to_path_buf()));
+    }
+    let header = MetaHeader {
+        magic: splayed_format::META_MAGIC,
+        version: 2,
+        flags: 0,
+        time_type: time_type.id(),
+        reserved0: [0; 3],
+        generation: 1,
+        time_count: 0,
+        sym_count: 0,
+        row_count: 0,
+        reserved1: 0,
+        sym_dict_offset: META_HEADER_SIZE as u64,
+        sym_index_offset: (META_HEADER_SIZE + 8) as u64,
+        file_size: (META_HEADER_SIZE + 8) as u64,
+    };
+    let mut f = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| map_io_path(path, e))?;
+    f.write_all(&header.to_bytes())?;
+    f.write_all(&[0u8; 8])?;
+    f.sync_all()?;
+    drop(f);
+    open_index(path)
+}
+
+/// 连带数据直接初始化主索引文件并打开 IndexHandle。
+pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreError> {
+    create_meta_file(path, data)?;
+    open_index(path)
+}
+
+/// 打开已存在的主索引文件。
+#[inline]
+pub fn open_index(path: &Path) -> Result<IndexHandle, CoreError> {
+    MetaHandle::open(path)
+}
+
+/// 显式关闭 Index 句柄并释放内存映射。
+#[inline]
+pub fn close_index(handle: IndexHandle) -> Result<(), CoreError> {
+    handle.close()
+}
+
+/// 销毁并删除主索引文件。
+pub fn drop_index(handle: IndexHandle) -> Result<(), CoreError> {
+    let path = handle.path().to_path_buf();
+    handle.close()?;
+    delete_meta_file(&path)
+}
+
 /// 根据排序后的 `(sym, time)` 两列创建 META 文件（`path` 为 META 文件完整路径）。
 pub fn create_meta_file(path: &Path, data: &DataView<'_>) -> Result<(), CoreError> {
     let bytes = MetaBuilder::build(data)?;
@@ -397,6 +457,46 @@ impl MetaHandle {
             }
         }
         None
+    }
+
+    #[inline]
+    pub fn read_index(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
+        self.read_index_handle(offset, length)
+    }
+
+    #[inline]
+    pub fn scan_index(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
+        self.scan_index_handle(request)
+    }
+
+    #[inline]
+    pub fn locate_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_index_handle(pairs)
+    }
+
+    pub fn read_index_schema(&self) -> Schema {
+        let time_type = self.header.time_type().unwrap_or(TimeType::TimestampUs);
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", time_type.data_type()),
+        ])
+    }
+
+    pub fn update_index(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        let tmp = self.path.with_extension("tmp");
+        let bytes = MetaBuilder::build(data)?;
+        let mut f = File::create(&tmp).map_err(|e| map_io_path(&tmp, e))?;
+        f.write_all(&bytes).map_err(|e| map_io_path(&tmp, e))?;
+        f.sync_all().map_err(|e| map_io_path(&tmp, e))?;
+        drop(f);
+        let new_mmap = unsafe { Mmap::map(&File::open(&tmp)?)? };
+        let new_header = MetaHeader::from_bytes(&new_mmap[..META_HEADER_SIZE])?;
+        // Drop existing mmap before rename on Windows
+        self.mmap = memmap2::MmapOptions::new().map_anon()?.make_read_only()?;
+        fs::rename(&tmp, &self.path)?;
+        self.mmap = new_mmap;
+        self.header = new_header;
+        Ok(())
     }
 
     /// `read_index_handle`：按逻辑行区间返回 `(sym, time)` 两列 DataView。
