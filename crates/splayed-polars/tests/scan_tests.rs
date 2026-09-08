@@ -159,3 +159,39 @@ fn scan_polars_none_table() {
     assert_eq!(price.null_count(), 1);
     cleanup(&dir);
 }
+
+#[test]
+fn scan_polars_empty_table_refuses() {
+    let dir = temp_dir("empty");
+    let root = dir.join("tbl");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let sym_col = Column::from_dict(vec![], vec![0, 0], vec![], None);
+    let time_col = Column {
+        data_type: DataType::Date32,
+        values: Buffer::from_vec(Vec::new()),
+        validity: None,
+        dict: None,
+    };
+    let price_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_vec(Vec::new()),
+        validity: None,
+        dict: None,
+    };
+    let data = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::Date32),
+            FieldSchema::new("price", DataType::Float64),
+        ]),
+        vec![sym_col, time_col, price_col],
+    )
+    .unwrap();
+    create_table(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+
+    // 空表没有数据分区和 .meta，polars 扫描无法推断 schema，应返回 Err
+    let res = splayed_polars::scan_polars(&root);
+    assert!(res.is_err());
+    cleanup(&dir);
+}

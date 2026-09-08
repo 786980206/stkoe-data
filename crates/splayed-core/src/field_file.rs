@@ -1025,7 +1025,7 @@ pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreErr
                 return Err(CoreError::Invalid("cast involving Utf8 is not supported".into()));
             }
             let file_len = fs::metadata(path).map_err(|e| map_io(path, e))?.len() as usize;
-            let is_header_only = file_len == HEADER_SIZE && handle.row_count() > 0;
+            let is_header_only = file_len == HEADER_SIZE;
             let chunk_starts: Vec<u64> = handle
                 .chunk_rows
                 .iter()
@@ -1214,7 +1214,7 @@ fn compress_field_file_encoded(
         return Err(CoreError::InvalidState("field is already compressed".into()));
     }
     let file_len = fs::metadata(path).map_err(|e| map_io(path, e))?.len() as usize;
-    let is_header_only = file_len == HEADER_SIZE && handle.row_count() > 0;
+    let is_header_only = file_len == HEADER_SIZE || handle.header.is_all_null();
     if is_header_only {
         // Header-only：直接写回压缩标志，不写任何 chunk
         let mut new_header = handle.header;
@@ -1330,7 +1330,7 @@ pub fn decompress_field_file(path: &Path) -> Result<(), CoreError> {
     if !header.is_chunked() {
         return Err(CoreError::InvalidState("field is not compressed".into()));
     }
-    let is_header_only = file_len == HEADER_SIZE && header.row_count > 0;
+    let is_header_only = file_len == HEADER_SIZE;
     if is_header_only {
         // Header-only：直接写回解压标志（PLAIN + NONE），不写任何 DATA / VALIDITY
         let mut new_header = header;

@@ -918,3 +918,176 @@ fn header_only_field_cast_and_compress_operations() {
 
     cleanup(&dir);
 }
+
+#[test]
+fn zero_length_field_boundaries() {
+    let dir = temp_dir("zero_length");
+    let path = dir.join("empty_field");
+
+    // 1. 创建 0 行全 NULL 字段
+    create_field_file(
+        &path,
+        DataType::Float64,
+        FieldInit::Length(0),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+
+    let mut h = open_field_file(&path, Mode::Write).unwrap();
+    assert_eq!(h.row_count(), 0);
+    assert_eq!(h.header().null_count, 0);
+
+    // 读 0 行返回空视图
+    let view = h.read_field_handle(0, 0).unwrap();
+    assert_eq!(view.length(), 0);
+
+    // 读 >0 行应报错
+    assert!(h.read_field_handle(0, 1).is_err());
+    assert!(h.read_field_handle(1, 0).is_err());
+
+    // 扫描 0 行字段返回 None
+    let req = splayed_core::ScanRequest::default();
+    let mut scanner = h.scan_field_handle(&req).unwrap();
+    assert_eq!(scanner.next().unwrap(), None);
+
+    // 写入 0 行应成功且不改变任何状态
+    let empty_col = Column::zeroed(DataType::Float64, 0, false);
+    h.write_field_handle(0, &empty_col.as_view()).unwrap();
+    close_field_handle(h).unwrap();
+
+    // 2. Cast 0 行字段
+    cast_field_file(&path, DataType::Int32).unwrap();
+    let h2 = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(h2.data_type(), DataType::Int32);
+    assert_eq!(h2.row_count(), 0);
+    close_field_handle(h2).unwrap();
+
+    // 3. Compress 0 行字段
+    compress_field_file(&path, None).unwrap();
+    let h3 = open_field_file(&path, Mode::Read).unwrap();
+    assert!(h3.is_chunked());
+    assert_eq!(h3.row_count(), 0);
+    close_field_handle(h3).unwrap();
+
+    // 4. Decompress 0 行字段
+    decompress_field_file(&path).unwrap();
+    let h4 = open_field_file(&path, Mode::Read).unwrap();
+    assert!(!h4.is_chunked());
+    assert_eq!(h4.row_count(), 0);
+    close_field_handle(h4).unwrap();
+
+    cleanup(&dir);
+}
+
+#[test]
+fn validity_unaligned_bit_overwrite_boundary() {
+    let dir = temp_dir("validity_unaligned");
+    let path = dir.join("price");
+
+    // 创建 32 行带 validity 区的 Float64 字段 (null_count = 0)
+    let vals: Vec<f64> = (0..32).map(|i| i as f64).collect();
+    let col = f64_column(&vals, Some(Bitmap::from_bytes(vec![0xFF; 4], 32)));
+    create_field_file(
+        &path,
+        DataType::Float64,
+        FieldInit::Data(col),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+
+    let mut h = open_field_file(&path, Mode::Write).unwrap();
+    assert_eq!(h.header().null_count, 0);
+
+    // 在 offset = 5 处写入 11 个值（跨越 byte 0, byte 1）
+    // 其中第 0, 3, 5 个值为 NULL（局部 index: 0, 3, 5，全局 index: 5, 8, 10）
+    let patch_vals: Vec<f64> = (0..11).map(|i| 100.0 + i as f64).collect();
+    let mut bits = vec![0xFFu8; 2]; // 11 位全有效初始
+    // 清除 bit 0, bit 3, bit 5 (变为 NULL)
+    bits[0] &= !(1 << 0);
+    bits[0] &= !(1 << 3);
+    bits[0] &= !(1 << 5);
+    let patch_col = f64_column(&patch_vals, Some(Bitmap::from_bytes(bits, 11)));
+    assert_eq!(patch_col.null_count(), 3);
+
+    h.write_field_handle(5, &patch_col.as_view()).unwrap();
+    close_field_handle(h).unwrap();
+
+    // 重新打开并精细校验每一位的有效性与值
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(h.header().null_count, 3); // 原先 0 个 NULL，新增了 3 个 NULL
+    let view = h.read_field_handle(0, 32).unwrap();
+    let vals = view_values(&view);
+    let validity = view.segments()[0].validity().expect("has validity");
+
+    // 检查全局 5, 8, 10 必须为 NULL (is_valid == false)，其余 29 个位置必须有效且数据正确
+    for i in 0..32 {
+        let valid = validity.is_valid(i);
+        if i == 5 || i == 8 || i == 10 {
+            assert!(!valid, "row {i} should be null");
+        } else {
+            assert!(valid, "row {i} should be valid");
+            if (5..16).contains(&i) {
+                // 覆盖区域中的有效值
+                let expected = 100.0 + (i - 5) as f64;
+                assert_eq!(vals[i], expected);
+            } else {
+                // 未覆盖区域的原有值
+                assert_eq!(vals[i], i as f64);
+            }
+        }
+    }
+    close_field_handle(h).unwrap();
+
+    cleanup(&dir);
+}
+
+#[test]
+fn chunked_field_small_chunks_crossing_boundary() {
+    let dir = temp_dir("small_chunks");
+    let path = dir.join("qty");
+
+    // 创建具有小 chunk 的压缩字段：边界为 [0, 2, 5, 6, 10]
+    // 块大小分别为：2, 3, 1, 4
+    let vals: Vec<f64> = (0..10).map(|i| (i * 10) as f64).collect();
+    let col = f64_column(&vals, None);
+    create_field_file(
+        &path,
+        DataType::Float64,
+        FieldInit::Data(col),
+        splayed_core::CreateFieldOptions {
+            compression: splayed_format::Compression::Zstd,
+            chunk_offsets: Some(vec![0, 2, 5, 6]),
+        },
+    )
+    .unwrap();
+
+    let mut h = open_field_file(&path, Mode::Write).unwrap();
+    assert!(h.is_chunked());
+    assert_eq!(h.row_count(), 10);
+
+    // 1. 跨越多个 chunk 边界读取：offset = 1, length = 6 (覆盖第 1 到第 6 行，跨越块 0, 1, 2, 3)
+    let view = h.read_field_handle(1, 6).unwrap();
+    assert_eq!(view.length(), 6);
+    let values = view_values(&view);
+    assert_eq!(values, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+
+    // 2. 在压缩字段跨 chunk 覆盖写：覆盖 [3..8] (跨越块 1, 2, 3)
+    let patch_vals = vec![999.0, 998.0, 997.0, 996.0, 995.0];
+    let patch_col = f64_column(&patch_vals, None);
+    h.write_field_handle(3, &patch_col.as_view()).unwrap();
+    close_field_handle(h).unwrap(); // 触发重压缩
+
+    // 3. 重新打开并验证跨 chunk 重压缩后的数据完整性
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert!(h.is_chunked());
+    let view_after = h.read_field_handle(0, 10).unwrap();
+    let all_vals = view_values(&view_after);
+    assert_eq!(
+        all_vals,
+        vec![0.0, 10.0, 20.0, 999.0, 998.0, 997.0, 996.0, 995.0, 80.0, 90.0]
+    );
+    close_field_handle(h).unwrap();
+
+    cleanup(&dir);
+}

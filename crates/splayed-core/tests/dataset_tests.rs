@@ -739,3 +739,62 @@ fn scan_dataset_symbol_in_or_pushdown() {
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }
+
+#[test]
+fn dataset_read_write_boundaries_and_zero_length() {
+    let dir = temp_dir("boundaries");
+    let root = dir.join("ds");
+    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    let ds = open_dataset(&root, Mode::Write).unwrap();
+
+    // 1. 读取 length = 0：应成功返回空 DataView，且 schema 保持 (None 只读 sym, time)
+    let view_zero = ds.read_dataset(0, 0, None).unwrap();
+    assert_eq!(view_zero.length(), 0);
+    assert_eq!(view_zero.schema.len(), 2);
+
+    let view_zero_proj = ds.read_dataset(3, 0, Some(&["price"])).unwrap();
+    assert_eq!(view_zero_proj.length(), 0);
+    assert_eq!(view_zero_proj.schema.len(), 3);
+
+    // 2. 越界读取检查
+    assert!(ds.read_dataset(0, 9, None).is_err());
+    assert!(ds.read_dataset(8, 1, None).is_err());
+    assert!(ds.read_dataset(u64::MAX, 1, None).is_err());
+
+    // 3. 包含保留名字段作为 projection（sym, time 被内部识别并安全处理）
+    let view_res = ds.read_dataset(2, 3, Some(&["sym", "time", "price"])).unwrap();
+    assert_eq!(view_res.length(), 3);
+    assert_eq!(view_res.column("sym").unwrap().length(), 3);
+    assert_eq!(view_res.column("time").unwrap().length(), 3);
+    assert_eq!(view_res.column("price").unwrap().length(), 3);
+
+    // 4. 重复指定列名投影（去重返回）
+    let view_dup = ds.read_dataset(0, 2, Some(&["price", "price"])).unwrap();
+    assert_eq!(view_dup.schema.len(), 3); // sym, time, price（不重复出现 price）
+
+    // 5. 写入越界检查
+    let patch_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&[99.0f64, 100.0f64]),
+        validity: None,
+        dict: None,
+    };
+    let patch_data = Data::new(
+        Schema::new(vec![FieldSchema::new("price", DataType::Float64)]),
+        vec![patch_col],
+    )
+    .unwrap();
+    // offset 7 写入 2 行（7+2 = 9 > 8），应报错
+    assert!(ds.write_dataset(7, &patch_data.as_view()).is_err());
+
+    // 正好写入末尾：offset 6 写入 2 行（6+2 = 8 == 8），应成功
+    ds.write_dataset(6, &patch_data.as_view()).unwrap();
+    let read_tail = ds.read_dataset(6, 2, Some(&["price"])).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, f64>(read_tail.column("price").unwrap().segments()[0].fixed_bytes().unwrap()),
+        &[99.0, 100.0]
+    );
+
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}

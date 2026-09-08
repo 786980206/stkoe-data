@@ -412,6 +412,15 @@ impl MetaHandle {
             return Err(CoreError::Invalid("index read range out of bounds".into()));
         }
         let time_type = self.header.time_type()?;
+        if length == 0 {
+            let schema = Schema::new(vec![
+                FieldSchema::new("sym", DataType::Utf8),
+                FieldSchema::new("time", time_type.data_type()),
+            ]);
+            let sym_view = ColumnView::empty(DataType::Utf8);
+            let time_view = ColumnView::empty(time_type.data_type());
+            return DataView::new(schema, vec![sym_view, time_view]).map_err(CoreError::from);
+        }
         let ts = time_type.size_of();
         let end = offset + length;
 

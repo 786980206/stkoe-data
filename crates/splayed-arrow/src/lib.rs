@@ -222,16 +222,29 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
                 })?);
             }
             let values_arr = StringArray::from(parts);
-            // keys: u32 → i32（位宽转换，值域校验）
-            let raw_keys: &[u32] = bytemuck::cast_slice(values);
-            let keys_i32: Vec<i32> = raw_keys
-                .iter()
-                .map(|&k| {
-                    i32::try_from(k).map_err(|_| {
-                        ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+            // keys: u32 → i32（位宽转换，值域校验，兼顾空切片与对齐）
+            let keys_i32: Vec<i32> = if values.is_empty() {
+                Vec::new()
+            } else if let Ok(raw_keys) = bytemuck::try_cast_slice::<u8, u32>(values) {
+                raw_keys
+                    .iter()
+                    .map(|&k| {
+                        i32::try_from(k).map_err(|_| {
+                            ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+                        })
                     })
-                })
-                .collect::<Result<_>>()?;
+                    .collect::<Result<_>>()?
+            } else {
+                values
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        let k = u32::from_le_bytes(chunk.try_into().unwrap());
+                        i32::try_from(k).map_err(|_| {
+                            ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+                        })
+                    })
+                    .collect::<Result<_>>()?
+            };
             let dict_keys = Int32Array::new(keys_i32.into(), validity);
             Ok(Arc::new(
                 DictionaryArray::try_new(dict_keys, Arc::new(values_arr))?,
@@ -241,7 +254,24 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
 }
 
 fn cast_to_vec<T: bytemuck::Pod>(bytes: &[u8]) -> Result<Vec<T>> {
-    Ok(bytemuck::cast_slice::<u8, T>(bytes).to_vec())
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Ok(slice) = bytemuck::try_cast_slice::<u8, T>(bytes) {
+        return Ok(slice.to_vec());
+    }
+    let size = std::mem::size_of::<T>();
+    if bytes.len() % size != 0 {
+        return Err(ArrowConvError::Unsupported(
+            "byte length does not match type size".into(),
+        ));
+    }
+    let count = bytes.len() / size;
+    let mut out = Vec::with_capacity(count);
+    for chunk in bytes.chunks_exact(size) {
+        out.push(bytemuck::pod_read_unaligned(chunk));
+    }
+    Ok(out)
 }
 
 /// 多段视图 → 单 ArrayRef（Layer 1；段间按行序拼接拷贝——RecordBatch 单列单数组

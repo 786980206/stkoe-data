@@ -1192,3 +1192,90 @@ fn create_table_columns_refuses_conflicting_type() {
     drop(table);
     cleanup(&dir);
 }
+
+#[test]
+fn table_query_batch_sizes_and_limit_boundaries() {
+    let dir = temp_dir("batch_boundaries");
+    let root = dir.join("tbl");
+    // month_sample() 包含 2 个分区（2026-08 4 行，2026-09 4 行，共 8 行）
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+
+    // 1. batch_size = Some(1)：每次迭代返回恰好 1 行
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, Some(1)).unwrap();
+    let mut count = 0;
+    while let Some(view) = reader.next().unwrap() {
+        assert_eq!(view.length(), 1);
+        count += 1;
+    }
+    reader.close().unwrap();
+    assert_eq!(count, 8);
+
+    // 2. batch_size = Some(3)：8 行分为 3, 3, 2
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, Some(3)).unwrap();
+    let mut lengths = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        lengths.push(view.length());
+    }
+    reader.close().unwrap();
+    assert_eq!(lengths, vec![3, 3, 2]);
+
+    // 3. batch_size = Some(100)（超出总行数）：聚合所有行至单批次或按分区批次（不可超发）
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, Some(100)).unwrap();
+    let mut total_rows = 0;
+    while let Some(view) = reader.next().unwrap() {
+        total_rows += view.length();
+    }
+    reader.close().unwrap();
+    assert_eq!(total_rows, 8);
+
+    // 4. limit 跨分区截断：limit = 5（分区 1 取 4 行，分区 2 取 1 行）
+    let req = TableScanRequest {
+        limit: Some(5),
+        ..Default::default()
+    };
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut total_limit = 0;
+    while let Some(view) = reader.next().unwrap() {
+        total_limit += view.length();
+    }
+    reader.close().unwrap();
+    assert_eq!(total_limit, 5);
+
+    drop(table);
+    cleanup(&dir);
+}
+
+#[test]
+fn table_partition_delete_and_rescan() {
+    let dir = temp_dir("part_del");
+    let root = dir.join("tbl");
+    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+
+    // 删除 2026-08 分区
+    delete_table_partition(&root, "month=2026-08").unwrap();
+    assert!(!root.join("month=2026-08").exists());
+    assert!(root.join("month=2026-09").exists());
+
+    // 重新打开表并扫描，此时只剩下 2026-09 分区的 4 行
+    let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
+    let meta = table.read_table_metadata().unwrap();
+    let partitions: Vec<String> = meta.partitions.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(partitions, vec!["month=2026-09"]);
+
+    let req = TableScanRequest::default();
+    let mut scanner = scan_table(&table, req).unwrap();
+    let mut rows = 0;
+    while let Some(prr) = scanner.next().unwrap() {
+        assert_eq!(prr.partition, "month=2026-09");
+        rows += prr.row_range.length;
+    }
+    scanner.close().unwrap();
+    assert_eq!(rows, 4);
+
+    drop(table);
+    cleanup(&dir);
+}

@@ -280,3 +280,32 @@ fn arrow_reader_limit_early_termination() {
     assert!(lens.iter().all(|&l| l <= 2));
     cleanup(&dir);
 }
+
+#[test]
+fn arrow_empty_data_view_and_batch_roundtrip() {
+    // 1. 空 DataView 转 RecordBatch
+    let schema = Schema::new(vec![
+        FieldSchema::new("id", DataType::Int32),
+        FieldSchema::new("val", DataType::Float64),
+    ]);
+    let col1 = Column::zeroed(DataType::Int32, 0, false);
+    let col2 = Column::zeroed(DataType::Float64, 0, false);
+    let data_view = splayed_format::DataView::new(schema, vec![col1.as_view(), col2.as_view()]).unwrap();
+
+    let batch = data_view_to_record_batch(&data_view).unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.num_columns(), 2);
+
+    // 2. 空 RecordBatch 转 Data
+    let data_back = record_batch_to_data(&batch).unwrap();
+    assert_eq!(data_back.length(), 0);
+    assert_eq!(data_back.schema.len(), 2);
+
+    // 3. 全 NULL 数组转 Arrow
+    let null_col = Column::zeroed(DataType::Float64, 5, true);
+    assert_eq!(null_col.null_count(), 5);
+    let arr = column_to_array(&null_col).unwrap();
+    assert_eq!(arr.len(), 5);
+    assert_eq!(arr.null_count(), 5);
+    assert_eq!(arr.logical_null_count(), 5);
+}
