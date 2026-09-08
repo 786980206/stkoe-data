@@ -365,6 +365,11 @@ fn table_field_structure_operations() {
 
     // create：全 NULL
     table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).unwrap();
+    // 验证各分区物理文件大小均为 64B
+    let meta = table.read_table_metadata().unwrap();
+    for p in meta.partitions {
+        assert_eq!(std::fs::metadata(root.join(&p.name).join("volume")).unwrap().len(), 64);
+    }
     let schema = table.read_table_schema().unwrap();
     assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
     // 重复创建 → Error
@@ -1102,6 +1107,9 @@ fn create_table_columns_creates_missing_columns_subset() {
     assert_eq!(price, vec![10.0, 20.0]); // price 未被动
 
     // 09 分区：volume/qty 已建且全 NULL（无输入行覆盖）
+    // 验证 09 分区的 volume 与 qty 文件为 header-only 64 字节
+    assert_eq!(std::fs::metadata(root.join("month=2026-09").join("volume")).unwrap().len(), 64);
+    assert_eq!(std::fs::metadata(root.join("month=2026-09").join("qty")).unwrap().len(), 64);
     let d901 = splayed_table::days_from_civil(2026, 9, 1) as i32;
     let req = TableScanRequest {
         time: Some((d901 as i64, (d901 + 1) as i64)),

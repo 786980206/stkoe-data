@@ -131,6 +131,11 @@ impl FieldHeader {
     pub fn is_chunked(&self) -> bool {
         self.encoding != Encoding::Plain.id() || self.compression != Compression::None.id()
     }
+
+    /// 该 header 是否表示全 NULL（row_count > 0 且 null_count == row_count）。
+    pub fn is_all_null(&self) -> bool {
+        self.row_count > 0 && self.null_count == self.row_count
+    }
 }
 
 #[cfg(test)]

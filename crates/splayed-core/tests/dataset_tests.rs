@@ -227,6 +227,8 @@ fn dataset_struct_ops_and_compression() {
 
     // create：全 NULL 字段
     ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).unwrap();
+    // 验证底层物理文件仅 64 字节
+    assert_eq!(std::fs::metadata(root.join("volume")).unwrap().len(), 64);
     assert_eq!(ds.read_dataset_schema().data_type_of("volume"), Some(DataType::Int64));
     let view = ds.read_dataset(0, 8, Some(&["volume"])).unwrap();
     assert_eq!(view.column("volume").unwrap().null_count(), 8);

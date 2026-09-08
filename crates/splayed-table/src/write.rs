@@ -378,7 +378,7 @@ pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<
     //    （任何类型冲突 / 校验失败 → 提前返回，无任何建列残留）。
     //    新列在所有已发现分区统一创建（表 Schema 一致）；输入未覆盖的分区全 NULL。
     let partitions = table.discover_partitions();
-    let mut queue: Vec<(String, String, DataType, Column)> = Vec::new();
+    let mut queue: Vec<(String, String, DataType, DatasetFieldInit)> = Vec::new();
     for p in &partitions {
         let ds = table.dataset_for(p)?;
         let l_p = ds.read_dataset_statistics()?.row_count as usize;
@@ -399,8 +399,14 @@ pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<
                 }
                 Some(_) => {} // 已存在同类型 → 不触碰
                 None => {
-                    let full = build_aligned_column(data, writes, name, field.data_type, l_p)?;
-                    queue.push((p.clone(), name.to_string(), field.data_type, full));
+                    let init = if writes.is_empty() {
+                        // 该分区未被输入覆盖：直接全 NULL 初始化（header-only 64B 文件，零磁盘占用）
+                        DatasetFieldInit::AllNull
+                    } else {
+                        let full = build_aligned_column(data, writes, name, field.data_type, l_p)?;
+                        DatasetFieldInit::Data(full)
+                    };
+                    queue.push((p.clone(), name.to_string(), field.data_type, init));
                 }
             }
         }
@@ -415,10 +421,10 @@ pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<
         .iter_mut()
         .map(|(k, v)| (k.as_str(), &mut **v))
         .collect();
-    for (pname, name, dtype, full) in queue {
+    for (pname, name, dtype, init) in queue {
         let ds = handles.get_mut(pname.as_str()).expect("plan partition handle");
         let fo = field_options(compression, chunk_target_rows, ds);
-        ds.create_dataset_field(&name, dtype, DatasetFieldInit::Data(full), fo)?;
+        ds.create_dataset_field(&name, dtype, init, fo)?;
     }
     Ok(())
 }

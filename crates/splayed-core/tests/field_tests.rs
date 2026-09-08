@@ -98,6 +98,8 @@ fn create_length_gives_all_null_field() {
     let dir = temp_dir("length");
     let path = dir.join("price");
     create_field_file(&path, DataType::Float64, FieldInit::Length(10), splayed_core::CreateFieldOptions::default()).unwrap();
+    // 物理文件仅 64 字节 header
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
     // 重复创建 → AlreadyExists
     assert!(matches!(
         create_field_file(&path, DataType::Float64, FieldInit::Length(10), splayed_core::CreateFieldOptions::default()),
@@ -809,11 +811,110 @@ fn create_compressed_field_equivalence_and_offsets() {
         },
     )
     .unwrap();
+    // compressed Length 也是 header-only 64 字节
+    assert_eq!(std::fs::metadata(&all_null).unwrap().len(), 64);
     let h = open_field_file(&all_null, Mode::Read).unwrap();
     assert!(h.is_chunked());
     assert_eq!(h.row_count(), 100);
     let view = h.read_field_handle(0, 100).unwrap();
     assert_eq!(view.null_count(), 100);
     close_field_handle(h).unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn header_only_field_read_scan_write_lifecycle() {
+    let dir = temp_dir("header_only_lifecycle");
+    let path = dir.join("price");
+    create_field_file(
+        &path,
+        DataType::Float64,
+        FieldInit::Length(100),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+
+    // 1. Read: 验证返回全 NULL
+    let r_handle = open_field_file(&path, Mode::Read).unwrap();
+    let view = r_handle.read_field_handle(10, 20).unwrap();
+    assert_eq!(view.null_count(), 20);
+    assert_eq!(view.length(), 20);
+
+    // 2. Scan: 谓词扫描，因全为 NULL 命中 0 行
+    let req = splayed_core::ScanRequest {
+        ranges: vec![splayed_core::RowRange::new(0, 100)],
+        projection: vec![],
+        predicate: Some(splayed_core::Predicate::value_cmp(
+            splayed_core::CmpOp::Gt,
+            splayed_core::Scalar::Float(0.0),
+        )),
+        limit: None,
+    };
+    let mut scanner = r_handle.scan_field_handle(&req).unwrap();
+    assert_eq!(scanner.next().unwrap(), None);
+    close_field_handle(r_handle).unwrap();
+
+    // 3. Write: 写入触发文件扩展
+    let mut w_handle = open_field_file(&path, Mode::Write).unwrap();
+    let patch_vals = vec![10.0, 20.0, 30.0];
+    let patch = f64_column(&patch_vals, None);
+    w_handle.write_field_handle(10, &patch.as_view()).unwrap();
+    close_field_handle(w_handle).unwrap();
+
+    // 验证物理文件已被扩展至完整大小：64 + 100*8 + ceil(100/8) = 64 + 800 + 13 = 877
+    let expected_len = 64 + 100 * 8 + (100 + 7) / 8;
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), expected_len as u64);
+
+    // 重新打开验证值与 NULL 状态
+    let r_handle = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(r_handle.header().generation, 2);
+    assert_eq!(r_handle.header().null_count, 97);
+    let view = r_handle.read_field_handle(10, 3).unwrap();
+    assert_eq!(view_values(&view), patch_vals);
+    let view_before = r_handle.read_field_handle(0, 10).unwrap();
+    assert_eq!(view_before.null_count(), 10);
+    close_field_handle(r_handle).unwrap();
+
+    cleanup(&dir);
+}
+
+#[test]
+fn header_only_field_cast_and_compress_operations() {
+    let dir = temp_dir("header_only_struct_ops");
+    let path = dir.join("price");
+    create_field_file(
+        &path,
+        DataType::Float64,
+        FieldInit::Length(50),
+        splayed_core::CreateFieldOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+
+    // 1. Cast: Float64 -> Int32 保持 64B
+    cast_field_file(&path, DataType::Int32).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert_eq!(h.data_type(), DataType::Int32);
+    assert_eq!(h.row_count(), 50);
+    close_field_handle(h).unwrap();
+
+    // 2. Compress: 保持 64B
+    compress_field_file(&path, None).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert!(h.is_chunked());
+    assert_eq!(h.row_count(), 50);
+    close_field_handle(h).unwrap();
+
+    // 3. Decompress: 保持 64B
+    splayed_core::decompress_field_file(&path).unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+    let h = open_field_file(&path, Mode::Read).unwrap();
+    assert!(!h.is_chunked());
+    assert_eq!(h.row_count(), 50);
+    close_field_handle(h).unwrap();
+
     cleanup(&dir);
 }

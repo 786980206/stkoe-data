@@ -175,7 +175,7 @@ fn create_field_file_chunked_all_null(
     data_type: DataType,
     rows: usize,
     compression: Compression,
-    boundaries: &[(usize, usize)],
+    _boundaries: &[(usize, usize)],
 ) -> Result<(), CoreError> {
     let size = data_type.size_of();
     let mut f = File::options()
@@ -184,30 +184,10 @@ fn create_field_file_chunked_all_null(
         .open(path)
         .map_err(|e| map_io(path, e))?;
 
-    // Phase 1: 占位 HEADER
-    f.write_all(&[0u8; HEADER_SIZE])?;
-
-    // Phase 2: 逐 chunk 编码直写（values 零填充、validity 全 0 位）
-    for &(lo, hi) in boundaries {
-        let take = hi - lo;
-        let zeros = vec![0u8; take * size];
-        let zero_bits = vec![0u8; validity_size(take as u32)];
-        let chunk = encode_chunk(
-            Encoding::Plain,
-            compression,
-            data_type,
-            &zeros,
-            Some(&zero_bits),
-            take,
-        )?;
-        f.write_all(&chunk)?;
-    }
-
-    // Phase 3: HEADER 回填（row_count = n、null_count = n、data_length = 逻辑字节数）
-    let mut header = FieldHeader::new_uncompressed(data_type, 1, rows as u32, rows as u32, false);
+    // 全 NULL（Length）字段：仅写入 64 字节 HEADER 表示，不向磁盘写入空 chunk
+    let mut header = FieldHeader::new_uncompressed(data_type, 1, rows as u32, rows as u32, true);
     header.compression = compression.id();
     header.data_length = rows as u64 * size as u64;
-    f.seek(SeekFrom::Start(0))?;
     f.write_all(&header.to_bytes())?;
     Ok(())
 }
@@ -332,10 +312,7 @@ fn create_field_file_plain(
             row_count = n as u32;
             null_count = n as u32;
             has_validity = true;
-            data_length = n as u64 * data_type.size_of() as u64;
-            // DATA + VALIDITY 由 OS set_len 零填充，无需显式写
-            let total = HEADER_SIZE as u64 + data_length + validity_size(n as u32) as u64;
-            f.set_len(total)?;
+            // 全 NULL 字段：仅写入 64 字节 HEADER 表示，不向磁盘写入 DATA / VALIDITY 区
         }
         FieldInit::Data(col) => {
             if col.data_type != data_type {
@@ -406,6 +383,7 @@ fn create_field_file_plain(
 enum Backing {
     Mmap(Mmap),
     MmapMut(MmapMut),
+    Empty,
 }
 
 /// compressed Field 打开时全量解压的工作表示（写路径必需；读路径暂以同一形态复用，
@@ -456,9 +434,15 @@ impl FieldHandle {
     }
 
     fn uncompressed_slices(&self) -> Result<(&[u8], Option<&[u8]>), CoreError> {
+        if let Some(work) = &self.working {
+            let data = work.values.as_slice();
+            let validity = work.validity.as_ref().map(|b| b.as_view().as_raw());
+            return Ok((data, validity));
+        }
         let bytes: &[u8] = match &self.backing {
             Backing::Mmap(m) => m,
             Backing::MmapMut(m) => m,
+            Backing::Empty => return Err(CoreError::InvalidState("backing is unmapped".into())),
         };
         let data_len = self.header.data_length as usize;
         let vlen = self.header.validity_size();
@@ -481,6 +465,7 @@ impl FieldHandle {
         let bytes: &mut [u8] = match &mut self.backing {
             Backing::MmapMut(m) => m,
             Backing::Mmap(_) => return Err(CoreError::InvalidState("not writable".into())),
+            Backing::Empty => return Err(CoreError::InvalidState("backing is unmapped".into())),
         };
         if bytes.len() < HEADER_SIZE + data_len + vlen {
             return Err(CoreError::InvalidState("field file truncated".into()));
@@ -627,6 +612,10 @@ impl FieldHandle {
         if self.is_chunked() {
             self.write_into_working(offset as usize, data)?;
         } else {
+            // Header-only 延迟展开：首次写入时将物理文件扩展至完整大小并重新 mmap
+            if self.working.is_some() {
+                self.expand_header_only_file()?;
+            }
             self.write_into_mmap(offset as usize, data)?;
         }
         // generation 每次 write 调用恰好 +1（不按段递增）；header 回写在其后，落盘即含新值
@@ -736,6 +725,25 @@ impl FieldHandle {
         Ok(())
     }
 
+    /// 对 uncompressed header-only 文件做延迟展开：扩展物理文件并重新 mmapMut。
+    fn expand_header_only_file(&mut self) -> Result<(), CoreError> {
+        let total = HEADER_SIZE as u64
+            + self.header.data_length
+            + self.header.validity_size() as u64;
+        // Windows 下必须先释放原有 mmap 句柄才能扩展文件
+        self.backing = Backing::Empty;
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(|e| map_io(&self.path, e))?;
+        file.set_len(total).map_err(|e| map_io(&self.path, e))?;
+        let mmap_mut = unsafe { MmapMut::map_mut(&file).map_err(|e| map_io(&self.path, e))? };
+        self.backing = Backing::MmapMut(mmap_mut);
+        self.working = None;
+        Ok(())
+    }
+
     /// 修改 header（不改 data）：data_type / row_count 必须与现值一致；
     /// 成功后递增 generation。uncompressed 立即落盘（mmap），compressed 随 close 收尾。
     pub fn update_field_handle(&mut self, mut header: FieldHeader) -> Result<(), CoreError> {
@@ -757,6 +765,9 @@ impl FieldHandle {
         }
         self.header = header;
         self.modified = true;
+        if self.working.is_some() && !self.is_chunked() {
+            self.expand_header_only_file()?;
+        }
         if let Backing::MmapMut(m) = &mut self.backing {
             let bytes = self.header.to_bytes();
             m[..HEADER_SIZE].copy_from_slice(&bytes);
@@ -1004,7 +1015,7 @@ impl FieldChunkReader for CastReader {
 pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreError> {
     let tmp = unique_tmp_path(path, "cast");
     let result = (|| -> Result<(), CoreError> {
-        let (source_gen, was_chunked, encoding, compression, chunk_starts) = {
+        let (source_gen, was_chunked, encoding, compression, chunk_starts, is_header_only) = {
             let handle = open_field_file(path, Mode::Read)?;
             let dt = handle.data_type();
             if dt == target_type {
@@ -1013,6 +1024,8 @@ pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreErr
             if dt == DataType::Utf8 || target_type == DataType::Utf8 {
                 return Err(CoreError::Invalid("cast involving Utf8 is not supported".into()));
             }
+            let file_len = fs::metadata(path).map_err(|e| map_io(path, e))?.len() as usize;
+            let is_header_only = file_len == HEADER_SIZE && handle.row_count() > 0;
             let chunk_starts: Vec<u64> = handle
                 .chunk_rows
                 .iter()
@@ -1028,28 +1041,39 @@ pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreErr
                 handle.header.encoding()?,
                 handle.header.compression()?,
                 chunk_starts,
+                is_header_only,
             );
-            let total = handle.row_count();
-            let reader = CastReader {
-                handle,
-                src: dt,
-                dst: target_type,
-                total,
-                offset: 0,
-                phase: 0,
-                validity_stream: Vec::new(),
-                bit_acc: 0,
-                acc_bits: 0,
-                validity_written: 0,
-            };
-            // 批次流式写出目标 Field（values → validity 三阶段顺序写；
-            // reader 拥有源 Handle，结束即释放）
-            create_field_file(
-                &tmp,
-                target_type,
-                FieldInit::Stream { reader: Box::new(reader) },
-                CreateFieldOptions::default(),
-            )?;
+            if !is_header_only {
+                let total = handle.row_count();
+                let reader = CastReader {
+                    handle,
+                    src: dt,
+                    dst: target_type,
+                    total,
+                    offset: 0,
+                    phase: 0,
+                    validity_stream: Vec::new(),
+                    bit_acc: 0,
+                    acc_bits: 0,
+                    validity_written: 0,
+                };
+                // 批次流式写出目标 Field（values → validity 三阶段顺序写；
+                // reader 拥有源 Handle，结束即释放）
+                create_field_file(
+                    &tmp,
+                    target_type,
+                    FieldInit::Stream { reader: Box::new(reader) },
+                    CreateFieldOptions::default(),
+                )?;
+            } else {
+                // Header-only：O(1) 直接创建 64 字节全 NULL 字段
+                create_field_file(
+                    &tmp,
+                    target_type,
+                    FieldInit::Length(handle.row_count()),
+                    CreateFieldOptions::default(),
+                )?;
+            }
             info
         };
 
@@ -1066,7 +1090,20 @@ pub fn cast_field_file(path: &Path, target_type: DataType) -> Result<(), CoreErr
 
         // 保持压缩状态：compressed 源按原 encoding / compression / chunk 分组重编码
         if was_chunked {
-            compress_field_file_encoded(&tmp, Some(chunk_starts), encoding, compression)?;
+            if is_header_only {
+                // Header-only：直接写回压缩标志，不落 chunk
+                let mut f = File::options().read(true).write(true).open(&tmp)?;
+                let mut hb = [0u8; HEADER_SIZE];
+                f.read_exact(&mut hb)?;
+                let mut h = FieldHeader::from_bytes(&hb)?;
+                h.compression = compression.id();
+                h.encoding = encoding.id();
+                h.set_has_validity(true);
+                f.seek(SeekFrom::Start(0))?;
+                f.write_all(&h.to_bytes())?;
+            } else {
+                compress_field_file_encoded(&tmp, Some(chunk_starts), encoding, compression)?;
+            }
         }
 
         // tmp 完整落盘后再原子替换：rename 生效时新文件内容已持久
@@ -1176,6 +1213,23 @@ fn compress_field_file_encoded(
     if handle.is_chunked() {
         return Err(CoreError::InvalidState("field is already compressed".into()));
     }
+    let file_len = fs::metadata(path).map_err(|e| map_io(path, e))?.len() as usize;
+    let is_header_only = file_len == HEADER_SIZE && handle.row_count() > 0;
+    if is_header_only {
+        // Header-only：直接写回压缩标志，不写任何 chunk
+        let mut new_header = handle.header;
+        new_header.compression = compression.id();
+        new_header.encoding = encoding.id();
+        new_header.set_has_validity(true);
+        drop(handle);
+        let tmp = tmp_path(path);
+        let mut out = File::options().write(true).create(true).truncate(true).open(&tmp)?;
+        out.write_all(&new_header.to_bytes())?;
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&tmp, path)?;
+        return Ok(());
+    }
     let rows = handle.header.row_count as usize;
     let boundaries: Vec<u64> = match offsets {
         Some(mut list) => {
@@ -1270,10 +1324,28 @@ fn stitch_chunk_bits(
 /// （单句柄双游标，两个区域各自顺序 IO）；内存 O(一个解码 chunk)。
 pub fn decompress_field_file(path: &Path) -> Result<(), CoreError> {
     let file = File::open(path).map_err(|e| map_io(path, e))?;
+    let file_len = file.metadata()?.len() as usize;
     let map = unsafe { Mmap::map(&file)? };
     let header = FieldHeader::from_bytes(&map[..HEADER_SIZE])?;
     if !header.is_chunked() {
         return Err(CoreError::InvalidState("field is not compressed".into()));
+    }
+    let is_header_only = file_len == HEADER_SIZE && header.row_count > 0;
+    if is_header_only {
+        // Header-only：直接写回解压标志（PLAIN + NONE），不写任何 DATA / VALIDITY
+        let mut new_header = header;
+        new_header.compression = Compression::None.id();
+        new_header.encoding = Encoding::Plain.id();
+        new_header.set_has_validity(true);
+        drop(map);
+        drop(file);
+        let tmp = tmp_path(path);
+        let mut out = File::options().write(true).create(true).truncate(true).open(&tmp)?;
+        out.write_all(&new_header.to_bytes())?;
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&tmp, path)?;
+        return Ok(());
     }
     let dt = header.data_type()?;
     let encoding = header.encoding()?;
@@ -1381,22 +1453,51 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
     let mut header = FieldHeader::from_bytes(&header_bytes)?;
     let file_len = file.metadata()?.len() as usize;
     drop(file);
-    // 以只读 mmap 完成 chunk 分组读取与工作表示解压
-    let map = unsafe { Mmap::map(&File::open(path)?)? };
+
+    let is_header_only = file_len == HEADER_SIZE && header.row_count > 0;
+
     let mut chunk_rows = Vec::new();
-    if header.is_chunked() {
-        let mut pos = HEADER_SIZE;
-        while pos < file_len {
-            let hdr = splayed_codec::ChunkHeader::from_bytes(&map[pos..])?;
-            pos += splayed_codec::CHUNK_HEADER_SIZE + hdr.payload_len as usize;
-            chunk_rows.push(hdr.rows);
+    let working = if is_header_only {
+        // Header-Only 全 NULL 字段（包括 uncompressed 与 compressed）：
+        // 构造全零 values 与全零 validity 的 Working 内存表示
+        let dt = header.data_type()?;
+        let rows = header.row_count as usize;
+        let size = dt.size_of();
+        let values = Buffer::zeroed_aligned(rows * size, 8);
+        let validity = Some(Bitmap::zeros(rows));
+        if header.is_chunked() {
+            // chunked：初始化默认分组
+            chunk_rows = (0..rows)
+                .step_by(CREATE_CHUNK_ROWS)
+                .map(|o| (rows - o).min(CREATE_CHUNK_ROWS) as u32)
+                .collect();
         }
-        if pos != file_len {
-            return Err(CoreError::InvalidState(
-                "chunk stream does not exactly cover file".into(),
-            ));
+        Some(Working { values, validity })
+    } else {
+        // 以只读 mmap 完成 chunk 分组读取与工作表示解压
+        let map = unsafe { Mmap::map(&File::open(path)?)? };
+        if header.is_chunked() {
+            let mut pos = HEADER_SIZE;
+            while pos < file_len {
+                let hdr = splayed_codec::ChunkHeader::from_bytes(&map[pos..])?;
+                pos += splayed_codec::CHUNK_HEADER_SIZE + hdr.payload_len as usize;
+                chunk_rows.push(hdr.rows);
+            }
+            if pos != file_len {
+                return Err(CoreError::InvalidState(
+                    "chunk stream does not exactly cover file".into(),
+                ));
+            }
         }
-    }
+        let w = if header.is_chunked() {
+            Some(FieldHandle::decode_working(&map, &header)?)
+        } else {
+            None
+        };
+        drop(map);
+        w
+    };
+
     let chunk_ends: Vec<u64> = chunk_rows
         .iter()
         .scan(0u64, |acc, &r| {
@@ -1404,17 +1505,15 @@ pub fn open_field_file(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError
             Some(*acc)
         })
         .collect();
-    let working = if header.is_chunked() {
-        Some(FieldHandle::decode_working(&map, &header)?)
-    } else {
-        None
-    };
+
     // compressed 基线：null_count 从解压位图精确重建（word 批量 popcount，O(rows/64)），
     // 后续写路径只做增量维护
     if let Some(w) = &working {
-        header.null_count = w.validity.as_ref().map(|b| b.null_count() as u32).unwrap_or(0);
+        if header.is_chunked() && !is_header_only {
+            header.null_count = w.validity.as_ref().map(|b| b.null_count() as u32).unwrap_or(0);
+        }
     }
-    drop(map);
+
     if mode == Mode::Read {
         let file = File::open(path)?;
         Ok(FieldHandle {
