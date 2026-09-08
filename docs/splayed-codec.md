@@ -1,4 +1,4 @@
-# splayed-codec：API 设计（V2.0 Draft）
+# splayed-codec：编解码与压缩设计
 
 `splayed-codec` 提供 Encoding（`PLAIN / DELTA / RLE / BITPACK`）与 Compression（`NONE / ZSTD / LZ4`）的内存编解码原语。Encoding / Compression 的 ID 枚举见 [splayed-format](splayed-format.md) §5 / §6；内存视图类型（BufferView / BitmapView）定义见 splayed-format §3。本页定义编码语义、compressed FIELD 的物理表示与 public API。
 

@@ -10,10 +10,10 @@
 
 | 文档 | 内容 |
 | --- | --- |
-| [公共语义](core/index.md) | 命名规则、API 分层、RowRange / ScanRequest / Predicate / Handle 对象、逻辑行空间 |
-| [Field API](core/field.md) | 文件生命周期（create/open/rename/cast/compress/decompress）+ Handle 读写扫描（read/write/update/scan/close）+ 内部实现流程 |
-| [META API](core/meta.md) | MetaBuilder（run-length 构建）、read_index_handle、scan_index_handle（谓词提取）、locate_index_handle（双指针定位）+ 内部实现流程 |
-| [Dataset API](core/dataset.md) | 生命周期、读写、扫描、结构操作（create/delete/rename/cast/compress field）、统计 + 内部实现流程 |
+| [公共语义](core/index.md) | 命名规则、四层架构、RowRange / ScanRequest / Predicate / Handle 对象、逻辑行空间 |
+| [Field API](core/field.md) | 骨架与初始化（create_field/init_field）、Handle 操作（read/write/update/scan/close/drop）、物理转换（cast/compress/decompress）+ 内部实现流程 |
+| [Index (META) API](core/meta.md) | 索引骨架与初始化（create_index/init_index）、IndexHandle（read/scan/locate/update/close/drop）+ 内部实现流程 |
+| [Dataset API](core/dataset.md) | 数据集骨架与初始化（create_dataset/init_dataset）、多级嵌套目录字段（Dot 语法）、缺列补 NULL 容错、写自愈、全量更新 + 内部实现流程 |
 
 ## 核心语义摘要
 
@@ -26,11 +26,13 @@ row(sym_i, time_index) = row_start(i) + (time_index - time_start(i))
 
 三层 API 的 offset / length 一一对应，无需换算；sym 区间内缺失时间 = NULL 逻辑行。
 
-**File / Handle 两层**：
+**四层对称架构**：
 
 ```
-*_file    直接操作物理文件（create / open / delete / rename / cast / compress）
-*_handle  操作已打开的 Handle（read / write / scan / update / close）
+Table    create_table / init_table / open_table / close_table / drop_table / write_table / read_table / scan_table
+Dataset  create_dataset / init_dataset / open_dataset / close_dataset / drop_dataset / write_dataset / read_dataset / scan_dataset
+Index    create_index / init_index / open_index / close_index / drop_index / read_index / scan_index / locate_index
+Field    create_field / init_field / open_field / close_field / drop_field / read_field / write_field / scan_field / cast / compress
 ```
 
 **Scanner 契约**：
@@ -85,7 +87,7 @@ close()  -> Result<()>           // 任何时刻可安全调用
 - `cast_field_file`：批次流式转换（256K 行/批，uncompressed 源全程 O(一个批次) 内存，validity 位流 O(total/8)）；tmp `sync_all` 后原子替换 + 唯一临时文件名；保持原压缩状态与 generation。
 - `compress_field_file` / `decompress_field_file`：chunk 流式——compress 逐 chunk 零拷贝切片编码直写 tmp（header 编码前即确定）；decompress 直接解析 chunk 位置逐 chunk 解码（不经 open 全量解压），DATA / VALIDITY 双游标顺序写，validity 位跨 chunk 拼接；内存 O(单个 chunk)；tmp `sync_all` 后原子替换。
 - `read_dataset` / `write_dataset` / `scan_dataset` 统一三阶段并发模型（主线程校验 + `ensure_field` 串行 → Field 级并行只做纯 I/O → 主线程收尾；并行度 `max_parallelism` 由最上层控制，`std::thread::scope` 分桶，不自建线程池）：write_dataset 按 `values_mut` 收集互不相交 `&mut FieldHandle`（列名唯一校验）分桶并行写，总字节 < 1 MiB 走串行快路径；scan_dataset 各 Field 以相同候选范围独立并行扫描后主线程顺序求交 + 相邻合并（与逐字段串行收窄等价：谓词逐行性质 + `∩` 交换/结合），候选 < 64K 行走串行，`limit` 不下推子扫描（截断后求交会漏行）；read_dataset **保持单线程**——读路径是 O(1) 零拷贝切片、不触碰数据页，并行调度开销为负收益，并行插入点在 chunk 惰性解码落地后。
-- Table 层 Field 结构操作统一执行器 `structural_for_each`（主线程严格前置校验 → `values_mut` 互不相交 `&mut DatasetHandle` 分桶并行 → 返回首个错误；并行只跨 Partition、不嵌套 Field 级并发）；compress / decompress 增加物理状态前置校验（`dataset_field_is_chunked` 只读 64B header，不经打开——compressed 打开会全量解压）；cast 增加跨分区类型一致性校验；create 的全 NULL 字段经 `FieldInit::Length` 的 `set_len` 稀疏零填充，成本 O(header)/分区。
+- Table 层 Field 结构操作统一执行器 `structural_for_each`（主线程严格前置校验 → `values_mut` 互不相交 `&mut DatasetHandle` 分桶并行 → 返回首个错误；并行只跨 Partition、不嵌套 Field 级并发）；compress / decompress 增加物理状态前置校验（`dataset_field_is_chunked` 只读 64B header，不经打开——compressed 打开会全量解压）；cast 增加跨分区类型一致性校验；create 的全 NULL 字段经 `FieldInit::Length` 的 Header-Only（仅 64 字节 Header，不落磁盘数据页，按需首次写扩展），成本 O(header)/分区。
 - Table Reader（read_table）双路径：`None` = 原始路径（一 range 一批，零聚合）；
   `Some(n)` = 聚合路径（range 级截断 + pending 剩余，恰好 n 行不超发——修正旧实现
   「拉满为止」的批次超发；多段 ColumnView 拼接保持零拷贝）；`Some(0)` 显式拒绝。
@@ -104,7 +106,7 @@ close()  -> Result<()>           // 任何时刻可安全调用
 - **创建即压缩**（create_field_file + CreateFieldOptions{compression, chunk_offsets}）：
   Data → 单遍 chunked 直接创建（逐 chunk encode_chunk 顺序直写，内存 O(单 chunk)，
   无 tmp / 无二次读；与 compress_field_file 输出字节级一致——测试锁定）；Length →
-  chunked 全 NULL（后续 write 生命周期保持压缩）；Stream → 组合路径（两阶段 reader
+  Header-Only 全 NULL 字段（仅 64 字节 Header，后续 write 生命周期保持压缩）；Stream → 组合路径（两阶段 reader
   协议使单遍编码需物化全列：流式写未压缩 + 原地压缩）。分层透传：CreateDatasetOptions
   {compression, chunk_syms}（sym 对齐边界由输入 sym run 推导，全 Field 复用）、
   TableOptions{compression, chunk_syms}、create_table_partition 按分区覆盖（冷热分层）、

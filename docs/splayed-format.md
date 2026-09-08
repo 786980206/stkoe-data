@@ -193,6 +193,7 @@ META 创建后 layout 固定、进入只读状态；不提供 update / compress 
 - `row_count` 在创建时确定，写路径不改变。
 - VALIDITY 区大小 = `ceil(row_count / 8)`，`has_validity = 0` 时不存在。
 - `null_count` 为真实 NULL 计数，创建（带数据）与每次成功写入后维护。
+- **Header-Only 全 NULL 字段**：当物理文件长度恰为 64 字节（`file_len == 64`）且 `row_count > 0`（`null_count == row_count`）时，该文件为 Header-Only 全 NULL 字段文件。物理磁盘不写入 DATA 与 VALIDITY 区，读取时返回全 0 位图与全零 values，首次覆盖写入时按需就地扩展物理文件。
 
 ## 9. Generation 与原子提交
 

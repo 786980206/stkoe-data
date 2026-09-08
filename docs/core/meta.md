@@ -1,332 +1,302 @@
-# splayed-core / META API
+# splayed-core / Index (META) API
 
-## 6. META API
+## 6. Index (META) API
 
 ### 6.0 总览
 
-| 接口 | 职责 | 层 |
+Index 层负责管理 `.meta` 文件，维护二维时序坐标容量网格：全局有序唯一的 `TIME AXIS`、标的字典 `SYM DICT` 以及 `SYM INDEX` 记录表。V2.1 将其全面统一为四层对称体系中的第三层——**Index 索引层**，提供首级公开对象 `IndexHandle`（与 `MetaHandle` 兼容并存）。
+
+| 接口 | 职责 | 层次 |
 | --- | --- | --- |
-| `MetaBuilder::build` | 从 (sym, time) 两列逻辑数据构建 META 文件字节 | File |
-| `create_meta_file` | 创建 `.meta`（build + 原子写出） | File |
-| `delete_meta_file` | 删除 `.meta` 物理文件 | File |
-| `MetaHandle::open` | 打开 `.meta`（只读 mmap），返回 `MetaHandle` | File |
-| `read_meta_handle` | 读取结构化元信息 `MetaInfo` | Handle |
-| `read_index_handle` | 按逻辑行读取 (sym, time) 两列 view | Handle |
-| `scan_index_handle` | 条件扫描 → `IndexScanner`（FIELD row ranges） | Handle |
-| `locate_index_handle` | (sym, time) 联合键批量定位 | Handle |
-| `close_meta_handle` | 关闭 Handle（`MetaHandle::close`） | Handle |
+| `create_index` | 创建空索引骨架文件（仅写 64B Header，`row_count = 0`） | File |
+| `init_index` | 连带 (sym, time) 数据初始化构建完整索引网格 | File |
+| `open_index` | 打开 `.meta` 文件，返回 `IndexHandle` | File |
+| `close_index` | 关闭索引句柄，释放 mmap 映射 | File / Handle |
+| `drop_index` | 销毁并物理删除 `.meta` 索引文件 | File / Handle |
+| `IndexHandle::read_index_schema` | 返回固定主键 Schema `[sym: Utf8, time: <time_type>]` | Handle |
+| `IndexHandle::read_index` | 零拷贝读取 (sym, time) 两列构成的 `DataView`（sym 零物化） | Handle |
+| `IndexHandle::scan_index` | 谓词二分快速扫描，产出命中行区间 `RowRange` | Handle |
+| `IndexHandle::locate_index` | (sym, time) 联合键双指针单调批量定位 | Handle |
+| `IndexHandle::update_index` | 全量原子替换主索引网格并刷新映射 | Handle |
 
-布局：`HEADER 64 | TIME AXIS | SYM DICT INDEX (n+1)×u64 | SYM STRING DATA | SYM INDEX n×12`。
+---
 
-### 6.1 MetaBuilder::build
+### 6.1 create_index
 
-**接口定义**：
+#### 函数签名
 ```rust
-pub struct MetaBuilder;
-impl MetaBuilder {
-    pub fn build(data: &DataView<'_>) -> Result<Vec<u8>, CoreError>
-}
+pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, CoreError>;
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `data` | `&DataView<'_>` | 输入 | 必须包含 `sym`（Utf8 字典视图）与 `time`（定宽整数列），按 `(sym ASC, time ASC)` 排序 |
-| 返回 | `Result<Vec<u8>, CoreError>` | 输出 | 完整 META 文件字节（header + TIME AXIS + DICT + STRING DATA + SYM INDEX） |
+| `path` | `&Path` | 输入 | 目标 `.meta` 文件路径；已存在则报错 |
+| `time_type` | `TimeType` | 输入 | 时间轴的整数或时间戳类型 |
+| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 初始化的空索引句柄（物理大小恰为 64B） |
 
-**内部实现**（单遍扫描 + 轴二分定位，无 HashMap）：
+#### 内部实现流程
 ```
-批量 cast  →  sym keys 整段 cast 为 &[u32]、time 列整段 cast 后归一为 &[u64]（零逐行函数调用）
-单遍扫描   →  收集全部 time 值 + sym run 边界（row_start / time_first / time_last / rows）
-              → 仅 run 切换时解析一次 string_at（字典解码，O(sym 段数) 字符串分配）
-TIME AXIS  →  sort_unstable + dedup
-SYM INDEX  →  每 run 二分定位 time_first / time_last 的轴下标（O(2R·log T)，R=run 数、T=轴长）
-              → 连续子区间校验：end ≥ start 且 (end − start + 1) == run 行数
-                （未按 (sym ASC, time ASC) 排序 / sym 内 time 重复或跳空 → NonContiguousTime）
-              → time_count = span = run 行数；row_start 累计 span
-serialize  →  header(64B) + TIME AXIS + DICT OFFSETS(n+1)×u64
-              + STRING DATA + SYM INDEX(n×12B)
+1. 校验 path 存在性（已存在 → CoreError::AlreadyExists）；
+2. 构建空 MetaHeader：
+   magic: META_MAGIC, version: FORMAT_VERSION, time_type: time_type.id(),
+   time_count: 0, sym_count: 0, row_count: 0, generation: 0,
+   sym_dict_offset: 64, sym_index_offset: 64, file_size: 64；
+3. File::create 并 write_all 写入 64 字节 Header；
+4. 挂载只读 mmap，返回 IndexHandle，耗时 < 1μs，0 数据 I/O。
 ```
 
-**核心原则**：每个 symbol 的 time 必须严格等于 TIME AXIS 的一个连续子区间，因此 SYM INDEX 只需保存
-`row_start + time_start + time_count`，不保存任何 symbol 内的 time 信息。连续性校验使 `time_count`
-（轴跨度）与 run 实际行数强一致，容量网格 `row_start = Σ 前序 time_count` 与数据行严格对齐；
-轴定位从 HashMap 换为二分（`2R·log T` 次比较，无哈希表构建与随机访问），输入规模越大收益越明显。
+#### 其他说明
+- 供 `create_dataset` / `create_table` 纯元数据骨架创建时使用。
 
-**说明**：
-- 违反连续子区间原则的输入（sym 内 time 跳空 / 重复 / 未排序）在构建期以 `NonContiguousTime` 拒绝，
-  不会生成网格与数据错位的 META。
-- 不要求不同 SYM 具有相同 TIME 集合；每个 SYM 可以有自己的 TIME 序列（只要各自是轴的连续子区间）。
-- `time_type` 从 time 列类型推断（Date32 / TimestampUs）；缺失时间点由对应 Field 的 NULL 表示。
-- 构建结果不可变：layout 固定、进入只读状态。
+---
 
-### 6.2 create_meta_file
+### 6.2 init_index
 
-**接口定义**：
+#### 函数签名
 ```rust
-pub fn create_meta_file(path: &Path, data: &DataView<'_>) -> Result<(), CoreError>
+pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreError>;
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `path` | `&Path` | 输入 | `.meta` 文件路径 |
-| `data` | `&DataView<'_>` | 输入 | sym / time 两列逻辑数据（要求同 `MetaBuilder::build`） |
-| 返回 | `Result<(), CoreError>` | 输出 | Ok = `.meta` 创建 / 替换完成 |
+| `path` | `&Path` | 输入 | 目标 `.meta` 文件路径 |
+| `data` | `&DataView<'_>` | 输入 | 必须包含按 `(sym ASC, time ASC)` 排序的 sym 与 time 两列 |
+| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 构建完成并已打开的 `IndexHandle` |
 
-**内部实现**：
+#### 内部实现流程
 ```
-MetaBuilder::build(data) → write_meta_atomic(path, bytes)
-write_meta_atomic: 写 path.tmp（create + truncate）→ write_all(bytes) → sync_all（tmp 完整落盘）
-→ fs::rename(tmp, path) 原子替换；失败清理 tmp，旧 META 保持不变
+1. 批量类型转换：sym 字典 keys 整段转换为 &[u32]，time 列整段转换为 &[u64]（无逐行调用）；
+2. 单遍扫描：收集全部 time 值并提取 sym run 边界（row_start / time_first / time_last / rows）；
+3. TIME AXIS 构建：sort_unstable + dedup，生成全局时间轴；
+4. SYM INDEX 构建：二分定位 time_first / time_last 在全局轴上的下标（O(2R log T)）；
+5. 连续子区间硬约束校验：end >= start 且 (end - start + 1) == run.rows（违规报 NonContiguousTime）；
+6. 顺序拼接序列化为单块 Buffer：HEADER(64B) + TIME AXIS + DICT OFFSETS + STRING DATA + SYM INDEX；
+7. 原子提交：写入临时文件 <path>.tmp → sync_all → rename 原文件；
+8. 重新以 mmap 打开，返回 IndexHandle。
 ```
 
-**说明**：
-- 原子提交规则见 splayed-format §9：写临时文件 → fsync → 原子 rename。
+#### 其他说明
+- 极速构建：无 HashMap，无逐行对象分配；网格与数据行严格数学对齐。
 
-### 6.3 delete_meta_file
+---
 
-**接口定义**：
+### 6.3 open_index
+
+#### 函数签名
 ```rust
-pub fn delete_meta_file(path: &Path) -> Result<(), CoreError>
+pub fn open_index(path: &Path) -> Result<IndexHandle, CoreError>;
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `path` | `&Path` | 输入 | `.meta` 文件路径 |
-| 返回 | `Result<(), CoreError>` | 输出 | Ok = 文件已删除 |
+| `path` | `&Path` | 输入 | 已存在的 `.meta` 文件路径 |
+| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 索引生命周期句柄 |
 
-**说明**：
-- 直接删除物理文件；调用方保证没有打开的 MetaHandle。
-
-### 6.4 MetaHandle::open
-
-**接口定义**：
-```rust
-impl MetaHandle {
-    pub fn open(path: &Path) -> Result<Self, CoreError>
-}
+#### 内部实现流程
+```
+1. File::open 打开物理文件并挂载 unsafe { Mmap::map(&file) }；
+2. 解析前 64 字节 MetaHeader 并验证 magic、version 及 file_size 一致性；
+3. 返回封装了 mmap 与 Header 的 IndexHandle。
 ```
 
-**参数**：
+#### 其他说明
+- 零拷贝挂载，打开耗时仅几微秒。
 
+---
+
+### 6.4 close_index
+
+#### 函数签名
+```rust
+pub fn close_index(handle: IndexHandle) -> Result<(), CoreError>;
+```
+
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `path` | `&Path` | 输入 | `.meta` 文件路径（必须已存在） |
-| 返回 | `Result<MetaHandle, CoreError>` | 输出 | 只读 Handle |
+| `handle` | `IndexHandle` | 输入 | 待释放的索引句柄（消费所有权） |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 释放完成 |
 
-**内部实现**：
+#### 内部实现流程
 ```
-File::open → Mmap::map（只读）→ MetaHeader::from_bytes + validate
-（chunk 信息按需经 SYM INDEX / TIME AXIS 视图访问，无预物化）
+消费 IndexHandle，释放内部持有的 Mmap 映射与文件描述符。
 ```
 
-**说明**：
-- META 无 write mode：META immutable，内容或 layout 变化时由 `MetaBuilder` 构建新文件原子替换。
-- open 后所有 META / Index 操作经 Handle 执行；无逐字段打开开销。
+#### 其他说明
+- 显式生命周期收尾，在重命名或删除前必须调用。
 
-### 6.5 read_meta_handle（与属性访问器）
+---
 
-**接口定义**：
+### 6.5 drop_index
+
+#### 函数签名
 ```rust
-pub struct MetaInfo {
-    pub version: u16,
-    pub time_type: TimeType,
-    pub generation: u64,
-    pub time_count: u32,
-    pub sym_count: u32,
-    pub row_count: u32,
-}
-impl MetaHandle {
-    pub fn read_meta_handle(&self) -> MetaInfo
-    pub fn header(&self) -> &MetaHeader
-    pub fn time_type(&self) -> TimeType
-    pub fn sym_record(&self, sym_id: u32) -> Result<SymIndexRecord, CoreError>
-    pub fn sym_str(&self, sym_id: u32) -> Result<&str, CoreError>
-    pub fn sym_id_of(&self, name: &str) -> Result<Option<u32>, CoreError>
-    pub fn time_at(&self, index: u32) -> Result<u64, CoreError>
-    pub fn locate_row(&self, row: u64) -> Result<(u32, u32), CoreError>
-    pub fn axis_index_of(&self, value: u64) -> Option<u32>
-}
+pub fn drop_index(handle: IndexHandle) -> Result<(), CoreError>;
 ```
 
-**参数与返回**：
-
-| 方法 | 返回类型 | 说明 |
-| --- | --- | --- |
-| `read_meta_handle()` | `MetaInfo`（owned） | 结构化元信息：version / time_type / generation / time_count / sym_count / row_count |
-| `header()` | `&MetaHeader` | 原始 header 视图 |
-| `time_type()` | `TimeType` | 时间类型（Date32 / TimestampUs） |
-| `sym_record(sym_id)` | `Result<SymIndexRecord>` | 第 `sym_id` 个 SYM INDEX record（time_start / time_count / row_start） |
-| `sym_str(sym_id)` | `Result<&str>` | 字典中第 `sym_id` 个符号字符串（零拷贝，指向 mmap） |
-| `sym_id_of(name)` | `Result<Option<u32>>` | 符号 → 字典 id（字典二分 O(log S)，按首现序 = 排序序；不存在 → `None`） |
-| `time_at(index)` | `Result<u64>` | TIME AXIS 第 `index` 个时间值（零拷贝读取） |
-| `locate_row(row)` | `Result<(u32, u32)>` | 逻辑行 → `(sym_id, 轴下标)`（SYM INDEX 二分；`row ≥ row_count` → Error） |
-| `axis_index_of(value)` | `Option<u32>` | 时间值 → TIME AXIS 下标（精确匹配；不存在 → `None`） |
-
-**说明**：
-- 只读取结构化信息与单点定位；不做批量 Index 扫描；调用方无需了解物理布局。
-- `sym_id_of` 的字典二分要求字典有序——META 构建按首现序写入字典，输入有序保证首现序 = 排序序。
-
-### 6.6 read_index_handle
-
-**接口定义**：
-```rust
-impl MetaHandle {
-    pub fn read_index_handle(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError>
-}
-```
-
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `&self` | `&MetaHandle` | 输入 | 只读 Handle |
-| `offset` | `u64` | 输入 | Index 逻辑行空间（容量网格）中的起始行 |
-| `length` | `u64` | 输入 | 读取行数；`offset + length ≤ row_count`；`length = 0` 返回空 view |
-| 返回 | `Result<DataView<'_>, CoreError>` | 输出 | 该逻辑行段的 (sym, time) 两列 view（零拷贝） |
+| `handle` | `IndexHandle` | 输入 | 待删除的索引句柄 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 物理文件已被删除 |
 
-**内部实现**：
+#### 内部实现流程
 ```
-1. 二分 SYM INDEX（row_start 单调递增）→ 找到起始 sym_id
-2. 从 sym_id 起逐 sym 遍历：
-     每段重叠区间 [max(offset,row_start), min(end,row_end))
-     → sym: ColumnSegment::new_repeat_dict(dict_offsets, dict_strings, sym_id, n)
-       （零存储——不物化 keys，O(sym_count) 而非 O(length)）
-     → time: TIME AXIS 直接切片（零拷贝多段）
-3. 组装 DataView { schema: [sym Utf8, time]，columns: [RepeatDict segments, time segments] }
+1. 记录文件路径 path；
+2. 显式释放 mmap 映射与文件句柄；
+3. 调用 fs::remove_file(path) 彻底删除物理文件。
 ```
-- sym 列零物化：RepeatDict 段只记录 (dict_offsets, dict_strings, dict_index)，消费方按需解析
-- time 列零拷贝：直接引用 mmap 的 TIME AXIS 区域
-- 无 scratch arena：不再需要 keys 物化缓冲
 
-**说明**：
-- 返回该逻辑行段的 `(sym, time)` 两列 view：sym 以字典视图返回（指向 SYM DICT / STRING DATA），time 直接指向 TIME AXIS——两者零拷贝。
-- 物理布局（TIME AXIS / DICT / INDEX 交错）由 core 内部组装，上层只见逻辑两列。
-- view 生命周期不超过 Handle。
+#### 其他说明
+- 解除 mmap 后执行 unlink，避免 Windows 下句柄占用报错。
 
-### 6.7 scan_index_handle
+---
 
-**接口定义**：
+### 6.6 IndexHandle::read_index_schema
+
+#### 函数签名
 ```rust
-impl MetaHandle {
-    pub fn scan_index_handle(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError>
-}
-impl IndexScanner {
-    pub fn next(&mut self) -> Result<Option<RowRange>, CoreError>
-    pub fn close(self) -> Result<(), CoreError>
+impl IndexHandle {
+    pub fn read_index_schema(&self) -> Schema;
 }
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `&self` | `&MetaHandle` | 输入 | 只读 Handle |
-| `request.ranges` | `&[RowRange]` | 输入 | 上游候选范围（空 = 不限制），与候选求交 |
-| `request.predicate` | `Option<Predicate>` | 输入 | 作用于 sym / time 的条件（如 `sym = "AAPL" AND time >= t1 AND time < t2`） |
-| `request.limit` | `Option<u64>` | 输入 | 达到后提前结束 |
-| 返回 scanner | `Result<IndexScanner, CoreError>` | 输出 | 定位器；`next()` 每次返回一个 FIELD row range（逻辑 = 物理），结束返回 `None` |
+| `&self` | `&IndexHandle` | 输入 | 索引句柄 |
+| 返回 | `Schema` | 输出 | 包含 `sym`（Utf8）与 `time`（TimeType）两列的 Schema |
 
-**内部实现**：
+#### 内部实现流程
 ```
-1. compile_predicate(request.predicate)  →  (sym_ids, time_lo, time_hi)
-     sym 条件 → SymFilter::All | Ids(Vec<u32>)
-       And → 各子过滤交集；Or → 并集；Not → All 回退
-       sym = "X" → sym_id_of 二分 → Ids([id])；不存在 → Ids([])
-     time 条件 → 轴 index 窗口 [lo, hi)
-       And → 各子条件窗口收窄；Or/Not → 全轴回退
-       time >= t1 → axis_lower_bound(t1)（二分）
-       time < t2  → axis_lower_bound(t2)
-2. 遍历候选 sym（Some(ids) 逐 id / None 全轴）→ 与 time 窗口求交 → RowRange
-     （limit 达到后提前结束）
-3. merge_ranges 合并 → 与 request.ranges 非空时双指针求交（O(a + b)）
-     → IndexScanner { ranges, pos, limit }
-```
-- 无法静态求值的谓词（嵌套 NOT 等）回退 All → 行级过滤由上层兜底
-
-**说明**：
-- 输出满足条件的 FIELD row ranges（逻辑 = 物理），可直接交给 `read_field_handle`，或作为 `scan_field_handle` 的 `ranges` 输入做多字段 predicate pushdown。
-
-典型执行链：
-
-```
-SYM/TIME predicate → scan_index_handle → RowRanges
-    → scan_field_handle (predicate A) → 更小 ranges
-    → scan_field_handle (predicate B) → final ranges
-    → read_field_handle / read_dataset
+直接返回基于 self.header.time_type() 构成的双字段 Schema 结构。
 ```
 
-META / Field scan 各自只做单层过滤，不决定多 Field 谓词的执行顺序；
-该顺序由上层固化——Dataset 层 `scan_dataset` 为「META 先行 → 字段按名称序」（见 dataset.md §7.12）。
+#### 其他说明
+- 纯内存构建，无 I/O。
 
-### 6.8 locate_index_handle
+---
 
-**接口定义**：
+### 6.7 IndexHandle::read_index
+
+#### 函数签名
 ```rust
-impl MetaHandle {
-    pub fn locate_index_handle(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>
+impl IndexHandle {
+    pub fn read_index(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError>;
 }
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `&self` | `&MetaHandle` | 输入 | 只读 Handle |
-| `pairs` | `&[(String, i64)]` | 输入 | `(sym, time)` 联合键序列；必须按 `(sym ASC, time ASC)` 排序且唯一 |
-| 返回 | `Result<Vec<RowRange>, CoreError>` | 输出 | 合并后的连续 RowRanges；`sum(length) == pairs.len()` 是定位成功的充要条件 |
+| `&self` | `&IndexHandle` | 输入 | 索引句柄 |
+| `offset` | `u64` | 输入 | 起始逻辑行（容量网格偏移） |
+| `length` | `u64` | 输入 | 读取行数（0 返回空视图） |
+| 返回 | `Result<DataView<'_>, CoreError>` | 输出 | 包含 sym 与 time 两列的零拷贝 `DataView` |
 
-**内部实现**（双指针单调推进，O(S + N)）：
+#### 内部实现流程
 ```
-sym_cursor（SYM INDEX 游标）──→ 单调前进，O(S) 总计
-time_cursor（TIME AXIS 游标）──→ sym 切换时重置到 time_start，run 内单调前进
-        │
-        ↓
-row = row_start + (time_cursor - time_start)
-        │
-        ↓
-边走边合并连续行（last.end() == row → length += 1）
-```
-- 排序校验内联（每行与前行比较，无额外遍历）
-- sym 不存在 / time 不在区间内 / time 不在轴上 → Error
-- 总量校验 sum(length) == input.len()
-
-**说明**：
-- META 利用输入有序性 × SYM INDEX / TIME AXIS 有序性做双指针扫描，避免逐行查找。
-- 返回与输入分段对应的 `RowRange[]`：每个 RowRange 对应一段连续输入与 Dataset 中一段连续逻辑行。
-- 供 `write_table` 等批量「按 key 定位已有行」的场景；不读取 Field 数据。
-
-与 `scan_index_handle` 的区别：
-
-```
-scan_index_handle    条件查询 → RowRanges
-locate_index_handle  (sym, time) 联合键 → RowRanges
+1. 边界校验：offset + length <= row_count；
+2. 二分 SYM INDEX 表（row_start 单调递增），找到第一个重叠的 sym_id；
+3. 顺序遍历重叠的 sym 区间：
+   - 每段 sym 列：构造 ColumnSegment::new_repeat_dict(...)
+     （零内存分配、零存储物化，仅记录 dict_index 与行数，O(1) 内存）；
+   - 每段 time 列：直接从 mmap 的 TIME AXIS 区域按字节切片（零拷贝）；
+4. 组装为包含 sym 和 time 两个 ColumnView 的 DataView 并返回。
 ```
 
-### 6.9 close_meta_handle
+#### 其他说明
+- 绝对零拷贝：sym 字典 keys 不逐行展开，time 轴零内存分配。
 
-**接口定义**：
+---
+
+### 6.8 IndexHandle::scan_index
+
+#### 函数签名
 ```rust
-impl MetaHandle {
-    pub fn close(self) -> Result<(), CoreError>
+impl IndexHandle {
+    pub fn scan_index(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError>;
 }
 ```
 
-**参数**：
-
+#### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `self` | `MetaHandle` | 输入 | 按值消费 Handle |
-| 返回 | `Result<(), CoreError>` | 输出 | Ok = 资源释放完成 |
+| `&self` | `&IndexHandle` | 输入 | 索引句柄 |
+| `request` | `&ScanRequest` | 输入 | 包含 ranges、predicate 与 limit 的请求 |
+| 返回 | `Result<IndexScanner, CoreError>` | 输出 | 索引扫描器，迭代返回物理 RowRange |
 
-**说明**：
-- close 后 Handle 不可再用；释放 fd / mmap 等资源；META 无任何写回。
+#### 内部实现流程
+```
+1. 编译谓词：将针对 sym 和 time 的条件表达式编译为 (sym_ids, time_lo, time_hi) 窗口；
+2. 线性扫描 SYM INDEX 表（通常仅几千行标的）：
+   - 根据 sym_id 过滤目标标的；
+   - 将 time 窗口二分映射为局部行偏移，直接数学计算命中区间 RowRange；
+3. 将计算得到的 RowRange 与 request.ranges 做双指针求交；
+4. 封装为 IndexScanner 返回。
+```
 
-### 6.10 META 更新策略
+#### 其他说明
+- 极速定位：完全无需扫描任何数据列文件，纯元数据二分在微秒级完成全表行区间裁剪。
 
-META immutable，无 `update_meta()`。内容或 layout 变化（新增 sym、扩大 time 范围、布局重排）时由 `MetaBuilder` 构建新文件：写临时文件 → 原子 rename 替换旧 `.meta`；替换原子完成，不出现 META 短暂不存在的状态。
+---
+
+### 6.9 IndexHandle::locate_index
+
+#### 函数签名
+```rust
+impl IndexHandle {
+    pub fn locate_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>;
+}
+```
+
+#### 参数与返回
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&self` | `&IndexHandle` | 输入 | 索引句柄 |
+| `pairs` | `&[(String, i64)]` | 输入 | 输入的 (sym, time) 键序列，必须按 (sym ASC, time ASC) 排序 |
+| 返回 | `Result<Vec<RowRange>, CoreError>` | 输出 | 合并后的内部逻辑行物理区间列表 |
+
+#### 内部实现流程
+```
+1. 双指针单调推进（sym_cursor 与 time_cursor），结合有序性避免逐行哈希查找；
+2. 根据 sym 记录二分时间轴，直接计算网格行号 row = row_start + (time_cursor - time_start)；
+3. 边推进边连续合并（last.end() == row 则 length += 1）；
+4. 校验总长度 sum(length) == pairs.len()。
+```
+
+#### 其他说明
+- 为 `write_table` 与 `write_dataset` 提供高效定位基础设施。
+
+---
+
+### 6.10 IndexHandle::update_index
+
+#### 函数签名
+```rust
+impl IndexHandle {
+    pub fn update_index(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
+}
+```
+
+#### 参数与返回
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `&mut self` | `&mut IndexHandle` | 输入 | 索引句柄 |
+| `data` | `&DataView<'_>` | 输入 | 替换后的全新 (sym, time) 完整数据视图 |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 主索引全量更新替换完成 |
+
+#### 内部实现流程
+```
+1. 基于新 data 调用 MetaBuilder::build 构建新索引的完整字节流；
+2. 写入临时文件 <path>.update.<pid>.tmp 并 sync_all；
+3. 显式释放原 Handle 的 mmap 映射；
+4. fs::rename 原子替换原有 .meta 文件；
+5. 重新建立 mmap 映射并更新 Handle 内部 header 与状态。
+```
+
+#### 其他说明
+- 崩溃安全，具备强原子性，无中间损坏状态。
