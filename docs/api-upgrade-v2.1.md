@@ -35,7 +35,7 @@
 
 | 业务分类 | Table 表级 (`splayed-table`) | Dataset 分区级 (`splayed-core`) | Index 网格级 (`splayed-core`) | Field 字段级 (`splayed-core`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **创建骨架** | `create_table(path, schema, partition_scheme, options)` | `create_dataset(path, schema)` | `create_index(path, time_type)` | `create_field(path, field_type)` |
+| **创建骨架** | `create_table(path, schema, partition_scheme, initial_partition, options)` | `create_dataset(path, schema)` | `create_index(path, time_type)` | `create_field(path, field_type)` |
 | **初始化数据**| `init_table(path, partition_scheme, dataview, options)` | `init_dataset(path, dataview, options)` | `init_index(path, dataview)` | `init_field(path, columnview, options)` |
 | **打开句柄** | `open_table(path, mode, options)` | `open_dataset(path, mode)` | `open_index(path)` | `open_field(path, mode)` |
 | **关闭句柄** | `close_table(handle)` | `close_dataset(handle)` | `close_index(handle)` | `close_field(handle)` |
