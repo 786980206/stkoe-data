@@ -262,7 +262,11 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
                     DictionaryArray::try_new(dict_keys, Arc::new(values_arr))?,
                 ))
             } else {
-                let rows = values.len() / 4;
+                let rows = if let Some(v) = &validity {
+                    v.len()
+                } else {
+                    values.len() / 4
+                };
                 let dict_keys = Int32Array::new(vec![0i32; rows].into(), validity);
                 let values_arr = StringArray::from(vec![""]);
                 Ok(Arc::new(
@@ -451,7 +455,7 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
 
     // 优化路径 2：定宽数值/时间多段列（例如 time 轴切片多段）
     // 单次分配连续缓冲区 + 批量 memcpy，避免生成数千个小 Array 再 concat
-    if view.data_type() != DataType::Utf8 {
+    if view.data_type() != DataType::Utf8 && view.data_type() != DataType::Bool {
         let total_rows = view.length();
         let elem_size = view.data_type().size_of();
         let mut values_bytes: Vec<u8> = Vec::with_capacity(total_rows * elem_size);
