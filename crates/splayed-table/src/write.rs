@@ -221,11 +221,7 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
 
     // ③ 写入：单分区 / 并行度 1 → 串行（Field 级并行拿满预算）；
     //    否则分区级并行，Field 级预算切分（P_field = max(1, max_parallelism / P_part)）
-    let max_par = table
-        .options
-        .max_parallelism
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-        .max(1);
+    let max_par = table.max_parallelism();
     let p_part = max_par.min(plan.len());
     if p_part <= 1 {
         for pw in &plan {

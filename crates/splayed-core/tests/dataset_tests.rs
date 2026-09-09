@@ -503,7 +503,7 @@ fn write_dataset_parallel_large_matches_expected() {
     let root = dir.join("ds");
     create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
         .unwrap();
-    let mut ds = open_dataset(&root, Mode::Write).unwrap();
+    let ds = open_dataset(&root, Mode::Write).unwrap();
     ds.set_max_parallelism(4); // 强制走并行分支
 
     // 全量覆盖：price 翻负、volume 全 42（沿用原 validity 位型，NULL 位置不变）
@@ -583,7 +583,7 @@ fn scan_dataset_parallel_multi_field_matches_brute_force() {
     let root = dir.join("ds");
     create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
         .unwrap();
-    let mut ds = open_dataset(&root, Mode::Read).unwrap();
+    let ds = open_dataset(&root, Mode::Read).unwrap();
     ds.set_max_parallelism(4);
 
     let pred = Predicate::And(vec![

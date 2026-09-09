@@ -934,6 +934,38 @@ fn write_table_parallel_equivalence() {
     cleanup(&dir);
 }
 
+#[test]
+fn table_parallelism_control_and_scan_request() {
+    let dir = temp_dir("tbl_par_ctrl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let initial = make_data(&[("AAPL", d(7, 1), 10.0), ("MSFT", d(8, 1), 20.0)]);
+    let root = dir.join("tbl");
+    create_table(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
+
+    let mut table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(2), ..Default::default() }).unwrap();
+    assert_eq!(table.max_parallelism(), 2);
+
+    // 动态下发更高并发预算
+    table.set_max_parallelism(8);
+    assert_eq!(table.max_parallelism(), 8);
+
+    // 查询带 max_parallelism
+    let req = TableScanRequest {
+        max_parallelism: Some(4),
+        ..Default::default()
+    };
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut got = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        got.extend(f64s(view.column("price").unwrap()));
+    }
+    reader.close().unwrap();
+    assert_eq!(got, vec![10.0, 20.0]);
+
+    table.close().unwrap();
+    cleanup(&dir);
+}
+
 /// 任何写入前完成全部定位与校验：后续分区的 key 缺失 → 整体报错且
 /// 前面分区**不产生部分写入**（无事务契约下的最强前置语义）。
 #[test]

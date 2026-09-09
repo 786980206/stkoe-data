@@ -110,7 +110,7 @@ pub struct DatasetHandle {
     /// Field 级并行上限（write_dataset / scan_dataset 的并行度旋钮，由最上层控制；
     /// 1 = 串行。Dataset 层不自建线程池，只用 `std::thread::scope` 按
     /// min(max_parallelism, 任务数) 分桶）。
-    max_parallelism: usize,
+    max_parallelism: std::cell::Cell<usize>,
 }
 
 impl DatasetHandle {
@@ -123,13 +123,18 @@ impl DatasetHandle {
     }
 
     /// 设置 Field 级并行上限（影响 write_dataset / scan_dataset；1 = 串行）。
-    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
-        self.max_parallelism = max_parallelism.max(1);
+    pub fn set_max_parallelism(&self, max_parallelism: usize) {
+        self.max_parallelism.set(max_parallelism.max(1));
     }
 
     /// 当前 Field 级并行上限（供上层在临时下调 / 恢复时保存现场）。
     pub fn max_parallelism(&self) -> usize {
-        self.max_parallelism
+        self.max_parallelism.get()
+    }
+
+    /// 当前数据集包含的总行数。
+    pub fn row_count(&self) -> u64 {
+        self.logical_length()
     }
 
     fn field_path(&self, name: &str) -> PathBuf {
@@ -325,7 +330,7 @@ impl DatasetHandle {
         }
         // ③ 写入：单字段 / 小写 / 并行度 1 → 串行快路径；否则 Field 级并行
         let total: usize = data.columns.iter().map(view_bytes).sum();
-        let p = self.max_parallelism;
+        let p = self.max_parallelism();
         if targets.len() <= 1 || total < WRITE_PARALLEL_MIN_BYTES || p <= 1 {
             for (i, handle) in targets {
                 handle.write_field_handle(offset, &data.columns[i])?;
@@ -416,7 +421,7 @@ impl DatasetHandle {
                 Vec::new()
             } else {
                 let total_rows: u64 = current.iter().map(|r| r.length).sum();
-                let p = self.max_parallelism;
+                let p = self.max_parallelism();
                 if groups.len() > 1 && total_rows >= SCAN_PARALLEL_MIN_ROWS && p > 1 {
                     let p = p.min(groups.len());
                     // 共享引用先行绑定：move 闭包只捕获 &Vec，不移动本体
@@ -1110,7 +1115,7 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
         schema,
         mode,
         fields: RefCell::new(HashMap::new()),
-        max_parallelism: std::thread::available_parallelism().map_or(1, |n| n.get()),
+        max_parallelism: std::cell::Cell::new(std::thread::available_parallelism().map_or(1, |n| n.get())),
     })
 }
 

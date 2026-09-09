@@ -154,6 +154,8 @@ impl DatasetHandle {
     pub fn write_dataset(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError>;
     pub fn update_dataset(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
     pub fn scan_dataset(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError>;
+    pub fn max_parallelism(&self) -> usize;
+    pub fn set_max_parallelism(&self, max_parallelism: usize);
 }
 ```
 
@@ -209,6 +211,8 @@ impl TableHandle {
     pub fn compress_table_field(&self, name: &str) -> Result<(), CoreError>;
     pub fn decompress_table_field(&self, name: &str) -> Result<(), CoreError>;
     pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError>;
+    pub fn max_parallelism(&self) -> usize;
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize);
 }
 ```
 

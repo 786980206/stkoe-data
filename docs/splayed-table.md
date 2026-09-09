@@ -80,6 +80,18 @@ pub struct TableScanRequest {
     pub predicate: Option<Predicate>,
     pub projection: Vec<String>,
     pub limit: Option<u64>,
+    pub max_parallelism: Option<usize>,
+}
+```
+
+### 3.3 并发调度管理
+```rust
+impl TableHandle {
+    /// 获取当前 Table 的最大并发预算
+    pub fn max_parallelism(&self) -> usize;
+
+    /// 动态调节全局最大并发预算，并级联更新所有已打开的 Dataset 句柄
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize);
 }
 ```
 
@@ -430,7 +442,7 @@ pub fn scan_table<'t>(
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `table` | `&'t TableHandle` | 输入 | 表句柄 |
-| `request` | `&TableScanRequest` | 输入 | 包含 sym、time、predicate、projection、limit 的查询请求 |
+| `request` | `&TableScanRequest` | 输入 | 包含 sym、time、predicate、projection、limit、max_parallelism 的查询请求 |
 | 返回 | `Result<TableScanner<'t>, CoreError>` | 输出 | 跨分区惰性扫描器 |
 
 #### 内部实现流程
@@ -439,7 +451,8 @@ pub fn scan_table<'t>(
    - 基于 request.time 范围，二分筛选满足条件的分区子集（纯推导，零 META I/O）；
 2. 构造 TableScanner：
    - 保持裁剪后的有序分区列表；
-   - next() 时惰性打开当前分区，调用 scan_dataset 返回 PartitionRowRange；
+   - 携带 request.max_parallelism 并发度预算；
+   - next() 时惰性打开当前分区，下推该并发配置至 DatasetHandle，调用 scan_dataset 返回 PartitionRowRange；
    - 保证任意时刻内存中至多打开一个分区的扫描器。
 ```
 

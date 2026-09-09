@@ -354,3 +354,21 @@ impl DatasetHandle {
 
 #### 其他说明
 - 索引先行裁剪，字段下推求交，最大限度避免无效 I/O。
+
+---
+
+### 7.13 并发控制 (set_max_parallelism / max_parallelism)
+
+#### 函数签名
+```rust
+impl DatasetHandle {
+    /// 获取当前数据集的 Field 级最大并行度
+    pub fn max_parallelism(&self) -> usize;
+
+    /// 动态设置 Field 级最大并行度（影响 write_dataset 与 scan_dataset）
+    pub fn set_max_parallelism(&self, max_parallelism: usize);
+}
+```
+
+#### 其他说明
+- 支持内部可变性（`Cell`），允许在持有不可变借用时无锁调节并发度，供上层 `Table` 级调度器灵活管控。

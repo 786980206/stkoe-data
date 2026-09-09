@@ -111,6 +111,24 @@ impl TableHandle {
         self.mode
     }
 
+    /// 获取当前 Table 的最大并行度预算。
+    pub fn max_parallelism(&self) -> usize {
+        self.options
+            .max_parallelism
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1)
+    }
+
+    /// 动态设置当前 Table 的最大并行度预算，并级联更新所有已打开的 Dataset 缓存。
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        let p = max_parallelism.max(1);
+        self.options.max_parallelism = Some(p);
+        let guard = self.datasets.borrow();
+        for ds in guard.values() {
+            ds.set_max_parallelism(p);
+        }
+    }
+
     /// 打开（或取缓存）Partition 对应的 Dataset。`none` 模式 name 为空 → 根目录 Dataset。
     pub(crate) fn dataset_for(&self, partition: &str) -> Result<&DatasetHandle, CoreError> {
         if !self.datasets.borrow().contains_key(partition) {
@@ -120,10 +138,7 @@ impl TableHandle {
                 self.root.join(partition)
             };
             let ds = open_dataset(&dir, self.mode)?;
-            let mut ds = ds;
-            if let Some(mp) = self.options.max_parallelism {
-                ds.set_max_parallelism(mp);
-            }
+            ds.set_max_parallelism(self.max_parallelism());
             self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
         }
         let borrow = self.datasets.borrow();
@@ -960,12 +975,7 @@ impl TableHandle {
             .iter_mut()
             .filter_map(|(k, v)| name_set.contains(k.as_str()).then(|| &mut **v))
             .collect();
-        let p = self
-            .options
-            .max_parallelism
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-            .max(1)
-            .min(targets.len());
+        let p = self.max_parallelism().min(targets.len());
         if p <= 1 {
             for h in targets {
                 f(h)?;

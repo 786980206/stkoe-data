@@ -21,6 +21,8 @@ pub struct TableScanRequest {
     pub projection: Vec<String>,
     /// Table-level 全局 limit。
     pub limit: Option<u64>,
+    /// 单次扫描允许的最大并行度预算；None 则默认遵循 TableHandle 配置。
+    pub max_parallelism: Option<usize>,
 }
 
 /// 跨 Partition 的扫描位置：`(partition, 该 Dataset 的逻辑行范围)`。
@@ -46,6 +48,8 @@ pub struct TableScanner<'t> {
     pub(crate) projection: Vec<Arc<str>>,
     /// 全局剩余 limit（逐分区下推 + 返回前防御性裁剪）
     remaining: Option<u64>,
+    /// 单次扫描指定的最大并行度
+    max_parallelism: Option<usize>,
 }
 
 impl<'t> TableScanner<'t> {
@@ -84,6 +88,9 @@ impl<'t> TableScanner<'t> {
             };
             self.next_idx += 1;
             let ds = self.table.dataset_for(partition)?;
+            if let Some(mp) = self.max_parallelism {
+                ds.set_max_parallelism(mp);
+            }
             let core_req = ScanRequest {
                 ranges: vec![],
                 projection: self.projection.clone(),
@@ -329,6 +336,7 @@ pub fn scan_table<'t>(
             .map(|s| Arc::from(s.as_str()))
             .collect(),
         remaining: request.limit,
+        max_parallelism: request.max_parallelism,
     })
 }
 
