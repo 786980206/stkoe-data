@@ -631,6 +631,159 @@ impl TableArrowReader {
         data_view_to_record_batch(&view)
     }
 
+    /// 多线程分区分文件并发读取满足扫描条件的所有 RecordBatch（零 GIL 争用、多核动态工作窃取）
+    pub fn read_all_parallel(
+        &self,
+        request: splayed_table::TableScanRequest,
+    ) -> Result<Vec<RecordBatch>> {
+        let scanner = self.inner.scan(request)?;
+        let partitions: Vec<String> = scanner.partitions().to_vec();
+        if partitions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = scanner.table_root();
+        let scheme = scanner.table_scheme();
+        let predicate = scanner.predicate().cloned();
+        let projection: Vec<Arc<str>> = if scanner.projection().is_empty() {
+            let splayed_schema = self.inner.schema()?;
+            splayed_schema
+                .fields
+                .iter()
+                .filter(|f| f.name.as_ref() != "sym" && f.name.as_ref() != "time")
+                .map(|f| Arc::from(f.name.as_ref()))
+                .collect()
+        } else {
+            scanner.projection().to_vec()
+        };
+        let proj_strs: Vec<&str> = projection.iter().map(|s| s.as_ref()).collect();
+
+        let max_p = scanner
+            .max_parallelism()
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .min(partitions.len())
+            .max(1);
+
+        if max_p <= 1 || partitions.len() <= 1 {
+            let mut results = Vec::new();
+            for part_name in &partitions {
+                let part_path = if scheme == splayed_table::PartitionScheme::None {
+                    root.to_path_buf()
+                } else {
+                    root.join(part_name)
+                };
+                let ds = splayed_core::open_dataset(&part_path, splayed_core::Mode::Read)?;
+                let core_req = splayed_core::ScanRequest {
+                    ranges: vec![],
+                    projection: projection.clone(),
+                    predicate: predicate.clone(),
+                    limit: None,
+                };
+                let mut ds_scanner = ds.scan(&core_req)?;
+                while let Some(r) = ds_scanner.next()? {
+                    let view = ds.read(r.offset, r.length, Some(&proj_strs))?;
+                    results.push(data_view_to_record_batch(&view)?);
+                }
+            }
+            return Ok(results);
+        }
+
+        // 多线程并发分区分文件读取（LPT 动态原子工作窃取，保持有序）
+        let num_parts = partitions.len();
+        let results = std::sync::Mutex::new(vec![Vec::new(); num_parts]);
+        let task_idx = std::sync::atomic::AtomicUsize::new(0);
+
+        let partitions_ref = &partitions;
+        let proj_strs_ref = &proj_strs;
+        let proj_arc_ref = &projection;
+        let predicate_ref = &predicate;
+        let results_ref = &results;
+
+        let mut first_err: Option<ArrowConvError> = None;
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for _ in 0..max_p {
+                handles.push(s.spawn(|| -> Result<()> {
+                    loop {
+                        let i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= num_parts {
+                            break;
+                        }
+                        let part_name = &partitions_ref[i];
+                        let part_path = if scheme == splayed_table::PartitionScheme::None {
+                            root.to_path_buf()
+                        } else {
+                            root.join(part_name)
+                        };
+                        let ds = splayed_core::open_dataset(&part_path, splayed_core::Mode::Read)?;
+                        let core_req = splayed_core::ScanRequest {
+                            ranges: vec![],
+                            projection: proj_arc_ref.clone(),
+                            predicate: predicate_ref.clone(),
+                            limit: None,
+                        };
+                        let mut ds_scanner = ds.scan(&core_req)?;
+                        let mut part_batches = Vec::new();
+                        while let Some(r) = ds_scanner.next()? {
+                            let view = ds.read(r.offset, r.length, Some(proj_strs_ref))?;
+                            let batch = data_view_to_record_batch(&view)?;
+                            part_batches.push(batch);
+                        }
+                        results_ref.lock().unwrap()[i] = part_batches;
+                    }
+                    Ok(())
+                }));
+            }
+            for h in handles {
+                match h.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        first_err.get_or_insert(e);
+                    }
+                    Err(_) => {
+                        first_err.get_or_insert(ArrowConvError::Core(
+                            splayed_core::CoreError::Invalid(
+                                "read worker thread panicked".into(),
+                            ),
+                        ));
+                    }
+                }
+            }
+        });
+
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+
+        let results_vec = results.into_inner().unwrap();
+        let mut flattened = Vec::with_capacity(num_parts);
+        for batches in results_vec {
+            flattened.extend(batches);
+        }
+
+        // 若有全局 limit，裁剪总行数
+        if let Some(limit) = scanner.remaining() {
+            let mut taken = 0u64;
+            let mut limited = Vec::new();
+            for b in flattened {
+                if taken >= limit {
+                    break;
+                }
+                let rem = (limit - taken) as usize;
+                if b.num_rows() <= rem {
+                    taken += b.num_rows() as u64;
+                    limited.push(b);
+                } else {
+                    limited.push(b.slice(0, rem));
+                    break;
+                }
+            }
+            return Ok(limited);
+        }
+
+        Ok(flattened)
+    }
+
     /// 读取 Arrow Schema
     pub fn schema(&self) -> Result<Arc<ArrowSchema>> {
         let splayed_schema = self.inner.schema()?;

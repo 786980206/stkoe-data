@@ -32,7 +32,17 @@ class TableReader:
         end_time: Optional[int] = None,
         columns: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
+        max_parallelism: Optional[int] = None,
     ) -> Any: ...
+    def read_batches(
+        self,
+        symbols: Optional[Sequence[str]] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        columns: Optional[Sequence[str]] = None,
+        limit: Optional[int] = None,
+        max_parallelism: Optional[int] = None,
+    ) -> list[Any]: ...
     def close(self) -> None: ...
 
 class TableWriter:

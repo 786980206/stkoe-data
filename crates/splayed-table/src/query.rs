@@ -124,6 +124,34 @@ impl<'t> TableScanner<'t> {
         }
         Ok(())
     }
+
+    pub fn partitions(&self) -> &[String] {
+        &self.partitions
+    }
+
+    pub fn predicate(&self) -> Option<&Predicate> {
+        self.predicate.as_ref()
+    }
+
+    pub fn projection(&self) -> &[Arc<str>] {
+        &self.projection
+    }
+
+    pub fn remaining(&self) -> Option<u64> {
+        self.remaining
+    }
+
+    pub fn max_parallelism(&self) -> Option<usize> {
+        self.max_parallelism
+    }
+
+    pub fn table_root(&self) -> &std::path::Path {
+        self.table.path()
+    }
+
+    pub fn table_scheme(&self) -> crate::partition::PartitionScheme {
+        self.table.scheme()
+    }
 }
 
 /// Table 流式批次读取器：消费 Scanner 定位的 ranges，装配为 `DataView` 输出。
@@ -413,6 +441,14 @@ impl TableReader {
 
     pub fn path(&self) -> &std::path::Path {
         self.inner.path()
+    }
+
+    pub fn handle(&self) -> &TableHandle {
+        &self.inner
+    }
+
+    pub fn discover_partitions(&self) -> Vec<String> {
+        self.inner.discover_partitions()
     }
 
     pub fn scheme(&self) -> crate::partition::PartitionScheme {

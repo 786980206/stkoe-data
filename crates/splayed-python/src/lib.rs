@@ -206,7 +206,7 @@ impl PyTableReader {
         })
     }
 
-    #[pyo3(signature = (symbols=None, start_time=None, end_time=None, columns=None, limit=None))]
+    #[pyo3(signature = (symbols=None, start_time=None, end_time=None, columns=None, limit=None, max_parallelism=None))]
     fn read_all(
         &self,
         py: Python<'_>,
@@ -215,9 +215,67 @@ impl PyTableReader {
         end_time: Option<i64>,
         columns: Option<Vec<String>>,
         limit: Option<u64>,
+        max_parallelism: Option<usize>,
     ) -> PyResult<PyObject> {
-        let mut stream = self.read(symbols, start_time, end_time, columns, limit, None)?;
-        stream.read_all(py)
+        let mut req = TableScanRequest::default();
+        if let Some(syms) = symbols {
+            if let Some(first) = syms.into_iter().next() {
+                req.sym = Some(first);
+            }
+        }
+        if let (Some(s), Some(e)) = (start_time, end_time) {
+            req.time = Some((s, e));
+        }
+        if let Some(cols) = columns {
+            req.projection = cols;
+        }
+        req.limit = limit;
+        req.max_parallelism = max_parallelism;
+
+        let batches = self.inner.read_all_parallel(req).map_err(to_py_err)?;
+
+        let py_batches = batches
+            .into_iter()
+            .map(|b| b.into_pyarrow(py))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let pa = py.import("pyarrow")?;
+        let table = pa.getattr("Table")?.call_method1("from_batches", (py_batches,))?;
+        Ok(table.into())
+    }
+
+    #[pyo3(signature = (symbols=None, start_time=None, end_time=None, columns=None, limit=None, max_parallelism=None))]
+    fn read_batches(
+        &self,
+        py: Python<'_>,
+        symbols: Option<Vec<String>>,
+        start_time: Option<i64>,
+        end_time: Option<i64>,
+        columns: Option<Vec<String>>,
+        limit: Option<u64>,
+        max_parallelism: Option<usize>,
+    ) -> PyResult<Vec<PyObject>> {
+        let mut req = TableScanRequest::default();
+        if let Some(syms) = symbols {
+            if let Some(first) = syms.into_iter().next() {
+                req.sym = Some(first);
+            }
+        }
+        if let (Some(s), Some(e)) = (start_time, end_time) {
+            req.time = Some((s, e));
+        }
+        if let Some(cols) = columns {
+            req.projection = cols;
+        }
+        req.limit = limit;
+        req.max_parallelism = max_parallelism;
+
+        let batches = self.inner.read_all_parallel(req).map_err(to_py_err)?;
+
+        batches
+            .into_iter()
+            .map(|b| b.into_pyarrow(py))
+            .collect()
     }
 
     fn schema(&self, py: Python<'_>) -> PyResult<PyObject> {

@@ -87,13 +87,16 @@ def scan_splayed(
                         read_cols_set.add(name)
             read_cols = list(read_cols_set)
 
-        # 执行底层的流式读取
-        batch_reader = reader.read(columns=read_cols, limit=n_rows, batch_size=batch_size)
-        batches = list(batch_reader)
-        if not batches:
-            tbl = pa.Table.from_batches([], schema=arrow_schema)
+        # 执行底层的并发 / 流式读取
+        if batch_size is None:
+            tbl = reader.read_all(columns=read_cols, limit=n_rows)
         else:
-            tbl = pa.Table.from_batches(batches)
+            batch_reader = reader.read(columns=read_cols, limit=n_rows, batch_size=batch_size)
+            batches = list(batch_reader)
+            if not batches:
+                tbl = pa.Table.from_batches([], schema=arrow_schema)
+            else:
+                tbl = pa.Table.from_batches(batches)
 
         # 谓词过滤求值
         if filter_expr is not None and tbl.num_rows > 0:
