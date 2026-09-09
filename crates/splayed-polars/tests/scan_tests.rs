@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
-use splayed_table::create_table;
+use splayed_table::create_table_data;
 
 fn temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir()
@@ -73,7 +73,7 @@ fn month_sample_with_null() -> Data {
 fn scan_polars_month_table_filter_and_nulls() {
     let dir = temp_dir("month");
     let root = dir.join("tbl");
-    create_table(&root, month_sample_with_null(), splayed_table::PartitionScheme::Month, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample_with_null(), splayed_table::PartitionScheme::Month, splayed_table::TableOptions::default()).unwrap();
 
     let lf = splayed_polars::scan_polars(&root).unwrap();
     let df = lf.collect().unwrap();
@@ -150,7 +150,7 @@ fn scan_polars_none_table() {
         vec![sym_col, time_col, price_col],
     )
     .unwrap();
-    create_table(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
 
     let lf = splayed_polars::scan_polars(&root).unwrap();
     let df = lf.collect().unwrap();
@@ -188,7 +188,7 @@ fn scan_polars_empty_table_refuses() {
         vec![sym_col, time_col, price_col],
     )
     .unwrap();
-    create_table(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
 
     // 空表没有数据分区和 .meta，polars 扫描无法推断 schema，应返回 Err
     let res = splayed_polars::scan_polars(&root);

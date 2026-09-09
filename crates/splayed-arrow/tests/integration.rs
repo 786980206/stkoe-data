@@ -17,7 +17,7 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 use splayed_table::{
-    create_table, open_table, scan_table, TableOptions, TableScanRequest,
+    create_table_data, open_table, scan_table, TableOptions, TableScanRequest,
 };
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -167,7 +167,7 @@ fn table_scan_to_arrow_end_to_end() {
     let dir = temp_dir("e2e");
     let root = dir.join("tbl");
     let data = sample_data();
-    create_table(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, data, splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     // 流式 Reader：逐批转换，不物化整个结果集
     let scanner = scan_table(&table, TableScanRequest::default()).unwrap();
@@ -213,7 +213,7 @@ fn multi_segment_view_to_batch_and_table_e2e() {
     // 多段（跨分区 batch 聚合）→ 单 Arrow 批
     let dir = temp_dir("e2e_multi");
     let root = dir.join("tbl");
-    create_table(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let scanner = scan_table(&table, TableScanRequest::default()).unwrap();
     let mut reader = read_table_as_arrow(&table, scanner, Some(2));
@@ -264,7 +264,7 @@ fn dict_key_overflow_is_checked() {
 fn arrow_reader_limit_early_termination() {
     let dir = temp_dir("limit");
     let root = dir.join("tbl");
-    create_table(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
+    create_table_data(&root, sample_data(), splayed_table::PartitionScheme::None, splayed_table::TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let req = TableScanRequest { limit: Some(3), ..Default::default() };
     let scanner = scan_table(&table, req).unwrap();

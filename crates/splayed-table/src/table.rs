@@ -7,7 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
-    CreateDatasetOptions, CoreError, DatasetHandle, DatasetStatistics, Mode, create_dataset,
+    CreateDatasetOptions, CoreError, DatasetHandle, DatasetStatistics, Mode,
     delete_dataset, open_dataset,
 };
 use splayed_format::{Buffer, Column, Data, DataView, DataType, DictBuffers, Schema, TimeType};
@@ -502,14 +502,8 @@ pub(crate) fn partition_spans(
         .collect())
 }
 
-/// 创建完整 Table（`none` → 根目录 Dataset；year/month/date → 按 time 切分 Partition）。
-///
-/// 并发模型：主线程一次线性扫描产出分区**连续片段** → 分区并行创建（round-robin
-/// 分桶），并行预算切分 `P_part × P_field ≤ max_parallelism`（与 create_dataset
-/// 内部的 Field 级并行共享总预算，消除无上界嵌套）；分区 gather 在各工作线程内
-/// 批量拼接（连续片段 memcpy + validity word 级位拼接）。失败语义：单分区原子
-/// （tmp + rename），已创建分区保留、不回滚；不改变 Partition 内数据顺序。
-pub fn create_table(
+/// 连带拥有型数据创建完整分区表（底层实现路径）。
+pub fn init_table_data(
     table_path: &Path,
     data: Data,
     scheme: PartitionScheme,
@@ -539,7 +533,7 @@ pub fn create_table(
     };
     if scheme == PartitionScheme::None {
         // 单 Dataset 快速路径：列所有权直接移动，不克隆
-        return create_dataset(table_path, data, ds_options);
+        return splayed_core::create_dataset_data(table_path, data, ds_options);
     }
     // ① 主线程：一次线性扫描 → 每分区连续行片段（分区名仅换段时构造）
     let buckets = partition_spans(&data, scheme, tt)?;
@@ -549,7 +543,7 @@ pub fn create_table(
         // 单分区 / 并行度 1：串行创建，Field 级并行拿满预算
         for (name, runs) in buckets {
             let sub = gather_runs(&data, &runs)?;
-            create_dataset(&table_path.join(&name), sub, ds_options.clone())?;
+            splayed_core::create_dataset_data(&table_path.join(&name), sub, ds_options.clone())?;
         }
         return Ok(());
     }
@@ -568,7 +562,7 @@ pub fn create_table(
                 for (name, runs) in group {
                     // 分区内 gather（批量拼接）+ create_dataset（Field 级并行 p_field）
                     let sub = gather_runs(data_ref, &runs)?;
-                    create_dataset(
+                    splayed_core::create_dataset_data(
                         &table_path.join(&name),
                         sub,
                         CreateDatasetOptions {
@@ -640,7 +634,7 @@ pub fn create_table_partition(
     // ③ 委托 Dataset 层：列所有权直接移交（无 gather / 克隆）；options 携带该
     //    分区的创建即压缩策略（可与既有分区差异化——冷热分层）；
     //    失败语义与 create_table 一致——不回滚，已写入文件保留
-    create_dataset(&partition_path, data, options)
+    splayed_core::create_dataset_data(&partition_path, data, options)
 }
 
 /// 基于 `&DataView` 零拷贝视图新增单个 Partition / Dataset。
@@ -689,49 +683,61 @@ pub fn init_table(
 ) -> Result<TableHandle, CoreError> {
     let opts = options.unwrap_or_default();
     let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
-    create_table(table_path, owned, scheme, opts.clone())?;
+    init_table_data(table_path, owned, scheme, opts.clone())?;
     open_table(table_path, Mode::Read, opts)
 }
 
-/// 创建仅含骨架的空 Table 并返回 TableHandle。
-pub fn create_table_skeleton(
+/// 兼容拥有型 Data 初始化。
+pub fn create_table_data(
+    table_path: &Path,
+    data: Data,
+    scheme: PartitionScheme,
+    options: TableOptions,
+) -> Result<(), CoreError> {
+    init_table_data(table_path, data, scheme, options)
+}
+
+/// 默认当前最新分区名推导（公历当天/当月/当年）。
+pub(crate) fn default_latest_partition_name(scheme: PartitionScheme) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86400) as i64;
+    let (y, m, d) = crate::partition::civil_from_days(days);
+    match scheme {
+        PartitionScheme::None => String::new(),
+        PartitionScheme::Year => format!("year={y}"),
+        PartitionScheme::Month => format!("month={y:04}-{m:02}"),
+        PartitionScheme::Date => format!("date={y:04}-{m:02}-{d:02}"),
+    }
+}
+
+/// 按 Schema 创建空 Table，并预先初始化最新分区（或指定分区）的空骨架。
+/// 物理磁盘上仅生成各字段 64B Header-Only 文件，0 实际数据 I/O。
+pub fn create_table(
     table_path: &Path,
     schema: &Schema,
     scheme: PartitionScheme,
+    initial_partition: Option<&str>,
     options: Option<TableOptions>,
 ) -> Result<TableHandle, CoreError> {
-    if table_path.exists() {
+    if table_path.exists() && (table_path.read_dir().map_err(CoreError::Io)?.next().is_some()) {
         return Err(CoreError::AlreadyExists(table_path.to_path_buf()));
     }
     fs::create_dir_all(table_path).map_err(CoreError::Io)?;
     let opts = options.unwrap_or_default();
     if scheme == PartitionScheme::None {
-        create_dataset_skeleton(table_path, schema)?;
+        splayed_core::create_dataset(table_path, schema)?;
+    } else {
+        let part_name = match initial_partition {
+            Some(p) => p.to_string(),
+            None => default_latest_partition_name(scheme),
+        };
+        let part_path = table_path.join(&part_name);
+        splayed_core::create_dataset(&part_path, schema)?;
     }
     open_table(table_path, Mode::Write, opts)
-}
-
-fn create_dataset_skeleton(path: &Path, schema: &Schema) -> Result<(), CoreError> {
-    let time_field = schema.fields.iter().find(|f| f.name.as_ref() == "time").ok_or_else(|| {
-        CoreError::Invalid("schema must contain 'time' column".into())
-    })?;
-    let tt = match time_field.data_type {
-        DataType::Date32 => TimeType::Date32,
-        DataType::TimestampUs => TimeType::TimestampUs,
-        _ => return Err(CoreError::Invalid("unsupported time column type".into())),
-    };
-    fs::create_dir_all(path).map_err(CoreError::Io)?;
-    splayed_core::create_index(&path.join(".meta"), tt)?;
-    for f in &schema.fields {
-        if f.name.as_ref() != "sym" && f.name.as_ref() != "time" {
-            let field_path = path.join(f.name.as_ref().replace('.', "/"));
-            if let Some(p) = field_path.parent() {
-                fs::create_dir_all(p).map_err(CoreError::Io)?;
-            }
-            splayed_core::create_field(&field_path, f.data_type)?;
-        }
-    }
-    Ok(())
 }
 
 /// 销毁并删除 Table 根目录（关闭句柄并删除物理目录）。

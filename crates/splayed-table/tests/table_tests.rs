@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
 use splayed_core::{CmpOp, Mode, Predicate, Scalar};
 use splayed_table::{
-    create_table, create_table_columns, create_table_partition, delete_table, delete_table_partition,
-    open_table, query_table, rename_table, scan_table, write_table, PartitionScheme, TableOptions,
-    TableScanRequest,
+    create_table, create_table_columns, create_table_data, create_table_partition, delete_table,
+    delete_table_partition, open_table, query_table, rename_table, scan_table, write_table,
+    PartitionScheme, TableOptions, TableScanRequest,
 };
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -121,7 +121,7 @@ fn month_sample() -> Data {
 fn month_table_create_query() {
     let dir = temp_dir("month");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     // 分区目录
     assert!(root.join("month=2026-08").exists());
     assert!(root.join("month=2026-09").exists());
@@ -202,7 +202,7 @@ fn month_table_create_query() {
 fn table_write_overwrites_existing_rows() {
     let dir = temp_dir("write");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 覆盖 08-03 的 AAPL/MSFT（输入按 (sym,time) 有序唯一）
@@ -252,7 +252,7 @@ fn none_scheme_table() {
         ("MSFT", d803, 20.0),
         ("MSFT", d804, 21.0),
     ]);
-    create_table(&root, sorted, PartitionScheme::None, TableOptions::default()).unwrap();
+    create_table_data(&root, sorted, PartitionScheme::None, TableOptions::default()).unwrap();
     assert!(root.join(".meta").exists());
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     assert_eq!(table.scheme(), PartitionScheme::None);
@@ -275,7 +275,7 @@ fn partition_and_table_lifecycle() {
     // 先建 08 分区
     let d803 = splayed_table::days_from_civil(2026, 8, 3) as i32;
     let partial = make_data(&[("AAPL", d803, 10.0)]);
-    create_table(&root, partial, PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, partial, PartitionScheme::Month, TableOptions::default()).unwrap();
 
     // create_table_partition：新增 09 分区（scheme 从已有分区推断）
     let sep_sample = make_data(&[("AAPL", splayed_table::days_from_civil(2026, 9, 1) as i32, 12.0)]);
@@ -342,7 +342,7 @@ fn validity_survives_partition_split() {
         d.columns[price_idx].validity = Some(bits);
         d
     };
-    create_table(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
     let req = TableScanRequest::default();
     let mut reader = query_table(&table, req, None).unwrap();
@@ -360,7 +360,7 @@ fn validity_survives_partition_split() {
 fn table_field_structure_operations() {
     let dir = temp_dir("fieldops");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // create：全 NULL
@@ -514,9 +514,9 @@ fn create_table_parallel_options_equivalent() {
     let (data1, expected) = parallel_opts_sample();
     let (data2, _) = parallel_opts_sample();
     let root1 = dir.join("serial");
-    create_table(&root1, data1, PartitionScheme::Month, TableOptions { max_parallelism: Some(1), ..Default::default() }).unwrap();
+    create_table_data(&root1, data1, PartitionScheme::Month, TableOptions { max_parallelism: Some(1), ..Default::default() }).unwrap();
     let root2 = dir.join("par");
-    create_table(&root2, data2, PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
+    create_table_data(&root2, data2, PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
 
     let rows1 = read_rows(&root1);
     let rows2 = read_rows(&root2);
@@ -546,7 +546,7 @@ fn create_table_empty_data_creates_root() {
         ],
     )
     .unwrap();
-    create_table(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, data, PartitionScheme::Month, TableOptions::default()).unwrap();
     assert!(root.is_dir());
     assert!(std::fs::read_dir(&root).unwrap().next().is_none()); // 无任何子项
     cleanup(&dir);
@@ -630,7 +630,7 @@ fn table_field_struct_ops_parallel_and_state_checks() {
             }
         }
     }
-    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
+    create_table_data(&root, make_data(&rows), PartitionScheme::Month, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
 
     let read_prices = |root: &Path| -> Vec<f64> {
         let table = open_table(root, Mode::Read, TableOptions::default()).unwrap();
@@ -700,7 +700,7 @@ fn metadata_read_apis_cache_semantics() {
             }
         }
     }
-    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
 
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
 
@@ -763,7 +763,7 @@ fn scan_table_lazy_prune_limit_and_boundary() {
             }
         }
     }
-    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
 
     let collect = |req: TableScanRequest| -> (Vec<String>, usize) {
@@ -836,7 +836,7 @@ fn read_table_batch_semantics() {
                 .map(move |k| ("AAPL", d((7 + m) as u32, (k + 1) as u32), (m * 3 + k) as f64))
         })
         .collect();
-    create_table(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, make_data(&rows), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
 
     // 聚合路径：batch = 4 → [4, 4, 1]（最后一批允许小）；跨界批次跨分区多段拼接
@@ -922,7 +922,7 @@ fn write_table_parallel_equivalence() {
     let root1 = dir.join("serial");
     let root2 = dir.join("par");
     for (root, mp) in [(&root1, Some(1usize)), (&root2, Some(8usize))] {
-        create_table(root, initial.clone(), PartitionScheme::Month, TableOptions::default()).unwrap();
+        create_table_data(root, initial.clone(), PartitionScheme::Month, TableOptions::default()).unwrap();
         let table = open_table(root, Mode::Write, TableOptions { max_parallelism: mp, ..Default::default() }).unwrap();
         write_table(&table, &patch).unwrap();
         table.close().unwrap();
@@ -940,7 +940,7 @@ fn table_parallelism_control_and_scan_request() {
     let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
     let initial = make_data(&[("AAPL", d(7, 1), 10.0), ("MSFT", d(8, 1), 20.0)]);
     let root = dir.join("tbl");
-    create_table(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
 
     let mut table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(2), ..Default::default() }).unwrap();
     assert_eq!(table.max_parallelism(), 2);
@@ -1012,6 +1012,60 @@ fn table_streaming_writer_and_create_partition() {
     cleanup(&dir);
 }
 
+#[test]
+fn create_table_schema_and_latest_partition_skeleton() {
+    let dir = temp_dir("tbl_skeleton_create");
+    let root = dir.join("tbl");
+    let schema = Schema::new(vec![
+        FieldSchema::new("sym", DataType::Utf8),
+        FieldSchema::new("time", DataType::TimestampUs),
+        FieldSchema::new("price", DataType::Float64),
+        FieldSchema::new("factor.ret20", DataType::Float32),
+    ]);
+
+    // 按 Schema 创建空表，预先初始化指定最新分区
+    let table = create_table(
+        &root,
+        &schema,
+        PartitionScheme::Month,
+        Some("month=2026-03"),
+        None,
+    ).unwrap();
+
+    // 1. 验证分区已预建，且各普通字段均为 64B Header-Only 文件（0 数据 I/O）
+    let part_dir = root.join("month=2026-03");
+    assert!(part_dir.join(".meta").exists());
+    let price_meta = std::fs::metadata(part_dir.join("price")).unwrap();
+    assert_eq!(price_meta.len(), 64);
+    let ret20_meta = std::fs::metadata(part_dir.join("factor/ret20")).unwrap();
+    assert_eq!(ret20_meta.len(), 64);
+
+    // 2. 验证立即能够读取到完整的全表 Schema
+    let read_schema = table.read_table_schema().unwrap();
+    assert_eq!(read_schema.fields.len(), 4);
+    assert_eq!(read_schema.fields[0].name.as_ref(), "sym");
+    assert_eq!(read_schema.fields[1].name.as_ref(), "time");
+    assert_eq!(read_schema.fields[2].name.as_ref(), "factor.ret20");
+    assert_eq!(read_schema.fields[3].name.as_ref(), "price");
+
+    // 3. 验证默认自动推断当前月份分区建表
+    let root2 = dir.join("tbl_auto");
+    let table2 = create_table(
+        &root2,
+        &schema,
+        PartitionScheme::Month,
+        None,
+        None,
+    ).unwrap();
+    let schema2 = table2.read_table_schema().unwrap();
+    assert_eq!(schema2.fields.len(), 4);
+    assert!(!table2.read_table_metadata().unwrap().partitions.is_empty());
+
+    table.close().unwrap();
+    table2.close().unwrap();
+    cleanup(&dir);
+}
+
 /// 任何写入前完成全部定位与校验：后续分区的 key 缺失 → 整体报错且
 /// 前面分区**不产生部分写入**（无事务契约下的最强前置语义）。
 #[test]
@@ -1020,7 +1074,7 @@ fn write_table_locate_all_before_write() {
     let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
     let initial = make_data(&[("AAPL", d(7, 1), 10.0), ("MSFT", d(8, 1), 20.0)]);
     let root = dir.join("tbl");
-    create_table(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, initial, PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 07 的 key 合法、08 的 key（A@8-2）不存在 → 定位阶段整体失败
@@ -1054,7 +1108,7 @@ fn create_table_compression_and_partition_override() {
         ("MSFT", d(7, 1), 20.0),
         ("MSFT", d(7, 2), 21.0),
     ]);
-    create_table(
+    create_table_data(
         &root,
         initial,
         PartitionScheme::Month,
@@ -1143,7 +1197,7 @@ fn fixed_col(dt: DataType, bytes: Vec<u8>) -> Column {
 fn create_table_columns_creates_missing_columns_subset() {
     let dir = temp_dir("crc_subset");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 子集输入：只覆盖 08 分区的 AAPL/MSFT 各一行（08-03）；新增 volume(i64)/qty(i32)
@@ -1210,7 +1264,7 @@ fn create_table_columns_creates_missing_columns_subset() {
 fn create_table_columns_skips_existing_same_type() {
     let dir = temp_dir("crc_skip");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 输入含已有 price(Float64) + 新 volume(Int64)，覆盖 08-04 两行
@@ -1250,7 +1304,7 @@ fn create_table_columns_skips_existing_same_type() {
 fn create_table_columns_refuses_conflicting_type() {
     let dir = temp_dir("crc_type");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
     // 输入把已有 price 声明为 Int64（类型冲突）→ 应前置报错
@@ -1276,7 +1330,7 @@ fn table_query_batch_sizes_and_limit_boundaries() {
     let dir = temp_dir("batch_boundaries");
     let root = dir.join("tbl");
     // month_sample() 包含 2 个分区（2026-08 4 行，2026-09 4 行，共 8 行）
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
 
     // 1. batch_size = Some(1)：每次迭代返回恰好 1 行
@@ -1331,7 +1385,7 @@ fn table_query_batch_sizes_and_limit_boundaries() {
 fn table_partition_delete_and_rescan() {
     let dir = temp_dir("part_del");
     let root = dir.join("tbl");
-    create_table(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
 
     // 删除 2026-08 分区
     delete_table_partition(&root, "month=2026-08").unwrap();

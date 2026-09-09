@@ -131,9 +131,10 @@ impl TableHandle {
 #### 函数签名
 ```rust
 pub fn create_table(
-    path: &Path,
+    table_path: &Path,
     schema: &Schema,
-    partition_scheme: PartitionScheme,
+    scheme: PartitionScheme,
+    initial_partition: Option<&str>,
     options: Option<TableOptions>,
 ) -> Result<TableHandle, CoreError>;
 ```
@@ -141,25 +142,28 @@ pub fn create_table(
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `path` | `&Path` | 输入 | Table 根目录；必须不存在 |
+| `table_path` | `&Path` | 输入 | Table 根目录；必须不存在或为空 |
 | `schema` | `&Schema` | 输入 | 表的初始逻辑 Schema（必须含 sym 与 time） |
-| `partition_scheme` | `PartitionScheme` | 输入 | `none \| year \| month \| date` 四选一 |
+| `scheme` | `PartitionScheme` | 输入 | `none \| year \| month \| date` 四选一 |
+| `initial_partition` | `Option<&str>` | 输入 | 初始预建的最新分区名；None 自动根据当前公历推断（如 `month=2026-03`） |
 | `options` | `Option<TableOptions>` | 输入 | 并行度与压缩等配置项 |
 | 返回 | `Result<TableHandle, CoreError>` | 输出 | 创建成功的空表句柄 |
 
 #### 内部实现流程
 ```
-1. 校验 path 不存在，创建根目录 fs::create_dir_all(path)；
+1. 校验 table_path 不存在或为空，创建根目录 fs::create_dir_all(table_path)；
 2. 校验 schema 包含合法的 sym 与 time 字段；
-3. 若 partition_scheme == PartitionScheme::None：
-   → 直接调用 create_dataset(path, schema) 在根目录创建单一数据集；
-4. 若为分区模式：
-   → 记录分区配置，保持空目录；
-5. 调用 open_table(path, Mode::Write, options) 打开并返回句柄。
+3. 若 scheme == PartitionScheme::None：
+   → 直接调用 create_dataset(table_path, schema) 在根目录创建单一数据集；
+4. 若为分区模式（Year / Month / Date）：
+   → 提取指定或默认推断的最新分区名（如 month=2026-03）；
+   → 在对应分区路径下调用 create_dataset(&part_path, schema) 完整初始化最新分区的 64B Header-Only 空骨架；
+5. 调用 open_table(table_path, Mode::Write, options) 打开并返回句柄。
 ```
 
 #### 其他说明
-- 纯元数据骨架创建，无需初始数据，耗时小于 1ms。
+- 物理磁盘上仅生成各字段 64B Header-Only 空文件，0 实际数据 I/O。
+- 表创建完成后立即拥有完整的 Schema 上下文，`table.read_table_schema()` 可立即读取，无需等待任何数据落盘。
 
 ---
 

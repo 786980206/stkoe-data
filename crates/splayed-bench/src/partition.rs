@@ -12,7 +12,7 @@ use crate::{month_start_us, sym_name, sym_strings};
 use std::sync::Arc;
 use std::io::Write as _;
 use splayed_table::{
-    close_table, create_table, create_table_partition, open_table, read_table, scan_table,
+    close_table, create_table_partition, init_table, open_table, read_table, scan_table,
     TableHandle, TableOptions, TableScanRequest,
 };
 
@@ -349,14 +349,14 @@ pub fn run_partition(out: &PathBuf, total_rows: usize, runs: usize) {
         let data = year_to_splayed_data(&yd);
         let t0 = Instant::now();
         if y == 0 {
-            create_table(
+            init_table(
                 &root,
-                data,
                 splayed_table::PartitionScheme::Year,
-                TableOptions {
+                &data.as_view(),
+                Some(TableOptions {
                     compression: Some(splayed_format::Compression::Zstd),
                     ..Default::default()
-                },
+                }),
             )
             .unwrap();
         } else {

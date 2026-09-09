@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use splayed_format::{Buffer, Column, Data, DataType, FieldSchema, Schema};
 use splayed_table::{
-    create_table, open_table, query_table, TableOptions, TableScanRequest,
+    create_table_data, open_table, query_table, TableOptions, TableScanRequest,
 };
 
 const SYMS: usize = 256;
@@ -129,7 +129,7 @@ fn bench_write(c: &mut Criterion) {
     group.bench_function("splayed_table_month", |b| {
         b.iter(|| {
             let root = temp_root("w_splayed");
-            create_table(&root, data.clone(), splayed_table::PartitionScheme::Month, TableOptions::default()).unwrap();
+            create_table_data(&root, data.clone(), splayed_table::PartitionScheme::Month, TableOptions::default()).unwrap();
             black_box(&root);
             let _ = std::fs::remove_dir_all(&root);
         })
@@ -150,7 +150,7 @@ fn bench_read_scan(c: &mut Criterion) {
     let data = bench_data();
     // 预建 splayed 表与 parquet 文件
     let splayed_root = temp_root("r_splayed");
-    create_table(&splayed_root, data.clone(), splayed_table::PartitionScheme::Month, TableOptions::default()).unwrap();
+    create_table_data(&splayed_root, data.clone(), splayed_table::PartitionScheme::Month, TableOptions::default()).unwrap();
     parquet_roundtrip_setup(&splayed_root, &data);
 
     let mut group = c.benchmark_group("read");

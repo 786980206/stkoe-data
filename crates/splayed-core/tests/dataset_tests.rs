@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use splayed_core::{
-    close_field_handle, create_dataset, create_dataset_index, delete_dataset, open_dataset,
+    close_field_handle, create_dataset, create_dataset_data, create_dataset_index, delete_dataset, open_dataset,
     open_field_file, CoreError, CmpOp, DatasetFieldInit, FieldChunkReader, Mode, Predicate,
     Scalar, ScanRequest, StreamValues,
 };
@@ -75,11 +75,11 @@ fn sample_data() -> Data {
 fn dataset_create_read_write_roundtrip() {
     let dir = temp_dir("roundtrip");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     assert!(root.join(".meta").exists());
     assert!(root.join("price").exists());
     // 重复创建 → AlreadyExists
-    assert!(create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).is_err());
+    assert!(create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).is_err());
 
     let ds = open_dataset(&root, Mode::Read).unwrap();
     let schema = ds.read_dataset_schema();
@@ -138,7 +138,7 @@ fn dataset_create_read_write_roundtrip() {
 fn dataset_write_and_scan() {
     let dir = temp_dir("write_scan");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Write).unwrap();
 
     // write：覆盖 MSFT 两行（逻辑行 [3, 5)）
@@ -222,7 +222,7 @@ fn dataset_write_and_scan() {
 fn dataset_struct_ops_and_compression() {
     let dir = temp_dir("struct");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
 
     // create：全 NULL 字段
@@ -297,7 +297,7 @@ fn dataset_struct_ops_and_compression() {
 fn dataset_locate_index() {
     let dir = temp_dir("locate");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
 
     // 有序唯一输入：AAPL@100 → row 0，AAPL@300 → row 2，GOOG@200 → row 4, GOOG@300 → row 5
@@ -333,7 +333,7 @@ fn dataset_locate_index() {
 fn dataset_index_rebuild() {
     let dir = temp_dir("reindex");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     // 重建 .meta（同输入）
     let data = sample_data();
     create_dataset_index(&root, &data.as_view()).unwrap();
@@ -368,7 +368,7 @@ fn create_dataset_field_failure_leaves_no_residue() {
         &[1, 2, 3, 4, 1, 2, 3, 4],
         &[10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0],
     );
-    create_dataset(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
 
     let mut ds = open_dataset(&root, Mode::Write).unwrap();
     let err = ds
@@ -417,10 +417,10 @@ fn create_dataset_parallel_options() {
 
     // 串行（max_parallelism = 1）
     let root1 = dir.join("serial");
-    create_dataset(&root1, data.clone(), splayed_core::CreateDatasetOptions { max_parallelism: 1, ..Default::default() }).unwrap();
+    create_dataset_data(&root1, data.clone(), splayed_core::CreateDatasetOptions { max_parallelism: 1, ..Default::default() }).unwrap();
     // 并行（max_parallelism = 8 > 字段数 → P = 2）
     let root2 = dir.join("par");
-    create_dataset(&root2, data, splayed_core::CreateDatasetOptions { max_parallelism: 8, ..Default::default() }).unwrap();
+    create_dataset_data(&root2, data, splayed_core::CreateDatasetOptions { max_parallelism: 8, ..Default::default() }).unwrap();
 
     for root in [&root1, &root2] {
         let ds = open_dataset(&root, Mode::Read).unwrap();
@@ -501,7 +501,7 @@ fn write_dataset_parallel_large_matches_expected() {
     let n = 100_000; // 2 字段 × 8B × 100K = 1.5 MiB ≥ WRITE_PARALLEL_MIN_BYTES（1 MiB）
     let dir = temp_dir("write_par");
     let root = dir.join("ds");
-    create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
+    create_dataset_data(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
         .unwrap();
     let ds = open_dataset(&root, Mode::Write).unwrap();
     ds.set_max_parallelism(4); // 强制走并行分支
@@ -581,7 +581,7 @@ fn scan_dataset_parallel_multi_field_matches_brute_force() {
     let n = 128_000; // ≥ SCAN_PARALLEL_MIN_ROWS（64K），双字段谓词 → 并行扫描分支
     let dir = temp_dir("scan_par");
     let root = dir.join("ds");
-    create_dataset(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
+    create_dataset_data(&root, large_two_field_data(n), splayed_core::CreateDatasetOptions::default())
         .unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
     ds.set_max_parallelism(4);
@@ -633,7 +633,7 @@ fn scan_dataset_parallel_multi_field_matches_brute_force() {
 fn read_dataset_projection_request_order_and_validation() {
     let dir = temp_dir("read_order");
     let root = dir.join("ds");
-    create_dataset(&root, two_field_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, two_field_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
 
     // 输出按 projection 请求序（schema 序为 price, volume）
@@ -662,7 +662,7 @@ fn read_dataset_projection_request_order_and_validation() {
 fn create_dataset_with_compression() {
     let dir = temp_dir("ds_compress");
     let root = dir.join("ds");
-    create_dataset(
+    create_dataset_data(
         &root,
         two_field_data(),
         splayed_core::CreateDatasetOptions {
@@ -699,7 +699,7 @@ fn scan_dataset_symbol_in_or_pushdown() {
     let dir = temp_dir("sym_in");
     let root = dir.join("ds");
     let data = two_field_data(); // A@1,A@2,B@1,B@2
-    create_dataset(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, data, splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
 
     // sym IN ("B") —— 单元素 Or 等价 IN
@@ -744,7 +744,7 @@ fn scan_dataset_symbol_in_or_pushdown() {
 fn dataset_read_write_boundaries_and_zero_length() {
     let dir = temp_dir("boundaries");
     let root = dir.join("ds");
-    create_dataset(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
+    create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).unwrap();
     let ds = open_dataset(&root, Mode::Write).unwrap();
 
     // 1. 读取 length = 0：应成功返回空 DataView，且 schema 保持 (None 只读 sym, time)
@@ -795,6 +795,25 @@ fn dataset_read_write_boundaries_and_zero_length() {
         &[99.0, 100.0]
     );
 
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn dataset_skeleton_create_and_schema_read() {
+    let dir = temp_dir("ds_skeleton");
+    let root = dir.join("ds");
+    let schema = Schema::new(vec![
+        FieldSchema::new("sym", DataType::Utf8),
+        FieldSchema::new("time", DataType::TimestampUs),
+        FieldSchema::new("price", DataType::Float64),
+        FieldSchema::new("factor.ret20", DataType::Float32),
+    ]);
+    let ds = create_dataset(&root, &schema).unwrap();
+    assert_eq!(ds.read_dataset_schema().len(), 4);
+    assert!(root.join(".meta").exists());
+    assert_eq!(std::fs::metadata(root.join("price")).unwrap().len(), 64);
+    assert_eq!(std::fs::metadata(root.join("factor/ret20")).unwrap().len(), 64);
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }

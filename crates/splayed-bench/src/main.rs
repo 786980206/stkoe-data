@@ -23,7 +23,7 @@ use parquet::file::properties::WriterProperties;
 use splayed_core::{CreateDatasetOptions, Mode};
 use splayed_format::{Buffer, Column, Data, DataType, FieldSchema, Schema};
 use splayed_table::{
-    close_table, create_table, create_table_partition, open_table, read_table, scan_table,
+    close_table, create_table_partition, init_table, open_table, read_table, scan_table,
     TableHandle, TableOptions, TableScanRequest,
 };
 
@@ -561,15 +561,15 @@ fn write_splayed(
         let data = month_to_splayed_data(&md);
         let t0 = Instant::now();
         if m == 0 {
-            create_table(
+            init_table(
                 root,
-                data,
                 splayed_table::PartitionScheme::Month,
-                TableOptions {
+                &data.as_view(),
+                Some(TableOptions {
                     max_parallelism: Some(max_parallelism),
                     compression: Some(splayed_format::Compression::Zstd),
                     ..Default::default()
-                },
+                }),
             )
             .unwrap();
         } else {

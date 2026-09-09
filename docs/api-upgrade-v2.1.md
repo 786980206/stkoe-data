@@ -168,6 +168,7 @@ pub fn create_table(
     path: &Path,
     schema: &Schema,
     partition_scheme: PartitionScheme,
+    initial_partition: Option<&str>,
     options: Option<TableOptions>,
 ) -> Result<TableHandle, CoreError>;
 

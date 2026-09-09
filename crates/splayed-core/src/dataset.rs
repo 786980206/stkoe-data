@@ -719,24 +719,38 @@ pub struct DatasetStatistics {
     pub time_max: i64,
 }
 
-/// 从目录内容构建 Schema（[sym, time] + 字段文件按名称排序）。
+/// 从目录内容递归构建 Schema（[sym, time] + 字段文件（含多级嵌套子目录 '.' 映射）按名称排序）。
 fn build_schema(root: &Path, time_type: TimeType) -> Result<Schema, CoreError> {
     let mut fields = vec![
         FieldSchema::new("sym", DataType::Utf8),
         FieldSchema::new("time", time_type.data_type()),
     ];
-    let mut names: Vec<String> = Vec::new();
-    for entry in fs::read_dir(root).map_err(|e| map_io_path(root, e))? {
-        let entry = entry.map_err(CoreError::Io)?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || name.ends_with(".tmp") {
-            continue;
+    let mut discovered: Vec<(String, PathBuf)> = Vec::new();
+    fn walk_dir(dir: &Path, prefix: &str, out: &mut Vec<(String, PathBuf)>) -> Result<(), CoreError> {
+        for entry in fs::read_dir(dir).map_err(|e| map_io_path(dir, e))? {
+            let entry = entry.map_err(CoreError::Io)?;
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.starts_with('.') || file_name.ends_with(".tmp") || file_name == ".lock" {
+                continue;
+            }
+            let path = entry.path();
+            let field_name = if prefix.is_empty() {
+                file_name
+            } else {
+                format!("{prefix}.{file_name}")
+            };
+            if path.is_dir() {
+                walk_dir(&path, &field_name, out)?;
+            } else {
+                out.push((field_name, path));
+            }
         }
-        names.push(name);
+        Ok(())
     }
-    names.sort();
-    for name in names {
-        let mut f = File::open(root.join(&name)).map_err(|e| map_io_path(root, e))?;
+    walk_dir(root, "", &mut discovered)?;
+    discovered.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, path) in discovered {
+        let mut f = File::open(&path).map_err(|e| map_io_path(&path, e))?;
         let mut head = [0u8; 64];
         std::io::Read::read_exact(&mut f, &mut head)?;
         let header = splayed_format::FieldHeader::from_bytes(&head)?;
@@ -1088,8 +1102,38 @@ pub fn create_dataset_from_view(
     Ok(())
 }
 
-/// 创建完整 Dataset。
+/// 按 Schema 创建空 Dataset 骨架（只创建目录、空 .meta 与各字段的 64B 空 Header，0 实际数据 I/O）。
 pub fn create_dataset(
+    path: &Path,
+    schema: &Schema,
+) -> Result<DatasetHandle, CoreError> {
+    if path.exists() && (path.read_dir().map_err(CoreError::Io)?.next().is_some()) {
+        return Err(CoreError::AlreadyExists(path.to_path_buf()));
+    }
+    let time_field = schema.fields.iter().find(|f| f.name.as_ref() == "time").ok_or_else(|| {
+        CoreError::Invalid("schema must contain 'time' column".into())
+    })?;
+    let tt = match time_field.data_type {
+        DataType::Date32 => TimeType::Date32,
+        DataType::TimestampUs => TimeType::TimestampUs,
+        _ => return Err(CoreError::Invalid("unsupported time column type".into())),
+    };
+    fs::create_dir_all(path).map_err(CoreError::Io)?;
+    crate::meta_file::create_index(&path.join(META_FILE_NAME), tt)?;
+    for f in &schema.fields {
+        if f.name.as_ref() != "sym" && f.name.as_ref() != "time" {
+            let field_path = path.join(f.name.as_ref().replace('.', "/"));
+            if let Some(p) = field_path.parent() {
+                fs::create_dir_all(p).map_err(CoreError::Io)?;
+            }
+            crate::field_file::create_field(&field_path, f.data_type)?;
+        }
+    }
+    open_dataset(path, Mode::Write)
+}
+
+/// 兼容带数据创建完整 Dataset 目录。
+pub fn create_dataset_data(
     path: &Path,
     data: Data,
     options: CreateDatasetOptions,
