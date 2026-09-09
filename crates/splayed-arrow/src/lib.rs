@@ -141,6 +141,18 @@ fn null_buffer_to_bitmap(nulls: &NullBuffer) -> Bitmap {
 
 // ---------------------------------------------------------------- to arrow
 
+fn bytes_to_scalar_buffer<T: arrow_buffer::ArrowNativeType>(bytes: &[u8]) -> Result<arrow_buffer::ScalarBuffer<T>> {
+    let size = std::mem::size_of::<T>();
+    if bytes.len() % size != 0 {
+        return Err(ArrowConvError::Unsupported(
+            "byte length does not match type size".into(),
+        ));
+    }
+    let buf = arrow_buffer::Buffer::from_slice_ref(bytes);
+    let len = bytes.len() / size;
+    Ok(arrow_buffer::ScalarBuffer::new(buf, 0, len))
+}
+
 /// 拥有型 Column → Arrow ArrayRef（Layer 1；docs/splayed-arrow.md §5）。
 pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
     let validity = col.validity.as_ref().map(bitmap_to_null_buffer);
@@ -151,55 +163,55 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
             validity,
         ))),
         DataType::Int8 => Ok(Arc::new(Int8Array::new(
-            cast_to_vec::<i8>(values)?.into(),
+            bytes_to_scalar_buffer::<i8>(values)?,
             validity,
         ))),
         DataType::Int16 => Ok(Arc::new(Int16Array::new(
-            cast_to_vec::<i16>(values)?.into(),
+            bytes_to_scalar_buffer::<i16>(values)?,
             validity,
         ))),
         DataType::Int32 => Ok(Arc::new(Int32Array::new(
-            cast_to_vec::<i32>(values)?.into(),
+            bytes_to_scalar_buffer::<i32>(values)?,
             validity,
         ))),
         DataType::Int64 => Ok(Arc::new(Int64Array::new(
-            cast_to_vec::<i64>(values)?.into(),
+            bytes_to_scalar_buffer::<i64>(values)?,
             validity,
         ))),
         DataType::UInt8 => Ok(Arc::new(UInt8Array::new(
-            cast_to_vec::<u8>(values)?.into(),
+            bytes_to_scalar_buffer::<u8>(values)?,
             validity,
         ))),
         DataType::UInt16 => Ok(Arc::new(UInt16Array::new(
-            cast_to_vec::<u16>(values)?.into(),
+            bytes_to_scalar_buffer::<u16>(values)?,
             validity,
         ))),
         DataType::UInt32 => Ok(Arc::new(UInt32Array::new(
-            cast_to_vec::<u32>(values)?.into(),
+            bytes_to_scalar_buffer::<u32>(values)?,
             validity,
         ))),
         DataType::UInt64 => Ok(Arc::new(UInt64Array::new(
-            cast_to_vec::<u64>(values)?.into(),
+            bytes_to_scalar_buffer::<u64>(values)?,
             validity,
         ))),
         DataType::Float32 => Ok(Arc::new(Float32Array::new(
-            cast_to_vec::<f32>(values)?.into(),
+            bytes_to_scalar_buffer::<f32>(values)?,
             validity,
         ))),
         DataType::Float64 => Ok(Arc::new(Float64Array::new(
-            cast_to_vec::<f64>(values)?.into(),
+            bytes_to_scalar_buffer::<f64>(values)?,
             validity,
         ))),
         DataType::Date32 => Ok(Arc::new(Date32Array::new(
-            cast_to_vec::<i32>(values)?.into(),
+            bytes_to_scalar_buffer::<i32>(values)?,
             validity,
         ))),
         DataType::TimestampUs => Ok(Arc::new(TimestampMicrosecondArray::new(
-            cast_to_vec::<i64>(values)?.into(),
+            bytes_to_scalar_buffer::<i64>(values)?,
             validity,
         ))),
         DataType::Date64 => Ok(Arc::new(Date64Array::new(
-            cast_to_vec::<i64>(values)?.into(),
+            bytes_to_scalar_buffer::<i64>(values)?,
             validity,
         ))),
         DataType::Utf8 => {
@@ -261,25 +273,64 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
     }
 }
 
-fn cast_to_vec<T: bytemuck::Pod>(bytes: &[u8]) -> Result<Vec<T>> {
-    if bytes.is_empty() {
-        return Ok(Vec::new());
+
+
+fn fixed_bytes_to_array(dt: DataType, bytes: &[u8], validity: Option<NullBuffer>) -> Result<ArrayRef> {
+    match dt {
+        DataType::Float64 => Ok(Arc::new(Float64Array::new(
+            bytes_to_scalar_buffer::<f64>(bytes)?,
+            validity,
+        ))),
+        DataType::Float32 => Ok(Arc::new(Float32Array::new(
+            bytes_to_scalar_buffer::<f32>(bytes)?,
+            validity,
+        ))),
+        DataType::Int64 => Ok(Arc::new(Int64Array::new(
+            bytes_to_scalar_buffer::<i64>(bytes)?,
+            validity,
+        ))),
+        DataType::Int32 => Ok(Arc::new(Int32Array::new(
+            bytes_to_scalar_buffer::<i32>(bytes)?,
+            validity,
+        ))),
+        DataType::Date32 => Ok(Arc::new(Date32Array::new(
+            bytes_to_scalar_buffer::<i32>(bytes)?,
+            validity,
+        ))),
+        DataType::TimestampUs => Ok(Arc::new(TimestampMicrosecondArray::new(
+            bytes_to_scalar_buffer::<i64>(bytes)?,
+            validity,
+        ))),
+        DataType::Date64 => Ok(Arc::new(Date64Array::new(
+            bytes_to_scalar_buffer::<i64>(bytes)?,
+            validity,
+        ))),
+        DataType::UInt64 => Ok(Arc::new(UInt64Array::new(
+            bytes_to_scalar_buffer::<u64>(bytes)?,
+            validity,
+        ))),
+        DataType::UInt32 => Ok(Arc::new(UInt32Array::new(
+            bytes_to_scalar_buffer::<u32>(bytes)?,
+            validity,
+        ))),
+        DataType::UInt16 => Ok(Arc::new(UInt16Array::new(
+            bytes_to_scalar_buffer::<u16>(bytes)?,
+            validity,
+        ))),
+        DataType::UInt8 => Ok(Arc::new(UInt8Array::new(
+            bytes_to_scalar_buffer::<u8>(bytes)?,
+            validity,
+        ))),
+        DataType::Int16 => Ok(Arc::new(Int16Array::new(
+            bytes_to_scalar_buffer::<i16>(bytes)?,
+            validity,
+        ))),
+        DataType::Int8 => Ok(Arc::new(Int8Array::new(
+            bytes_to_scalar_buffer::<i8>(bytes)?,
+            validity,
+        ))),
+        _ => Err(ArrowConvError::Unsupported(format!("{dt:?} is not fixed type"))),
     }
-    if let Ok(slice) = bytemuck::try_cast_slice::<u8, T>(bytes) {
-        return Ok(slice.to_vec());
-    }
-    let size = std::mem::size_of::<T>();
-    if bytes.len() % size != 0 {
-        return Err(ArrowConvError::Unsupported(
-            "byte length does not match type size".into(),
-        ));
-    }
-    let count = bytes.len() / size;
-    let mut out = Vec::with_capacity(count);
-    for chunk in bytes.chunks_exact(size) {
-        out.push(bytemuck::pod_read_unaligned(chunk));
-    }
-    Ok(out)
 }
 
 /// 多段视图 → 单 ArrayRef（Layer 1；段间按行序拼接拷贝——RecordBatch 单列单数组
@@ -289,6 +340,17 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
     // 单段走拥有列的路径（语义一致）
     if view.segments().len() == 1 {
         let seg = &view.segments()[0];
+        if view.data_type() != DataType::Utf8 && view.data_type() != DataType::Bool {
+            if let Some(fb) = seg.fixed_bytes() {
+                let validity = seg.validity().map(|b| {
+                    let raw = pack_bits(b);
+                    let buf = arrow_buffer::Buffer::from_vec(raw);
+                    let boolean_buf = arrow_buffer::BooleanBuffer::new(buf, 0, b.len());
+                    NullBuffer::new(boolean_buf)
+                });
+                return fixed_bytes_to_array(view.data_type(), fb, validity);
+            }
+        }
         let owned = segment_to_owned(seg, view.data_type());
         return column_to_array(&owned);
     }
@@ -366,9 +428,7 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
                     let mut curr_row = 0;
                     for s in view.segments() {
                         if let Some(v) = s.validity() {
-                            for i in 0..s.rows() {
-                                bit_bm.set(curr_row + i, v.is_valid(i));
-                            }
+                            bit_bm.copy_bits_from(curr_row, &v, s.rows());
                         }
                         curr_row += s.rows();
                     }
@@ -410,9 +470,7 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
             let mut curr_row = 0;
             for s in view.segments() {
                 if let Some(v) = s.validity() {
-                    for i in 0..s.rows() {
-                        bit_bm.set(curr_row + i, v.is_valid(i));
-                    }
+                    bit_bm.copy_bits_from(curr_row, &v, s.rows());
                 }
                 curr_row += s.rows();
             }
@@ -421,13 +479,8 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
             None
         };
 
-        let col = Column {
-            data_type: view.data_type(),
-            values: Buffer::from_vec(values_bytes),
-            validity,
-            dict: None,
-        };
-        return column_to_array(&col);
+        let null_buf = validity.as_ref().map(bitmap_to_null_buffer);
+        return fixed_bytes_to_array(view.data_type(), &values_bytes, null_buf);
     }
 
     // 回退兜底：逐段构造后用 arrow concat 拼接
@@ -556,14 +609,40 @@ pub fn data_to_record_batch(data: &Data) -> Result<RecordBatch> {
 /// 多段 DataView → RecordBatch（Layer 2；逐列视图直转，**不物化为 Data**——
 /// 否则引入一次多余的全量拷贝）。
 pub fn data_view_to_record_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch> {
-    let fields = arrow_fields(&view.schema);
-    let mut arrays = Vec::with_capacity(view.schema.fields.len());
-    for field in &view.schema.fields {
-        let col = view.column(&field.name).expect("schema iteration guarantees");
-        arrays.push(column_view_to_array(col)?);
+    data_view_to_record_batch_projected(view, None)
+}
+
+/// 支持精准投影裁剪的 DataView → RecordBatch（仅转换请求的列，跳过不相关的列）。
+pub fn data_view_to_record_batch_projected<'a>(
+    view: &DataView<'a>,
+    projection: Option<&[&str]>,
+) -> Result<RecordBatch> {
+    match projection {
+        Some(wanted) if !wanted.is_empty() => {
+            let mut fields = Vec::with_capacity(wanted.len());
+            let mut arrays = Vec::with_capacity(wanted.len());
+            for &col_name in wanted {
+                if let Some(col) = view.column(col_name) {
+                    let pos = view.schema.position(col_name).expect("field in schema");
+                    let field = &view.schema.fields[pos];
+                    fields.push(ArrowField::new(col_name, to_arrow_type(field.data_type), true));
+                    arrays.push(column_view_to_array(col)?);
+                }
+            }
+            let arrow_schema = Arc::new(ArrowSchema::new(fields));
+            Ok(RecordBatch::try_new(arrow_schema, arrays)?)
+        }
+        _ => {
+            let fields = arrow_fields(&view.schema);
+            let mut arrays = Vec::with_capacity(view.schema.fields.len());
+            for field in &view.schema.fields {
+                let col = view.column(&field.name).expect("schema iteration guarantees");
+                arrays.push(column_view_to_array(col)?);
+            }
+            let arrow_schema = Arc::new(ArrowSchema::new(fields));
+            Ok(RecordBatch::try_new(arrow_schema, arrays)?)
+        }
     }
-    let arrow_schema = Arc::new(ArrowSchema::new(fields));
-    Ok(RecordBatch::try_new(arrow_schema, arrays)?)
 }
 
 // ---------------------------------------------------------------- Table → Arrow
@@ -644,18 +723,36 @@ impl TableArrowReader {
         let root = scanner.table_root();
         let scheme = scanner.table_scheme();
         let predicate = scanner.predicate().cloned();
-        let projection: Vec<Arc<str>> = if scanner.projection().is_empty() {
-            let splayed_schema = self.inner.schema()?;
-            splayed_schema
+        let splayed_schema = self.inner.schema()?;
+
+        let is_select_all = scanner.projection().is_empty();
+        let (wanted_cols, field_proj_strs): (Option<Vec<&str>>, Vec<&str>) = if is_select_all {
+            let field_strs: Vec<&str> = splayed_schema
                 .fields
                 .iter()
                 .filter(|f| f.name.as_ref() != "sym" && f.name.as_ref() != "time")
-                .map(|f| Arc::from(f.name.as_ref()))
-                .collect()
+                .map(|f| f.name.as_ref())
+                .collect();
+            (None, field_strs)
         } else {
-            scanner.projection().to_vec()
+            let mut wanted: Vec<&str> = scanner.projection().iter().map(|s| s.as_ref()).collect();
+            // 保持 Splayed 语义：sym 与 time 恒在最前
+            if !wanted.contains(&"sym") {
+                wanted.insert(0, "sym");
+            }
+            if !wanted.contains(&"time") {
+                let time_pos = if wanted[0] == "sym" { 1 } else { 0 };
+                wanted.insert(time_pos, "time");
+            }
+            let field_strs: Vec<&str> = wanted
+                .iter()
+                .copied()
+                .filter(|&c| c != "sym" && c != "time")
+                .collect();
+            (Some(wanted), field_strs)
         };
-        let proj_strs: Vec<&str> = projection.iter().map(|s| s.as_ref()).collect();
+
+        let field_proj_arc: Vec<Arc<str>> = field_proj_strs.iter().map(|&s| Arc::from(s)).collect();
 
         let max_p = scanner
             .max_parallelism()
@@ -671,17 +768,25 @@ impl TableArrowReader {
                 } else {
                     root.join(part_name)
                 };
-                let ds = splayed_core::open_dataset(&part_path, splayed_core::Mode::Read)?;
-                let core_req = splayed_core::ScanRequest {
-                    ranges: vec![],
-                    projection: projection.clone(),
-                    predicate: predicate.clone(),
-                    limit: None,
-                };
-                let mut ds_scanner = ds.scan(&core_req)?;
-                while let Some(r) = ds_scanner.next()? {
-                    let view = ds.read(r.offset, r.length, Some(&proj_strs))?;
-                    results.push(data_view_to_record_batch(&view)?);
+                let ds = splayed_core::open_dataset_with_schema(&part_path, splayed_core::Mode::Read, splayed_schema.clone())?;
+                if predicate.is_none() {
+                    let len = ds.logical_length();
+                    if len > 0 {
+                        let view = ds.read(0, len, Some(&field_proj_strs))?;
+                        results.push(data_view_to_record_batch_projected(&view, wanted_cols.as_deref())?);
+                    }
+                } else {
+                    let core_req = splayed_core::ScanRequest {
+                        ranges: vec![],
+                        projection: field_proj_arc.clone(),
+                        predicate: predicate.clone(),
+                        limit: None,
+                    };
+                    let mut ds_scanner = ds.scan(&core_req)?;
+                    while let Some(r) = ds_scanner.next()? {
+                        let view = ds.read(r.offset, r.length, Some(&field_proj_strs))?;
+                        results.push(data_view_to_record_batch_projected(&view, wanted_cols.as_deref())?);
+                    }
                 }
             }
             return Ok(results);
@@ -689,14 +794,41 @@ impl TableArrowReader {
 
         // 多线程并发分区分文件读取（LPT 动态原子工作窃取，保持有序）
         let num_parts = partitions.len();
-        let results = std::sync::Mutex::new(vec![Vec::new(); num_parts]);
+        let mut part_order: Vec<usize> = (0..num_parts).collect();
+        let mut row_counts = Vec::with_capacity(num_parts);
+        for i in 0..num_parts {
+            let part_path = if scheme == splayed_table::PartitionScheme::None {
+                root.to_path_buf()
+            } else {
+                root.join(&partitions[i])
+            };
+            let rc = match std::fs::File::open(part_path.join(".meta")) {
+                Ok(mut f) => {
+                    use std::io::Read;
+                    let mut buf = [0u8; 64];
+                    if f.read_exact(&mut buf).is_ok() {
+                        u32::from_le_bytes(buf[16..20].try_into().unwrap()) as u64
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0,
+            };
+            row_counts.push(rc);
+        }
+        part_order.sort_by_key(|&i| std::cmp::Reverse(row_counts[i]));
+
+        let results: Vec<std::sync::Mutex<Vec<RecordBatch>>> = (0..num_parts).map(|_| std::sync::Mutex::new(Vec::new())).collect();
         let task_idx = std::sync::atomic::AtomicUsize::new(0);
 
         let partitions_ref = &partitions;
-        let proj_strs_ref = &proj_strs;
-        let proj_arc_ref = &projection;
+        let part_order_ref = &part_order;
+        let field_proj_strs_ref = &field_proj_strs;
+        let field_proj_arc_ref = &field_proj_arc;
         let predicate_ref = &predicate;
+        let wanted_cols_ref = &wanted_cols;
         let results_ref = &results;
+        let splayed_schema_ref = &splayed_schema;
 
         let mut first_err: Option<ArrowConvError> = None;
 
@@ -705,31 +837,45 @@ impl TableArrowReader {
             for _ in 0..max_p {
                 handles.push(s.spawn(|| -> Result<()> {
                     loop {
-                        let i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= num_parts {
+                        let task_i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if task_i >= num_parts {
                             break;
                         }
+                        let i = part_order_ref[task_i];
                         let part_name = &partitions_ref[i];
                         let part_path = if scheme == splayed_table::PartitionScheme::None {
                             root.to_path_buf()
                         } else {
                             root.join(part_name)
                         };
-                        let ds = splayed_core::open_dataset(&part_path, splayed_core::Mode::Read)?;
-                        let core_req = splayed_core::ScanRequest {
-                            ranges: vec![],
-                            projection: proj_arc_ref.clone(),
-                            predicate: predicate_ref.clone(),
-                            limit: None,
-                        };
-                        let mut ds_scanner = ds.scan(&core_req)?;
+                        let ds = splayed_core::open_dataset_with_schema(
+                            &part_path,
+                            splayed_core::Mode::Read,
+                            splayed_schema_ref.clone(),
+                        )?;
                         let mut part_batches = Vec::new();
-                        while let Some(r) = ds_scanner.next()? {
-                            let view = ds.read(r.offset, r.length, Some(proj_strs_ref))?;
-                            let batch = data_view_to_record_batch(&view)?;
-                            part_batches.push(batch);
+                        if predicate_ref.is_none() {
+                            let len = ds.logical_length();
+                            if len > 0 {
+                                let view = ds.read(0, len, Some(field_proj_strs_ref))?;
+                                let batch = data_view_to_record_batch_projected(&view, wanted_cols_ref.as_deref())?;
+                                part_batches.push(batch);
+                            }
+                        } else {
+                            let core_req = splayed_core::ScanRequest {
+                                ranges: vec![],
+                                projection: field_proj_arc_ref.clone(),
+                                predicate: predicate_ref.clone(),
+                                limit: None,
+                            };
+                            let mut ds_scanner = ds.scan(&core_req)?;
+                            while let Some(r) = ds_scanner.next()? {
+                                let view = ds.read(r.offset, r.length, Some(field_proj_strs_ref))?;
+                                let batch = data_view_to_record_batch_projected(&view, wanted_cols_ref.as_deref())?;
+                                part_batches.push(batch);
+                            }
                         }
-                        results_ref.lock().unwrap()[i] = part_batches;
+                        *results_ref[i].lock().unwrap() = part_batches;
                     }
                     Ok(())
                 }));
@@ -755,9 +901,9 @@ impl TableArrowReader {
             return Err(e);
         }
 
-        let results_vec = results.into_inner().unwrap();
         let mut flattened = Vec::with_capacity(num_parts);
-        for batches in results_vec {
+        for cell in results {
+            let batches = cell.into_inner().unwrap();
             flattened.extend(batches);
         }
 

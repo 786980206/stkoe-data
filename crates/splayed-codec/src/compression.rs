@@ -21,7 +21,12 @@ pub fn decompress(compression: Compression, payload: &[u8]) -> Result<Vec<u8>, C
     match compression {
         Compression::None => Ok(payload.to_vec()),
         Compression::Zstd => {
-            zstd::stream::decode_all(payload).map_err(|e| CodecError::Io(e.to_string()))
+            // 获取解压内容大小（若无法从帧头获取，则退回流式）
+            if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(payload) {
+                zstd::bulk::decompress(payload, size as usize).map_err(|e| CodecError::Io(e.to_string()))
+            } else {
+                zstd::stream::decode_all(payload).map_err(|e| CodecError::Io(e.to_string()))
+            }
         }
         Compression::Lz4 => {
             lz4_flex::decompress_size_prepended(payload).map_err(|e| CodecError::Io(e.to_string()))

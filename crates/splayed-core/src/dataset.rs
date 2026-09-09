@@ -141,7 +141,7 @@ impl DatasetHandle {
         self.root.join(name.replace('.', "/"))
     }
 
-    fn logical_length(&self) -> u64 {
+    pub fn logical_length(&self) -> u64 {
         self.meta.header().row_count as u64
     }
 
@@ -1306,6 +1306,22 @@ pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>
     }
     let meta = MetaHandle::open(&path.join(META_FILE_NAME))?;
     let schema = build_schema(path, meta.time_type())?;
+    Ok(DatasetHandle {
+        root: path.to_path_buf(),
+        meta,
+        schema,
+        mode,
+        fields: RefCell::new(HashMap::new()),
+        max_parallelism: std::cell::Cell::new(std::thread::available_parallelism().map_or(1, |n| n.get())),
+    })
+}
+
+/// 打开已有 Dataset（使用已知 Schema，避免递归扫描磁盘所有列文件）。
+pub fn open_dataset_with_schema(path: &Path, mode: Mode, schema: Schema) -> Result<DatasetHandle, CoreError> {
+    if !path.is_dir() {
+        return Err(CoreError::NotFound(path.to_path_buf()));
+    }
+    let meta = MetaHandle::open(&path.join(META_FILE_NAME))?;
     Ok(DatasetHandle {
         root: path.to_path_buf(),
         meta,

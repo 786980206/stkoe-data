@@ -12,7 +12,7 @@ pub mod scan;
 
 pub use dataset::{
     close_dataset, create_dataset, create_dataset_data, create_dataset_from_view, create_dataset_index,
-    delete_dataset, drop_dataset, init_dataset, open_dataset, read_dataset_schema, rename_dataset,
+    delete_dataset, drop_dataset, init_dataset, open_dataset, open_dataset_with_schema, read_dataset_schema, rename_dataset,
     update_dataset, CreateDatasetOptions, DatasetFieldInit, DatasetHandle, DatasetReader,
     DatasetScanner, DatasetStatistics, DatasetWriter, CHUNK_ROW_CAP, RESERVED_FIELD_NAMES,
 };
