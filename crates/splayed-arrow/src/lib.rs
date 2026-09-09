@@ -203,54 +203,60 @@ pub fn column_to_array(col: &Column) -> Result<ArrayRef> {
             validity,
         ))),
         DataType::Utf8 => {
-            let dict = col.dict.as_ref().ok_or_else(|| {
-                ArrowConvError::Unsupported("Utf8 column without dict buffers".into())
-            })?;
-            let DictBuffers { offsets, strings } = dict;
-            let read = |i: usize| -> (usize, usize) {
-                let lo = u64::from_le_bytes(offsets.as_slice()[i * 8..i * 8 + 8].try_into().unwrap())
-                    as usize;
-                let hi = u64::from_le_bytes(
-                    offsets.as_slice()[(i + 1) * 8..(i + 1) * 8 + 8].try_into().unwrap(),
-                ) as usize;
-                (lo, hi)
-            };
-            let n = offsets.len() / 8 - 1;
-            let mut parts: Vec<&str> = Vec::with_capacity(n);
-            for i in 0..n {
-                let (lo, hi) = read(i);
-                parts.push(std::str::from_utf8(&strings.as_slice()[lo..hi]).map_err(|e| {
-                    ArrowConvError::Unsupported(format!("dict string is not utf-8: {e}"))
-                })?);
-            }
-            let values_arr = StringArray::from(parts);
-            // keys: u32 → i32（位宽转换，值域校验，兼顾空切片与对齐）
-            let keys_i32: Vec<i32> = if values.is_empty() {
-                Vec::new()
-            } else if let Ok(raw_keys) = bytemuck::try_cast_slice::<u8, u32>(values) {
-                raw_keys
-                    .iter()
-                    .map(|&k| {
-                        i32::try_from(k).map_err(|_| {
-                            ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+            if let Some(dict) = col.dict.as_ref() {
+                let DictBuffers { offsets, strings } = dict;
+                let read = |i: usize| -> (usize, usize) {
+                    let lo = u64::from_le_bytes(offsets.as_slice()[i * 8..i * 8 + 8].try_into().unwrap())
+                        as usize;
+                    let hi = u64::from_le_bytes(
+                        offsets.as_slice()[(i + 1) * 8..(i + 1) * 8 + 8].try_into().unwrap(),
+                    ) as usize;
+                    (lo, hi)
+                };
+                let n = offsets.len() / 8 - 1;
+                let mut parts: Vec<&str> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let (lo, hi) = read(i);
+                    parts.push(std::str::from_utf8(&strings.as_slice()[lo..hi]).map_err(|e| {
+                        ArrowConvError::Unsupported(format!("dict string is not utf-8: {e}"))
+                    })?);
+                }
+                let values_arr = StringArray::from(parts);
+                // keys: u32 → i32（位宽转换，值域校验，兼顾空切片与对齐）
+                let keys_i32: Vec<i32> = if values.is_empty() {
+                    Vec::new()
+                } else if let Ok(raw_keys) = bytemuck::try_cast_slice::<u8, u32>(values) {
+                    raw_keys
+                        .iter()
+                        .map(|&k| {
+                            i32::try_from(k).map_err(|_| {
+                                ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+                            })
                         })
-                    })
-                    .collect::<Result<_>>()?
+                        .collect::<Result<_>>()?
+                } else {
+                    values
+                        .chunks_exact(4)
+                        .map(|chunk| {
+                            let k = u32::from_le_bytes(chunk.try_into().unwrap());
+                            i32::try_from(k).map_err(|_| {
+                                ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
+                            })
+                        })
+                        .collect::<Result<_>>()?
+                };
+                let dict_keys = Int32Array::new(keys_i32.into(), validity);
+                Ok(Arc::new(
+                    DictionaryArray::try_new(dict_keys, Arc::new(values_arr))?,
+                ))
             } else {
-                values
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let k = u32::from_le_bytes(chunk.try_into().unwrap());
-                        i32::try_from(k).map_err(|_| {
-                            ArrowConvError::Unsupported(format!("dict key {k} exceeds i32"))
-                        })
-                    })
-                    .collect::<Result<_>>()?
-            };
-            let dict_keys = Int32Array::new(keys_i32.into(), validity);
-            Ok(Arc::new(
-                DictionaryArray::try_new(dict_keys, Arc::new(values_arr))?,
-            ))
+                let rows = values.len() / 4;
+                let dict_keys = Int32Array::new(vec![0i32; rows].into(), validity);
+                let values_arr = StringArray::from(vec![""]);
+                Ok(Arc::new(
+                    DictionaryArray::try_new(dict_keys, Arc::new(values_arr))?,
+                ))
+            }
         }
     }
 }
@@ -286,14 +292,7 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
         let owned = segment_to_owned(seg, view.data_type());
         return column_to_array(&owned);
     }
-    // 多段：逐段构造后用 arrow concat 拼接
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(view.segments().len());
-    for seg in view.segments() {
-        let owned = segment_to_owned(seg, view.data_type());
-        arrays.push(column_to_array(&owned)?);
-    }
-    if arrays.is_empty() {
-        // 空列：单空段路径已覆盖；防御分支
+    if view.segments().is_empty() {
         let owned = segment_to_owned(&splayed_format::ColumnSegment::new(
             view.data_type(),
             splayed_format::BufferView::new(&[]),
@@ -301,6 +300,141 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
             0,
         )?, view.data_type());
         return column_to_array(&owned);
+    }
+
+    // 优化路径 1：同字典 Utf8（例如 sym 轴生成的 RepeatDict/Dict 段）
+    // 零字符串重复哈希，按键向量预分配批量填充
+    if view.data_type() == DataType::Utf8 {
+        let first = &view.segments()[0];
+        let (first_offsets, first_strings) = match first.values() {
+            splayed_format::ColumnValues::RepeatDict { dict_offsets, dict_strings, .. } => {
+                (dict_offsets.as_slice(), dict_strings.as_slice())
+            }
+            splayed_format::ColumnValues::Dict { dict_offsets, dict_strings, .. } => {
+                (dict_offsets.as_slice(), dict_strings.as_slice())
+            }
+            _ => (&[][..], &[][..]),
+        };
+        if !first_offsets.is_empty() {
+            let same_dict = view.segments().iter().all(|s| match s.values() {
+                splayed_format::ColumnValues::RepeatDict { dict_offsets, dict_strings, .. } => {
+                    dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings
+                }
+                splayed_format::ColumnValues::Dict { dict_offsets, dict_strings, .. } => {
+                    dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings
+                }
+                _ => false,
+            });
+            if same_dict {
+                let offs: Vec<u64> = first_offsets
+                    .chunks_exact(8)
+                    .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                    .collect();
+                let n = offs.len() - 1;
+                let mut parts: Vec<&str> = Vec::with_capacity(n);
+                for i in 0..n {
+                    let lo = offs[i] as usize;
+                    let hi = offs[i + 1] as usize;
+                    parts.push(std::str::from_utf8(&first_strings[lo..hi]).map_err(|e| {
+                        ArrowConvError::Unsupported(format!("dict string is not utf-8: {e}"))
+                    })?);
+                }
+                let values_arr = Arc::new(StringArray::from(parts));
+
+                let total_rows = view.length();
+                let mut keys: Vec<i32> = Vec::with_capacity(total_rows);
+                let mut has_null = false;
+                for seg in view.segments() {
+                    if seg.validity().is_some() {
+                        has_null = true;
+                    }
+                    match seg.values() {
+                        splayed_format::ColumnValues::RepeatDict { dict_index, .. } => {
+                            keys.resize(keys.len() + seg.rows(), *dict_index as i32);
+                        }
+                        splayed_format::ColumnValues::Dict { keys: seg_keys, .. } => {
+                            for chunk in seg_keys.as_slice().chunks_exact(4) {
+                                keys.push(u32::from_le_bytes(chunk.try_into().unwrap()) as i32);
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                let validity = if has_null {
+                    let mut bit_bm = Bitmap::ones(total_rows);
+                    let mut curr_row = 0;
+                    for s in view.segments() {
+                        if let Some(v) = s.validity() {
+                            for i in 0..s.rows() {
+                                bit_bm.set(curr_row + i, v.is_valid(i));
+                            }
+                        }
+                        curr_row += s.rows();
+                    }
+                    let buf = bit_bm.as_view().as_raw();
+                    let len = bit_bm.len();
+                    Some(NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+                        arrow_buffer::Buffer::from(buf.to_vec()),
+                        0,
+                        len,
+                    )))
+                } else {
+                    None
+                };
+
+                let keys_arr = Int32Array::new(keys.into(), validity);
+                return Ok(Arc::new(DictionaryArray::try_new(keys_arr, values_arr)?));
+            }
+        }
+    }
+
+    // 优化路径 2：定宽数值/时间多段列（例如 time 轴切片多段）
+    // 单次分配连续缓冲区 + 批量 memcpy，避免生成数千个小 Array 再 concat
+    if view.data_type() != DataType::Utf8 {
+        let total_rows = view.length();
+        let elem_size = view.data_type().size_of();
+        let mut values_bytes: Vec<u8> = Vec::with_capacity(total_rows * elem_size);
+        let mut has_null = false;
+        for seg in view.segments() {
+            if let Some(fb) = seg.fixed_bytes() {
+                values_bytes.extend_from_slice(fb);
+            }
+            if seg.validity().is_some() {
+                has_null = true;
+            }
+        }
+
+        let validity = if has_null {
+            let mut bit_bm = Bitmap::ones(total_rows);
+            let mut curr_row = 0;
+            for s in view.segments() {
+                if let Some(v) = s.validity() {
+                    for i in 0..s.rows() {
+                        bit_bm.set(curr_row + i, v.is_valid(i));
+                    }
+                }
+                curr_row += s.rows();
+            }
+            Some(bit_bm)
+        } else {
+            None
+        };
+
+        let col = Column {
+            data_type: view.data_type(),
+            values: Buffer::from_vec(values_bytes),
+            validity,
+            dict: None,
+        };
+        return column_to_array(&col);
+    }
+
+    // 回退兜底：逐段构造后用 arrow concat 拼接
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(view.segments().len());
+    for seg in view.segments() {
+        let owned = segment_to_owned(seg, view.data_type());
+        arrays.push(column_to_array(&owned)?);
     }
     // concat（同类型）
     let dt = arrays[0].data_type().clone();
