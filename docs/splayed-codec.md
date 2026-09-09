@@ -108,8 +108,8 @@ decode_chunk(encoding, compression, data_type,
 | core 场景 | codec 调用 |
 | --- | --- |
 | `compress_field_file` / compressed write handle 的 close 收尾 | 逐 chunk `encode_chunk` |
-| compressed Field 的 `read_field_handle` | 定位覆盖的 chunks → `decode_chunk` 物化到 working representation → 返回 view |
-| compressed Field 的 `scan_field_handle` | 逐 chunk 物化后求值 predicate（值过滤发生在解压后数据上） |
+| compressed Field 的 `read` | 定位覆盖的 chunks → `decode_chunk` 物化到 working representation → 返回 view |
+| compressed Field 的 `scan` | 逐 chunk 物化后求值 predicate（值过滤发生在解压后数据上） |
 | `decompress_field_file` | 全量 `decode_chunk` → 按 format §7 布局重写为 uncompressed |
 
 ## 8. 注意事项

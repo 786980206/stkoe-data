@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Splayed V2.1 纯对象式统一接口调用链 (Table > Dataset > Index > Field)</title>
+<style>
+  :root {
+    --bg: #090d16;
+    --card: #111827;
+    --border: #1f2937;
+    --text: #e5e7eb;
+    --text-dim: #9ca3af;
+    --table: #38bdf8;
+    --dataset: #818cf8;
+    --index: #34d399;
+    --field: #f472b6;
+    --action: #fb923c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+  body { background: var(--bg); color: var(--text); padding: 32px; font-size: 13px; line-height: 1.4; }
+
+  header { margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+  h1 { font-size: 20px; color: #fff; margin-bottom: 6px; }
+  .desc { color: var(--text-dim); font-size: 13px; margin-bottom: 8px; }
+  .legend { display: flex; gap: 20px; font-size: 12px; margin-top: 10px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; font-weight: bold; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; }
+
+  .flow-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
+  .flow-title { font-size: 15px; font-weight: bold; color: #fff; margin-bottom: 16px; border-bottom: 1px solid #1f2937; padding-bottom: 8px; }
+
+  .chain { display: flex; flex-direction: column; align-items: flex-start; gap: 0; margin-left: 20px; }
+  
+  .step { display: flex; align-items: center; gap: 12px; }
+  .fn { padding: 6px 14px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid; white-space: nowrap; }
+  .fn-table { background: rgba(56, 189, 248, 0.12); color: var(--table); border-color: var(--table); }
+  .fn-dataset { background: rgba(129, 140, 248, 0.12); color: var(--dataset); border-color: var(--dataset); }
+  .fn-index { background: rgba(52, 211, 153, 0.12); color: var(--index); border-color: var(--index); }
+  .fn-field { background: rgba(244, 114, 182, 0.12); color: var(--field); border-color: var(--field); }
+
+  .comment { color: var(--text-dim); font-size: 12px; }
+
+  .conn { display: flex; align-items: center; height: 32px; padding-left: 24px; position: relative; color: #6b7280; font-size: 12px; }
+  .conn::before { content: ""; position: absolute; left: 14px; top: 0; bottom: 0; width: 2px; background: #374151; }
+  .conn-arrow { margin-left: 12px; color: #9ca3af; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
+  .conn-arrow::before { content: "↓"; margin-right: 4px; color: #60a5fa; }
+
+  .branch { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 4px 28px; border-left: 2px dashed #4b5563; padding-left: 16px; }
+  .branch-item { display: flex; align-items: center; gap: 10px; }
+  .cond { background: #1f2937; color: #fbbf24; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Splayed V2.1 统一对象式接口调用链图谱</h1>
+  <div class="desc">四层纯对偶接口对齐：Table(Reader/Writer) &gt; Dataset(Reader/Writer) &gt; Index(Reader/Writer) &gt; Field(Reader/Writer)</div>
+  <div class="legend">
+    <span><span class="dot" style="background:var(--table)"></span>Table (Reader/Writer)</span>
+    <span><span class="dot" style="background:var(--dataset)"></span>Dataset (Reader/Writer)</span>
+    <span><span class="dot" style="background:var(--index)"></span>Index (Reader/Writer)</span>
+    <span><span class="dot" style="background:var(--field)"></span>Field (Reader/Writer)</span>
+  </div>
+</header>
+
+<!-- 1. 写入调用链 -->
+<div class="flow-box">
+  <div class="flow-title">1. 数据写入调用链 (.write)</div>
+  <div class="chain">
+    <div class="step">
+      <div class="fn fn-table">TableWriter.write(data)</div>
+      <div class="comment">// 获得 .lock 互斥锁，解析分区与行计划</div>
+    </div>
+    
+    <!-- 分区自愈分支 -->
+    <div class="branch">
+      <div class="branch-item">
+        <span class="cond">[新分区不存在]</span>
+        <span style="color:#6b7280">&rarr;</span>
+        <span class="fn fn-dataset">DatasetWriter.init(part_path, sub_data)</span>
+        <span class="comment">// 自动初始化新分区</span>
+      </div>
+      <div class="branch-item">
+        <span class="cond">[新列不存在]</span>
+        <span style="color:#6b7280">&rarr;</span>
+        <span class="fn fn-dataset">DatasetWriter.create_field(name, dt, init)</span>
+        <span class="comment">// 跨分区自愈建列 (未覆盖置NULL)</span>
+      </div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">按 max_parallelism 切分 P_part &times; P_field 并发调度</span></div>
+
+    <div class="step">
+      <div class="fn fn-dataset">DatasetWriter.write(offset, sliced_view)</div>
+      <div class="comment">// 校验行限，按列并发分发至各个 FieldWriter</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">逐列下推 (std::thread::scope)</span></div>
+
+    <div class="step">
+      <div class="fn fn-field">FieldWriter.write(offset, col_view)</div>
+      <div class="comment">// MmapMut 切片原地覆写 + copy_bits_into 批量更新 Validity 位</div>
+    </div>
+
+    <!-- 骨架展开分支 -->
+    <div class="branch">
+      <div class="branch-item">
+        <span class="cond">[若为 Header-Only 延迟骨架]</span>
+        <span style="color:#6b7280">&rarr;</span>
+        <span class="comment">自动触发物理空间就地展开并重新 MmapMut</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 2. 查询与扫描调用链 -->
+<div class="flow-box">
+  <div class="flow-title">2. 查询与扫描调用链 (.scan & .read)</div>
+  <div class="chain">
+    <div class="step">
+      <div class="fn fn-table">TableReader.scan(request)</div>
+      <div class="comment">// 分区目录名二分剪枝 (零 META I/O)，产出 TableScanner</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">TableScanner.next() [惰性迭代命中分区]</span></div>
+
+    <div class="step">
+      <div class="fn fn-dataset">DatasetReader.scan(request)</div>
+      <div class="comment">// 产出 DatasetScanner，协调索引定位与谓词计算</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">第一阶段: 索引定位</span></div>
+
+    <div class="step">
+      <div class="fn fn-index">IndexReader.scan(request)</div>
+      <div class="comment">// 12B SYM INDEX 二分 &rarr; TIME AXIS 二分 &rarr; 输出 [row_start, row_start + count)</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">第二阶段: 逐谓词求值 (Predicate Pushdown)</span></div>
+
+    <div class="step">
+      <div class="fn fn-field">FieldReader.scan(request)</div>
+      <div class="comment">// 向量化计算位图，与 Index 行区间求交集</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">第三阶段: 投影列提取 (Projection)</span></div>
+
+    <div class="step">
+      <div class="fn fn-field">FieldReader.read(offset, length)</div>
+      <div class="comment">// Zero-Copy 零拷贝：直接从 Mmap 虚拟内存切片返回 ColumnView</div>
+    </div>
+  </div>
+</div>
+
+<!-- 3. DDL 与结构操作调用链 -->
+<div class="flow-box">
+  <div class="flow-title">3. DDL 结构变更与自愈修复 (.init_field & .fix)</div>
+  <div class="chain">
+    <!-- 链路 A: init_field -->
+    <div class="step">
+      <div class="fn fn-table">TableWriter.init_field(name, dt)</div>
+      <div class="comment">// 仅在自然排序的最新分区新增单列结构 (免传 rows)</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">提取最新分区 latest_rows = dataset_reader.row_count()</span></div>
+
+    <div class="step">
+      <div class="fn fn-field">FieldWriter.init_empty(path, dt, latest_rows)</div>
+      <div class="comment">// 物理写入 64B Header-Only 延迟骨架 (磁盘数据页分配为 0)</div>
+    </div>
+
+    <div style="height: 16px;"></div>
+
+    <!-- 链路 B: fix -->
+    <div class="step">
+      <div class="fn fn-table">TableWriter.fix()</div>
+      <div class="comment">// 表存储完整性自愈入口</div>
+    </div>
+
+    <div class="conn"><span class="conn-arrow">自底向上清理分区空目录后，扫描历史独有字段 (prior - latest)</span></div>
+
+    <div class="branch">
+      <div class="branch-item">
+        <span class="cond">[发现缺失字段]</span>
+        <span style="color:#6b7280">&rarr;</span>
+        <span class="fn fn-field">FieldWriter.init_empty(latest_part_path, dt, latest_rows)</span>
+        <span class="comment">// 最新分区补齐全空骨架，恢复全表 Schema 一致</span>
+      </div>
+      <div class="branch-item">
+        <span class="cond">[字段已对齐]</span>
+        <span class="comment">// 刷新元数据，自愈完成</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 4. 对偶接口统一矩阵 -->
+<div class="flow-box">
+  <div class="flow-title">4. 四层纯对象式读写对称接口一览</div>
+  <table style="width:100%; border-collapse:collapse; font-size:12px;">
+    <thead>
+      <tr style="border-bottom:1px solid #374151; color:#9ca3af; text-align:left;">
+        <th style="padding:8px;">层级</th>
+        <th style="padding:8px;">只读对象 (*Reader)</th>
+        <th style="padding:8px;">可写对象 (*Writer)</th>
+        <th style="padding:8px;">核心统一定义接口</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr style="border-bottom:1px solid #1f2937;">
+        <td style="padding:8px; color:var(--table); font-weight:bold;">Table</td>
+        <td style="padding:8px;">TableReader</td>
+        <td style="padding:8px;">TableWriter</td>
+        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .init_field() / .fix()</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1f2937;">
+        <td style="padding:8px; color:var(--dataset); font-weight:bold;">Dataset</td>
+        <td style="padding:8px;">DatasetReader</td>
+        <td style="padding:8px;">DatasetWriter</td>
+        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .create_field() / .locate()</td>
+      </tr>
+      <tr style="border-bottom:1px solid #1f2937;">
+        <td style="padding:8px; color:var(--index); font-weight:bold;">Index</td>
+        <td style="padding:8px;">IndexReader</td>
+        <td style="padding:8px;">IndexWriter</td>
+        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .locate()</td>
+      </tr>
+      <tr>
+        <td style="padding:8px; color:var(--field); font-weight:bold;">Field</td>
+        <td style="padding:8px;">FieldReader</td>
+        <td style="padding:8px;">FieldWriter</td>
+        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .init_empty()</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+</body>
+</html>

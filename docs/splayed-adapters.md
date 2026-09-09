@@ -23,7 +23,7 @@ pub fn scan_polars(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>   // 入�
 
 ### 语义
 
-- `schema`：由 `read_table_schema()` 提供（最后 Partition，含 sym/time）。
+- `schema`：由 `table.schema()` 提供（最后 Partition，含 sym/time）。
 - 谓词：polars 传来的 `Expr` 谓词 **暂不下推**（行级由 polars 自己过滤）；
   sym/time 等值与范围条件在 v2.1 经 `TableScanRequest.sym/time` 下推（优化项）。
 - 投影：**暂不下推**（polars 0.45 匿名扫描的投影下推优化器存在 unwrap panic；
@@ -45,7 +45,7 @@ pub fn scan_polars(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>   // 入�
 
 ### 注意事项
 
-- DuckDB 的表函数签名需静态 schema → 打开时读 `read_table_schema()`。
+- DuckDB 的表函数签名需静态 schema → 打开时读 `table.schema()`。
 - Windows 下 DuckDB 扩展为独立 cdylib，不在 workspace members。
 
 ## 3. splayed-adbc（ADBC 驱动，DataFusion 执行）
@@ -59,7 +59,7 @@ pub fn scan_polars(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>   // 入�
 
 - 谓词/投影/limit 下推：DataFusion 优化器裁剪后映射到 `TableScanRequest`
   （predicate → `Predicate`，limit → 全局 limit）。
-- 统计：`read_table_statistics()` 上报（row_count 精确，min/max 精确）。
+- 统计：`table.statistics()` 上报（row_count 精确，min/max 精确）。
 - stats-agg 优化规则（MIN/MAX/COUNT 命中）：后续迭代（需 DataFusion rule 定制）。
 - refresh/reload 联动：`TableHandle` 重开语义。
 

@@ -309,3 +309,148 @@ fn arrow_empty_data_view_and_batch_roundtrip() {
     assert_eq!(arr.null_count(), 5);
     assert_eq!(arr.logical_null_count(), 5);
 }
+
+#[test]
+fn arrow_table_reader_writer_e2e() {
+    let dir = temp_dir("arrow_rw_e2e");
+    let root = dir.join("tbl");
+
+    // 1. 创建空表并用 TableArrowWriter 全量更新初始 RecordBatch
+    let writer = splayed_arrow::TableArrowWriter::create(&root, &arrow_schema_sample(), splayed_table::PartitionScheme::None, None, None).unwrap();
+    
+    // 构建初始 RecordBatch
+    let sample = sample_data();
+    let initial_batch = data_to_record_batch(&sample).unwrap();
+    writer.update(&initial_batch).unwrap();
+    assert_eq!(writer.statistics().unwrap().row_count, 4);
+
+    // 2. 通过 TableArrowReader 直接进行面向对象式流式读取
+    let reader = splayed_arrow::TableArrowReader::open(&root).unwrap();
+    let mut arrow_reader = reader.read(splayed_table::TableScanRequest::default(), Some(2)).unwrap();
+    let mut total_rows = 0;
+    while let Some(batch) = arrow_reader.next().unwrap() {
+        total_rows += batch.num_rows();
+        assert_eq!(batch.num_columns(), 3);
+    }
+    assert_eq!(total_rows, 4);
+    arrow_reader.close().unwrap();
+    reader.close().unwrap();
+
+    // 3. TableArrowWriter::remove
+    writer.remove().unwrap();
+    assert!(!root.exists());
+    cleanup(&dir);
+}
+
+#[test]
+fn arrow_table_reader_writer_full_lifecycle_and_ddl() {
+    let dir = temp_dir("arrow_full_lifecycle");
+    let root = dir.join("tbl");
+
+    // 1. TableArrowWriter::create 建立 Schema 骨架
+    let arrow_schema = arrow_schema_sample();
+    let writer = splayed_arrow::TableArrowWriter::create(&root, &arrow_schema, splayed_table::PartitionScheme::Month, None, None).unwrap();
+    assert_eq!(writer.statistics().unwrap().row_count, 0);
+
+    // 2. TableArrowWriter::update 写入初始数据
+    let sample = sample_data();
+    let batch = data_to_record_batch(&sample).unwrap();
+    writer.update(&batch).unwrap();
+    assert_eq!(writer.statistics().unwrap().row_count, 4);
+
+    // 3. TableArrowWriter 覆盖写 write（修改部分行）
+    writer.write(&batch).unwrap();
+    assert_eq!(writer.statistics().unwrap().row_count, 4);
+
+    // 4. TableArrowWriter::as_reader 转换为只读 TableArrowReader
+    let reader = writer.as_reader().unwrap();
+    let schema = reader.schema().unwrap();
+    assert_eq!(schema.fields().len(), 3);
+
+    // 5. TableArrowReader::scan 与 TableArrowReader::read_range 细粒度点查
+    let mut scanner = reader.scan(splayed_table::TableScanRequest::default()).unwrap();
+    let mut prr_opt = None;
+    while let Some(prr) = scanner.next().unwrap() {
+        prr_opt = Some(prr);
+        break;
+    }
+    scanner.close().unwrap();
+    
+    let prr = prr_opt.expect("should have at least one partition range");
+    let point_batch = reader.read_range(&prr, Some(&["price"])).unwrap();
+    // read_range 默认保留主键 (sym, time) + 投影列 "price"，共 3 列
+    assert_eq!(point_batch.num_columns(), 3);
+    assert!(point_batch.schema().fields().iter().any(|f| f.name() == "price"));
+    assert!(point_batch.num_rows() > 0);
+
+    // 6. DDL 操作：init_field, rename_field, delete_field
+    writer.init_field("volume", DataType::Int64, None).unwrap();
+    assert_eq!(writer.schema().unwrap().fields().len(), 4);
+
+    writer.rename_field("volume", "vol").unwrap();
+    assert!(writer.schema().unwrap().fields().iter().any(|f| f.name() == "vol"));
+
+    writer.delete_field("vol").unwrap();
+    assert_eq!(writer.schema().unwrap().fields().len(), 3);
+
+    // 7. 关闭与安全物理删除
+    reader.close().unwrap();
+    writer.remove().unwrap();
+    assert!(!root.exists());
+    cleanup(&dir);
+}
+
+#[test]
+fn arrow_table_writer_write_auto_creates_missing_columns() {
+    let dir = temp_dir("arrow_write_auto_columns");
+    let root = dir.join("tbl");
+
+    // 创建只包含 (sym, time) 的基础表
+    let base_schema = arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("sym", arrow_schema::DataType::Dictionary(Box::new(arrow_schema::DataType::Int32), Box::new(arrow_schema::DataType::Utf8)), true),
+        arrow_schema::Field::new("time", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+    ]);
+    let writer = splayed_arrow::TableArrowWriter::create(&root, &base_schema, splayed_table::PartitionScheme::None, None, None).unwrap();
+    
+    // 初始化：sample_data() 包含 (sym, time, price)
+    let sample = sample_data();
+    let initial_batch = data_to_record_batch(&sample).unwrap();
+    writer.update(&initial_batch).unwrap();
+    // 包含 sym, time, price 共 3 列
+    assert_eq!(writer.schema().unwrap().fields().len(), 3);
+
+    // 构建一个带新列 "factor.alpha" 的 RecordBatch
+    let mut fields = initial_batch.schema().fields().to_vec();
+    fields.push(std::sync::Arc::new(arrow_schema::Field::new("factor.alpha", arrow_schema::DataType::Float64, true)));
+    let new_schema = std::sync::Arc::new(arrow_schema::Schema::new(fields));
+
+    let mut cols = initial_batch.columns().to_vec();
+    let alpha_arr: std::sync::Arc<dyn arrow_array::Array> = std::sync::Arc::new(arrow_array::Float64Array::from(vec![1.5, 2.5, 3.5, 4.5]));
+    cols.push(alpha_arr);
+    let extended_batch = arrow_array::RecordBatch::try_new(new_schema, cols).unwrap();
+
+    // write 自动自愈补全缺失列并完成写入
+    writer.write(&extended_batch).unwrap();
+    assert_eq!(writer.schema().unwrap().fields().len(), 4);
+    assert!(writer.schema().unwrap().fields().iter().any(|f| f.name() == "factor.alpha"));
+
+    // 读回验证
+    let reader = writer.as_reader().unwrap();
+    let mut stream = reader.read(splayed_table::TableScanRequest::default(), None).unwrap();
+    let read_batch = stream.next().unwrap().unwrap();
+    assert_eq!(read_batch.num_columns(), 4);
+    assert_eq!(read_batch.num_rows(), 4);
+    stream.close().unwrap();
+    reader.close().unwrap();
+
+    writer.remove().unwrap();
+    cleanup(&dir);
+}
+
+fn arrow_schema_sample() -> arrow_schema::Schema {
+    arrow_schema::Schema::new(vec![
+        arrow_schema::Field::new("sym", arrow_schema::DataType::Dictionary(Box::new(arrow_schema::DataType::Int32), Box::new(arrow_schema::DataType::Utf8)), true),
+        arrow_schema::Field::new("time", arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None), true),
+        arrow_schema::Field::new("price", arrow_schema::DataType::Float64, true),
+    ])
+}

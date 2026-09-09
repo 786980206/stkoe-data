@@ -271,6 +271,118 @@ pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreE
     open_index(path)
 }
 
+/// 只读索引对象
+pub struct IndexReader {
+    inner: MetaHandle,
+}
+
+impl IndexReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = MetaHandle::open(path)?;
+        Ok(Self { inner })
+    }
+
+    pub fn read(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
+        self.inner.read(offset, length)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate(pairs)
+    }
+
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate_borrowed(pairs)
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.inner.schema()
+    }
+
+    pub fn info(&self) -> MetaInfo {
+        self.inner.info()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close()
+    }
+}
+
+/// 可写索引对象
+pub struct IndexWriter {
+    inner: MetaHandle,
+}
+
+impl IndexWriter {
+    pub fn create(path: &Path, time_type: TimeType) -> Result<Self, CoreError> {
+        create_index(path, time_type)?;
+        Self::open(path)
+    }
+
+    pub fn init(path: &Path, data: &DataView<'_>) -> Result<Self, CoreError> {
+        init_index(path, data)?;
+        Self::open(path)
+    }
+
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = MetaHandle::open(path)?;
+        Ok(Self { inner })
+    }
+
+    pub fn read(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
+        self.inner.read(offset, length)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate(pairs)
+    }
+
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate_borrowed(pairs)
+    }
+
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.inner.update(data)
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.inner.schema()
+    }
+
+    pub fn info(&self) -> MetaInfo {
+        self.inner.info()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn as_reader(&self) -> Result<IndexReader, CoreError> {
+        IndexReader::open(self.inner.path())
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close()
+    }
+
+    pub fn remove(self) -> Result<(), CoreError> {
+        let path = self.inner.path().to_path_buf();
+        self.close()?;
+        delete_meta_file(&path)
+    }
+}
+
 /// 打开已存在的主索引文件。
 #[inline]
 pub fn open_index(path: &Path) -> Result<IndexHandle, CoreError> {
@@ -466,23 +578,58 @@ impl MetaHandle {
     }
 
     #[inline]
-    pub fn read_index(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
+    pub fn read(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
         self.read_index_handle(offset, length)
     }
 
     #[inline]
-    pub fn scan_index(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
+    pub fn scan(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
         self.scan_index_handle(request)
     }
 
     #[inline]
-    pub fn locate_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.update_index(data)
+    }
+
+    #[inline]
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
         self.locate_index_handle(pairs)
     }
 
     #[inline]
-    pub fn locate_index_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
         self.locate_index_generic(pairs)
+    }
+
+    #[inline]
+    pub fn schema(&self) -> Schema {
+        self.read_index_schema()
+    }
+
+    #[inline]
+    pub fn info(&self) -> MetaInfo {
+        self.read_meta_handle()
+    }
+
+    #[inline]
+    pub fn read_index(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError> {
+        self.read(offset, length)
+    }
+
+    #[inline]
+    pub fn scan_index(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError> {
+        self.scan(request)
+    }
+
+    #[inline]
+    pub fn locate_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate(pairs)
+    }
+
+    #[inline]
+    pub fn locate_index_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_borrowed(pairs)
     }
 
     pub fn read_index_schema(&self) -> Schema {

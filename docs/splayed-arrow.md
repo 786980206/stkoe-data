@@ -49,7 +49,7 @@ Polars 适配层自带 arrowconv，不经此 crate。
 
 > 本版为正确性优先；上表拷贝点均为 `docs/splayed-core.md` §9 记录的已知优化项。
 
-## 5. API 设计（三层）
+## 5. API 设计（三层 + 原生对象）
 
 ### Layer 1：Array 转换（单列）
 
@@ -66,29 +66,98 @@ pub fn data_view_to_record_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch>
 pub fn record_batch_to_data(batch: &RecordBatch) -> Result<Data>                 // Arrow → core（create / write 路径）
 ```
 
-### Layer 3：Table 流式适配
+### Layer 3：TableArrowReader 与 TableArrowWriter（Arrow 原生对象，与 Table 层对称）
 
 ```rust
-pub fn read_table_as_arrow<'t>(table: &'t TableHandle, scanner: TableScanner<'t>,
-    batch_size: Option<usize>) -> TableArrowReader<'t>
+// 1. Arrow 原生只读表对象
+pub struct TableArrowReader {
+    inner: splayed_table::TableReader,
+}
 
-pub struct TableArrowReader<'t> { /* inner: TableReader<'t> */ }
-impl<'t> TableArrowReader<'t> {
-    pub fn next(&mut self) -> Result<Option<RecordBatch>>   // 逐批流式，不物化整个结果集
-    pub fn close(self) -> Result<()>
+impl TableArrowReader {
+    pub fn open(path: &Path) -> Result<Self>;
+    pub fn open_with_options(path: &Path, options: TableOptions) -> Result<Self>;
+
+    pub fn scan(&self, request: TableScanRequest) -> Result<TableScanner<'_>>;
+    pub fn read<'t>(&'t self, request: TableScanRequest, batch_size: Option<usize>) -> Result<TableArrowBatchReader<'t>>;
+    pub fn read_range(&self, range: &PartitionRowRange, projection: Option<&[&str]>) -> Result<RecordBatch>;
+
+    pub fn schema(&self) -> Result<Arc<ArrowSchema>>;
+    pub fn metadata(&self) -> Result<TableMetadata>;
+    pub fn statistics(&self) -> Result<TableStatistics>;
+    pub fn path(&self) -> &Path;
+    pub fn scheme(&self) -> PartitionScheme;
+    pub fn close(self) -> Result<()>;
+}
+
+// 2. 流式批次读取器
+pub struct TableArrowBatchReader<'t> {
+    inner: TableBatchReader<'t>,
+}
+
+impl<'t> TableArrowBatchReader<'t> {
+    pub fn next(&mut self) -> Result<Option<RecordBatch>>;   // 逐批流式 RecordBatch
+    pub fn close(self) -> Result<()>;
+}
+
+// 3. Arrow 原生可写表对象
+pub struct TableArrowWriter {
+    inner: splayed_table::TableWriter,
+}
+
+impl TableArrowWriter {
+    pub fn create(
+        path: &Path,
+        arrow_schema: &ArrowSchema,
+        scheme: PartitionScheme,
+        initial_partition: Option<&str>,
+        options: Option<TableOptions>,
+    ) -> Result<Self>;
+
+    pub fn init(
+        path: &Path,
+        scheme: PartitionScheme,
+        batch: &RecordBatch,
+        options: Option<TableOptions>,
+    ) -> Result<Self>;
+
+    pub fn open(path: &Path) -> Result<Self>;
+    pub fn open_with_options(path: &Path, options: TableOptions) -> Result<Self>;
+
+    pub fn write(&self, batch: &RecordBatch) -> Result<()>;
+    pub fn update(&self, batch: &RecordBatch) -> Result<()>;
+
+    pub fn delete_partition(&self, partition_name: &str) -> Result<()>;
+
+    pub fn init_field(&self, field_name: &str, data_type: DataType, opts: Option<CreateFieldOptions>) -> Result<()>;
+    pub fn delete_field(&self, field: &str) -> Result<()>;
+    pub fn rename_field(&self, field: &str, new_name: &str) -> Result<()>;
+    pub fn cast_field(&self, field: &str, target_type: DataType) -> Result<()>;
+    pub fn compress_field(&self, field: &str) -> Result<()>;
+    pub fn decompress_field(&self, field: &str) -> Result<()>;
+    pub fn fix(&self) -> Result<()>;
+
+    pub fn as_reader(&self) -> Result<TableArrowReader>;
+    pub fn schema(&self) -> Result<Arc<ArrowSchema>>;
+    pub fn metadata(&self) -> Result<TableMetadata>;
+    pub fn statistics(&self) -> Result<TableStatistics>;
+    pub fn path(&self) -> &Path;
+    pub fn scheme(&self) -> PartitionScheme;
+    pub fn close(self) -> Result<()>;
+    pub fn remove(self) -> Result<()>;
 }
 ```
 
 职责与约束：
 
-- **调用链**：`TableScanRequest → scan_table → TableScanner → read_table_as_arrow
-  → TableArrowReader → next() → RecordBatch`。Arrow 层直接接收 `TableScanner`
-  （而非 `TableScanRequest`）——**查询语义（裁剪 / 谓词 / limit）归 Table 层**，
-  Arrow 层不重新 scan、不做 pruning。
-- **流式**：`TableArrowReader` 逐批输出；构造无 I/O，Dataset 打开 / META 错误延迟
+- **端到端纯对象调用链**：
+  - 读取：`TableArrowReader::open → reader.read(req, batch_size) → TableArrowBatchReader → next() → RecordBatch`；
+  - 细粒度点查：`TableArrowReader::open → reader.read_range(&prr, proj) → RecordBatch`；
+  - 写入/更新：`TableArrowWriter::create / init → writer.write(&batch) / writer.update(&batch)`；
+  - 查询语义归 Table 层，Arrow 层不重新做裁剪或谓词计算，专注于流式批次转换与零开销交互。
+- **流式**：`TableArrowBatchReader` 逐批输出；构造无 I/O，Dataset 打开 / META 错误延迟
   到 `next()`；1 TB 级结果不物化 `Vec<RecordBatch>`。
-- `data_view_to_record_batch`：多段合并按行序拼接（发生一次合并拷贝，见 §4）；
-  所有列行数必须一致（继承 DataView 校验）；**不物化为 `Data`**（否则引入多余拷贝）。
+- `data_view_to_record_batch`：多段合并按行序拼接；所有列行数必须一致（继承 DataView 校验）；**不物化为 `Data`**（否则引入多余拷贝）。
 - `record_batch_to_data`：无 sym/time 约束（由 create/write 调用方校验）；
   Arrow nullable → validity bitmap；`Dictionary(Int32, Utf8)` → V2 字典表示
   （keys + DictBuffers，天然映射，不展开为普通字符串）；字典键位宽校验。

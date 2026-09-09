@@ -75,7 +75,7 @@
 | R6 | 100M | 50 | ZSTD-3 | 1 列 | 0.01% | 0.01% | 极高选择性 |
 
 - 选择性定义：Sym Sel. = 选中 symbol 数 / 1000；Time Sel. = 选中时间跨度 / 总跨度。
-- 过滤实现：`symbol IN (…)` = Or(Eq) 组合（Splayed 经 META `scan_index_handle`
+- 过滤实现：`symbol IN (…)` = Or(Eq) 组合（Splayed 经 META 索引扫描 `scan`
   sym 过滤 union 下推）；`time BETWEEN lo AND hi` = 时间范围（Splayed 经分区裁剪 +
   META time 窗口下推）。Parquet 侧逐批行级过滤对照。
 - Symbol 1% = 1000 中固定种子随机取 10 个；Time 1% = 总跨度 1% 连续区间。

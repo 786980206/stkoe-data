@@ -31,27 +31,33 @@
 
 ---
 
-## 二、 完整四层 API 对照矩阵
+## 二、 完整四层面向对象 API 对照矩阵
 
 | 业务分类 | Table 表级 (`splayed-table`) | Dataset 分区级 (`splayed-core`) | Index 网格级 (`splayed-core`) | Field 字段级 (`splayed-core`) |
 | :--- | :--- | :--- | :--- | :--- |
-| **创建骨架** | `create_table(path, schema, partition_scheme, initial_partition, options)` | `create_dataset(path, schema)` | `create_index(path, time_type)` | `create_field(path, field_type)` |
-| **初始化数据**| `init_table(path, partition_scheme, dataview, options)` | `init_dataset(path, dataview, options)` | `init_index(path, dataview)` | `init_field(path, columnview, options)` |
-| **打开句柄** | `open_table(path, mode, options)` | `open_dataset(path, mode)` | `open_index(path)` | `open_field(path, mode)` |
-| **关闭句柄** | `close_table(handle)` | `close_dataset(handle)` | `close_index(handle)` | `close_field(handle)` |
-| **销毁删除** | `drop_table(handle)` | `drop_dataset(handle)` | `drop_index(handle)` | `drop_field(handle)` |
-| **结构查询** | `read_table_schema(table)` | `read_dataset_schema(path / handle)` | `read_index_schema(path / handle)` | `read_field_schema(path / handle)` |
-| **新增字段** | `create_table_field(table, name, type)` | `create_dataset_field(ds, name, type)`| — | — |
-| **删除字段** | `delete_table_field(table, name)` | `delete_dataset_field(ds, name)` | — | `delete_field_file(path)` |
-| **重命名字段**| `rename_table_field(table, old, new)` | `rename_dataset_field(ds, old, new)`| — | `rename_field(path, new_name)` |
-| **类型转换** | `cast_table_field(table, name, type)` | `cast_dataset_field(ds, name, type)` | — | `cast_field(path, type)` |
-| **压缩管理** | `compress_table_field` / `decompress` | `compress_dataset_field` / `decompress` | — | `compress_field` / `decompress` |
-| **条件扫描** | `scan_table(table, request)` | `scan_dataset(ds, request)` | `scan_index(index, request)` | `scan_field(field, request)` |
-| **范围读取** | `read_table(table, scanner, batch_size)`| `read_dataset(ds, offset, len, cols)`| `read_index(index, offset, len)` | `read_field(field, offset, len)` |
-| **位置覆盖写**| `write_table(table, dataview)` | `write_dataset(ds, offset, dataview)`| — | `write_field(field, offset, colview)` |
-| **全量替换更新**| `update_table(table, dataview)` | `update_dataset(ds, dataview)` | `update_index(index, dataview)` | `update_field(field, columnview)` |
-| **分区数据删除**| `delete_partition(table, partition)` | — | — | — |
-| **重命名对象**| `rename_table(path, new_name)` | `rename_dataset(path, new_name)`| — | — |
+| **只读对象** | `TableReader` | `DatasetReader` | `IndexReader` | `FieldReader` |
+| **可写对象** | `TableWriter` | `DatasetWriter` | `IndexWriter` | `FieldWriter` |
+| **创建骨架** | `TableWriter::create(...)` | `DatasetWriter::create(...)` | `IndexWriter::create(...)` | `FieldWriter::create(...)` |
+| **初始化数据**| `TableWriter::init(...)` | `DatasetWriter::init(...)` | `IndexWriter::init(...)` | `FieldWriter::init(...)` |
+| **打开只读** | `TableReader::open(...)` | `DatasetReader::open(...)` | `IndexReader::open(...)` | `FieldReader::open(...)` |
+| **打开可写** | `TableWriter::open(...)` | `DatasetWriter::open(...)` | `IndexWriter::open(...)` | `FieldWriter::open(...)` |
+| **关闭对象** | `reader.close()`, `writer.close()` | `reader.close()`, `writer.close()` | `reader.close()`, `writer.close()` | `reader.close()`, `writer.close()` |
+| **物理销毁** | `writer.remove()` | `writer.remove()` | `writer.remove()` | `writer.remove()` |
+| **结构查询** | `reader.schema()` / `writer.schema()` | `reader.schema()` / `writer.schema()` | `reader.schema()` / `writer.schema()` | `reader.schema()` / `writer.schema()` |
+| **新增字段** | `writer.init_field(...)` | `writer.create_field(...)` | — | — |
+| **删除字段** | `writer.delete_field(...)` | `writer.delete_field(...)` | — | — |
+| **重命名字段**| `writer.rename_field(...)` | `writer.rename_field(...)` | — | `writer.rename(...)` |
+| **类型转换** | `writer.cast_field(...)` | `writer.cast_field(...)` | — | `writer.cast(...)` |
+| **压缩管理** | `writer.compress_field` / `decompress` | `writer.compress_field` / `decompress` | — | `writer.compress` / `decompress` |
+| **条件扫描** | `reader.scan(request)` | `reader.scan(request)` | `reader.scan(request)` | `reader.scan(request)` |
+| **扫描转流** | `scanner.into_reader(batch_size)` | — | — | — |
+| **范围读取** | `reader.read(request, batch_size)` | `reader.read(offset, len, cols)` | `reader.read(offset, len)` | `reader.read(offset, len)` |
+| **单范围点读**| `reader.read_range(range, proj)` | — | — | — |
+| **主键批量定位**| — | `reader.locate(pairs)` | `reader.locate(pairs)` | — |
+| **位置覆盖写**| `writer.write(dataview)` | `writer.write(offset, dataview)` | — | `writer.write(offset, colview)` |
+| **全量替换更新**| `writer.update(dataview)` | `writer.update(dataview)` | `writer.update(dataview)` | `writer.update(colview)` |
+| **写入数据（自动建列）** | `writer.write(dataview)` | — | — | — |
+| **分区管理** | `writer.delete_partition` | — | — | — |
 
 ---
 
@@ -60,173 +66,192 @@
 ### 3.1 字段层：`Field` API (`splayed-core::field_file`)
 
 ```rust
-// 1. 创建与初始化
-/// 创建仅包含 64 字节文件头的空字段文件（row_count = 0, null_count = 0, data_length = 0）。
-pub fn create_field(path: &Path, field_type: DataType) -> Result<(), CoreError>;
+// 1. 只读字段对象
+pub struct FieldReader { ... }
 
-/// 连带数据直接初始化创建字段文件（带数据一步直写，全 NULL 产出 64B Header-Only 文件）。
-pub fn init_field(
-    path: &Path,
-    column: &ColumnView<'_>,
-    options: Option<CreateFieldOptions>,
-) -> Result<(), CoreError>;
+impl FieldReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+    pub fn read(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError>;
+    pub fn scan(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError>;
+    pub fn schema(&self) -> FieldSchema;
+    pub fn row_count(&self) -> u64;
+    pub fn close(self) -> Result<(), CoreError>;
+}
 
-// 2. 生命周期与句柄操作
-pub fn open_field(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError>;
-pub fn close_field(handle: FieldHandle) -> Result<(), CoreError>;
-pub fn drop_field(path: &Path) -> Result<(), CoreError>;
-pub fn drop_field_handle(handle: FieldHandle) -> Result<(), CoreError>;
+// 2. 可写字段对象
+pub struct FieldWriter { ... }
 
-// 3. 元数据与物理转换（基于物理路径，规避 Mmap 共享冲突与陈旧句柄）
-pub fn read_field_schema(path: &Path) -> Result<FieldSchema, CoreError>;
-pub fn rename_field(path: &Path, new_name: &str) -> Result<(), CoreError>;
-pub fn cast_field(path: &Path, target_type: DataType) -> Result<(), CoreError>;
-pub fn compress_field(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError>;
-pub fn decompress_field(path: &Path) -> Result<(), CoreError>;
+impl FieldWriter {
+    pub fn create(path: &Path, field_type: DataType) -> Result<Self, CoreError>;
+    pub fn init(path: &Path, data: &ColumnView<'_>, options: Option<CreateFieldOptions>) -> Result<Self, CoreError>;
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
 
-// 4. FieldHandle 方法
-impl FieldHandle {
-    pub fn read_field_schema(&self) -> FieldSchema;
-    pub fn read_field(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError>;
-    pub fn write_field(&mut self, offset: u64, data: &ColumnView<'_>) -> Result<(), CoreError>;
-    pub fn update_field(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError>;
-    pub fn scan_field(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError>;
+    pub fn write(&mut self, offset: u64, data: &ColumnView<'_>) -> Result<(), CoreError>;
+    pub fn update(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError>;
+    pub fn rename(&mut self, new_name: &str) -> Result<(), CoreError>;
+    pub fn cast(&mut self, target_type: DataType) -> Result<(), CoreError>;
+    pub fn compress(&mut self) -> Result<(), CoreError>;
+    pub fn decompress(&mut self) -> Result<(), CoreError>;
+    pub fn update_header(&mut self, header: FieldHeader) -> Result<(), CoreError>;
+
+    pub fn schema(&self) -> FieldSchema;
+    pub fn as_reader(&self) -> Result<FieldReader, CoreError>;
+    pub fn close(self) -> Result<(), CoreError>;
+    pub fn remove(self) -> Result<(), CoreError>;
 }
 ```
 
-### 3.2 索引层：`Index` API (`splayed-core::index`)
+### 3.2 索引层：`Index` API (`splayed-core::meta_file`)
 
 ```rust
-pub struct IndexHandle {
-    path: PathBuf,
-    mmap: memmap2::Mmap,
-    header: MetaHeader,
+// 1. 只读索引对象
+pub struct IndexReader { ... }
+
+impl IndexReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+    pub fn read(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError>;
+    pub fn scan(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError>;
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>;
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError>;
+    pub fn schema(&self) -> Schema;
+    pub fn info(&self) -> MetaInfo;
+    pub fn close(self) -> Result<(), CoreError>;
 }
 
-// 1. 自由函数
-pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, CoreError>;
-pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreError>;
-pub fn open_index(path: &Path) -> Result<IndexHandle, CoreError>;
-pub fn close_index(handle: IndexHandle) -> Result<(), CoreError>;
-pub fn drop_index(handle: IndexHandle) -> Result<(), CoreError>;
+// 2. 可写索引对象
+pub struct IndexWriter { ... }
 
-// 2. IndexHandle 方法
-impl IndexHandle {
-    pub fn path(&self) -> &Path;
-    pub fn read_index_schema(&self) -> Schema;
-    pub fn read_index(&self, offset: u64, length: u64) -> Result<DataView<'_>, CoreError>;
-    pub fn scan_index(&self, request: &ScanRequest) -> Result<IndexScanner, CoreError>;
-    pub fn update_index(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
-    pub fn locate_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>;
+impl IndexWriter {
+    pub fn create(path: &Path, time_type: TimeType) -> Result<Self, CoreError>;
+    pub fn init(path: &Path, data: &DataView<'_>) -> Result<Self, CoreError>;
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn schema(&self) -> Schema;
+    pub fn as_reader(&self) -> Result<IndexReader, CoreError>;
+    pub fn close(self) -> Result<(), CoreError>;
+    pub fn remove(self) -> Result<(), CoreError>;
 }
 ```
 
 ### 3.3 数据集层：`Dataset` API (`splayed-core::dataset`)
 
 ```rust
-// 1. 自由函数
-pub fn create_dataset(path: &Path, schema: &Schema) -> Result<DatasetHandle, CoreError>;
-pub fn init_dataset(
-    path: &Path,
-    data: &DataView<'_>,
-    options: Option<CreateDatasetOptions>,
-) -> Result<DatasetHandle, CoreError>;
-pub fn open_dataset(path: &Path, mode: Mode) -> Result<DatasetHandle, CoreError>;
-pub fn close_dataset(handle: DatasetHandle) -> Result<(), CoreError>;
-pub fn drop_dataset(handle: DatasetHandle) -> Result<(), CoreError>;
-pub fn read_dataset_schema(path: &Path) -> Result<Schema, CoreError>;
+// 1. 只读数据集对象
+pub struct DatasetReader { ... }
 
-// 2. DatasetHandle 方法
-impl DatasetHandle {
-    pub fn read_dataset_schema(&self) -> &Schema;
-    pub fn create_dataset_field(&mut self, name: &str, field_type: DataType) -> Result<(), CoreError>;
-    pub fn delete_dataset_field(&mut self, name: &str) -> Result<(), CoreError>;
-    pub fn rename_dataset_field(&mut self, old_name: &str, new_name: &str) -> Result<(), CoreError>;
-    pub fn cast_dataset_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError>;
-    pub fn compress_dataset_field(&mut self, name: &str) -> Result<(), CoreError>;
-    pub fn decompress_dataset_field(&mut self, name: &str) -> Result<(), CoreError>;
-
-    pub fn read_dataset(
-        &self,
-        offset: u64,
-        length: u64,
-        columns: Option<&[&str]>,
-    ) -> Result<DataView<'_>, CoreError>;
-    pub fn write_dataset(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError>;
-    pub fn update_dataset(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
-    pub fn scan_dataset(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError>;
+impl DatasetReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+    pub fn read(&self, offset: u64, length: u64, projection: Option<&[&str]>) -> Result<DataView<'_>, CoreError>;
+    pub fn scan(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError>;
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError>;
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError>;
+    pub fn schema(&self) -> Schema;
+    pub fn statistics(&self) -> Result<DatasetStatistics, CoreError>;
     pub fn max_parallelism(&self) -> usize;
     pub fn set_max_parallelism(&self, max_parallelism: usize);
+    pub fn close(self) -> Result<(), CoreError>;
+}
+
+// 2. 可写数据集对象
+pub struct DatasetWriter { ... }
+
+impl DatasetWriter {
+    pub fn create(path: &Path, schema: &Schema) -> Result<Self, CoreError>;
+    pub fn init(path: &Path, data: &DataView<'_>, options: Option<CreateDatasetOptions>) -> Result<Self, CoreError>;
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+
+    pub fn write(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
+
+    pub fn create_field(&mut self, name: &str, data_type: DataType, init: DatasetFieldInit, options: CreateFieldOptions) -> Result<(), CoreError>;
+    pub fn delete_field(&mut self, name: &str) -> Result<(), CoreError>;
+    pub fn rename_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError>;
+    pub fn cast_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError>;
+    pub fn compress_field(&mut self, name: &str) -> Result<(), CoreError>;
+    pub fn decompress_field(&mut self, name: &str) -> Result<(), CoreError>;
+    pub fn update_field(&self, name: &str, header: &FieldHeader) -> Result<(), CoreError>;
+
+    pub fn schema(&self) -> Schema;
+    pub fn statistics(&self) -> Result<DatasetStatistics, CoreError>;
+    pub fn as_reader(&self) -> Result<DatasetReader, CoreError>;
+    pub fn close(self) -> Result<(), CoreError>;
+    pub fn remove(self) -> Result<(), CoreError>;
 }
 ```
 
 ### 3.4 表层：`Table` API (`splayed-table`)
 
 ```rust
-// 1. 自由函数
-pub fn create_table(
-    path: &Path,
-    schema: &Schema,
-    partition_scheme: PartitionScheme,
-    initial_partition: Option<&str>,
-    options: Option<TableOptions>,
-) -> Result<TableHandle, CoreError>;
+// 1. 只读表对象
+pub struct TableReader { ... }
 
-pub fn init_table(
-    path: &Path,
-    partition_scheme: PartitionScheme,
-    data: &DataView<'_>,
-    options: Option<TableOptions>,
-) -> Result<TableHandle, CoreError>;
+impl TableReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+    pub fn open_with_options(path: &Path, options: TableOptions) -> Result<Self, CoreError>;
 
-pub fn open_table(
-    path: &Path,
-    mode: Mode,
-    options: Option<TableOptions>,
-) -> Result<TableHandle, CoreError>;
+    pub fn scan(&self, request: TableScanRequest) -> Result<TableScanner<'_>, CoreError>;
+    pub fn read<'t>(&'t self, request: TableScanRequest, batch_size: Option<usize>) -> Result<TableBatchReader<'t>, CoreError>;
+    pub fn read_range(&self, range: &PartitionRowRange, projection: Option<&[&str]>) -> Result<DataView<'_>, CoreError>;
 
-pub fn close_table(handle: TableHandle) -> Result<(), CoreError>;
-pub fn drop_table(handle: TableHandle) -> Result<(), CoreError>;
-pub fn rename_table(path: &Path, new_name: &str) -> Result<(), CoreError>;
-
-pub fn scan_table<'t>(
-    table: &'t TableHandle,
-    request: &TableScanRequest,
-) -> Result<TableScanner<'t>, CoreError>;
-
-pub fn read_table<'t>(
-    table: &'t TableHandle,
-    scanner: TableScanner<'t>,
-    batch_size: Option<usize>,
-) -> Result<TableReader<'t>, CoreError>;
-
-pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>;
-pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>;
-
-// 2. 流式表写入器（Out-of-Core Streaming Ingestion）
-pub struct TableStreamWriter { ... }
-impl TableStreamWriter {
-    pub fn new(path: &Path, scheme: PartitionScheme, options: Option<TableOptions>) -> Result<Self, CoreError>;
-    pub fn write_partition(&mut self, partition_name: &str, data: &DataView<'_>) -> Result<(), CoreError>;
-    pub fn write_batch(&mut self, batch: &DataView<'_>) -> Result<(), CoreError>;
-    pub fn finish(self) -> Result<TableHandle, CoreError>;
-}
-
-// 3. TableHandle 方法
-impl TableHandle {
-    pub fn read_table_schema(&self) -> Result<Schema, CoreError>;
-    pub fn create_partition(&self, partition_name: &str, data: &DataView<'_>, options: Option<CreateDatasetOptions>) -> Result<(), CoreError>;
-    pub fn create_table_field(&self, name: &str, field_type: DataType) -> Result<(), CoreError>;
-    pub fn delete_table_field(&self, name: &str) -> Result<(), CoreError>;
-    pub fn rename_table_field(&self, old_name: &str, new_name: &str) -> Result<(), CoreError>;
-    pub fn cast_table_field(&self, name: &str, target_type: DataType) -> Result<(), CoreError>;
-    pub fn compress_table_field(&self, name: &str) -> Result<(), CoreError>;
-    pub fn decompress_table_field(&self, name: &str) -> Result<(), CoreError>;
-    pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError>;
+    pub fn schema(&self) -> Result<Schema, CoreError>;
+    pub fn metadata(&self) -> Result<TableMetadata, CoreError>;
+    pub fn statistics(&self) -> Result<TableStatistics, CoreError>;
     pub fn max_parallelism(&self) -> usize;
     pub fn set_max_parallelism(&mut self, max_parallelism: usize);
+    pub fn close(self) -> Result<(), CoreError>;
 }
-```
+
+// 2. 扫描器与流式批次转换
+pub struct TableScanner<'t> { ... }
+impl<'t> TableScanner<'t> {
+    pub fn next(&mut self) -> Result<Option<PartitionRowRange>, CoreError>;
+    pub fn into_reader(self, batch_size: Option<usize>) -> TableBatchReader<'t>;
+    pub fn close(self) -> Result<(), CoreError>;
+}
+
+// 3. 可写表对象（统一支持单分区/跨分区流式批次写与 DDL）
+pub struct TableWriter { ... }
+
+impl TableWriter {
+    pub fn create(
+        path: &Path,
+        schema: &Schema,
+        scheme: PartitionScheme,
+        initial_partition: Option<&str>,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError>;
+
+    pub fn init(
+        path: &Path,
+        scheme: PartitionScheme,
+        data: &DataView<'_>,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError>;
+
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+    pub fn open_with_options(path: &Path, options: TableOptions) -> Result<Self, CoreError>;
+
+    pub fn write(&self, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn update(&self, data: &DataView<'_>) -> Result<(), CoreError>;
+
+    pub fn delete_partition(&self, partition_name: &str) -> Result<(), CoreError>;
+
+    pub fn init_field(&self, field: &str, data_type: DataType, init: TableFieldInit) -> Result<(), CoreError>;
+    pub fn delete_field(&self, field: &str) -> Result<(), CoreError>;
+    pub fn rename_field(&self, field: &str, new_name: &str) -> Result<(), CoreError>;
+    pub fn cast_field(&self, field: &str, target_type: DataType) -> Result<(), CoreError>;
+    pub fn compress_field(&self, field: &str) -> Result<(), CoreError>;
+    pub fn decompress_field(&self, field: &str) -> Result<(), CoreError>;
+    pub fn update_field(&self, field: &str, header: &FieldHeader) -> Result<(), CoreError>;
+
+    pub fn as_reader(&self) -> Result<TableReader, CoreError>;
+    pub fn schema(&self) -> Result<Schema, CoreError>;
+    pub fn metadata(&self) -> Result<TableMetadata, CoreError>;
+    pub fn statistics(&self) -> Result<TableStatistics, CoreError>;
+    pub fn close(self) -> Result<(), CoreError>;
+    pub fn remove(self) -> Result<(), CoreError>;
+}
 
 ---
 
@@ -246,7 +271,7 @@ impl TableHandle {
   - 在 `splayed-format` 中提供共享零页与全 0 位图构造器：
     `ColumnSegment::new_virtual_null(data_type, rows)`。
   - 内部 `values` 引用全局只读零页 `STATIC_ZERO_BUFFER`（无需堆分配）；`validity` 构造全 0 `BitmapView`。
-  - 当 `read_dataset` 发现请求列在当前物理磁盘上不存在时，直接生成虚拟 NULL 段，耗时 $<10\text{ns}$，不产生磁盘 I/O。
+  - 当 Dataset/Field 的 `read` 发现请求列在当前物理磁盘上不存在时，直接生成虚拟 NULL 段，耗时 $<10\text{ns}$，不产生磁盘 I/O。
 
 ### 4.3 写入与更新时缺失列自愈补建（Auto-Creation）
 - **流水线**：
@@ -279,10 +304,10 @@ impl TableHandle {
 ┌─────────────────────────────────────────────────────────────┐
 │ 阶段二：Dataset 增强（Dot 多级目录 + 缺失列补 NULL）        │
 │ • 升级 field_path 支持 "a.b.c" 路径映射                      │
-│ • read_dataset_schema 递归 DFS 发现并还原嵌套字段           │
+│ • schema (read_dataset_schema) 递归 DFS 发现并还原嵌套字段   │
 │ • create_dataset 骨架构建与 init_dataset 带数据构建         │
-│ • read_dataset 缺列自动补 NULL 虚拟列                       │
-│ • write_dataset 缺列自愈建列与 update_dataset 全量替换      │
+│ • read (read_dataset) 缺列自动补 NULL 虚拟列                │
+│ • write (write_dataset) 缺列自愈建列与 update 全量替换      │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼

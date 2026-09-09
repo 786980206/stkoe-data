@@ -108,7 +108,7 @@ fn create_length_gives_all_null_field() {
 
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(handle.row_count(), 10);
-    let view = handle.read_field_handle(0, 10).unwrap();
+    let view = handle.read(0, 10).unwrap();
     assert_eq!(view.null_count(), 10);
     assert!(view.string_at(0).is_none());
     close_field_handle(handle).unwrap();
@@ -126,13 +126,13 @@ fn data_init_and_positional_overwrite() {
     create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, None)), splayed_core::CreateFieldOptions::default()).unwrap();
 
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
-    let view = handle.read_field_handle(0, 8).unwrap();
+    let view = handle.read(0, 8).unwrap();
     assert_eq!(view_values(&view), values);
 
     // 覆盖写 [2, 5)
     let patch = f64_column(&[100.0, 200.0, 300.0], None);
-    handle.write_field_handle(2, &patch.as_view()).unwrap();
-    let view = handle.read_field_handle(0, 8).unwrap();
+    handle.write(2, &patch.as_view()).unwrap();
+    let view = handle.read(0, 8).unwrap();
     let got = view_values(&view);
     assert_eq!(&got[2..5], &[100.0, 200.0, 300.0]);
     assert_eq!(got[0], 0.0);
@@ -140,7 +140,7 @@ fn data_init_and_positional_overwrite() {
 
     // 重开验证已落盘
     let handle = open_field_file(&path, Mode::Read).unwrap();
-    assert_eq!(view_values(&handle.read_field_handle(0, 8).unwrap())[3], 200.0);
+    assert_eq!(view_values(&handle.read(0, 8).unwrap())[3], 200.0);
     close_field_handle(handle).unwrap();
     cleanup(&dir);
 }
@@ -162,7 +162,7 @@ fn write_validity_batch_and_null_count_delta() {
 
     // 覆盖 [4, 8)：全有效段 → 批量置 1 路径（行 4,6 由 NULL 变有效）
     let patch = f64_column(&[100.0, 101.0, 102.0, 103.0], None);
-    handle.write_field_handle(4, &patch.as_view()).unwrap();
+    handle.write(4, &patch.as_view()).unwrap();
     assert_eq!(handle.header().null_count, 6);
 
     // 覆盖 [8, 12)：带 NULL 段 → 批量位复制路径（行 8,11 NULL；行 9,10 有效）
@@ -170,12 +170,12 @@ fn write_validity_batch_and_null_count_delta() {
     pbm.set(0, false);
     pbm.set(3, false);
     let patch2 = f64_column(&[108.0, 109.0, 110.0, 111.0], Some(pbm));
-    handle.write_field_handle(8, &patch2.as_view()).unwrap();
+    handle.write(8, &patch2.as_view()).unwrap();
     // 旧区间有效位 {9, 11} → 新有效位 {9, 10}：null_count 不变
     assert_eq!(handle.header().null_count, 6);
 
     // 读回验证（值 + null_count）
-    let view = handle.read_field_handle(0, 16).unwrap();
+    let view = handle.read(0, 16).unwrap();
     assert_eq!(view.null_count(), 6);
     assert_eq!(&view_values(&view)[4..8], &[100.0, 101.0, 102.0, 103.0]);
     assert_eq!(&view_values(&view)[8..12], &[108.0, 109.0, 110.0, 111.0]);
@@ -185,7 +185,7 @@ fn write_validity_batch_and_null_count_delta() {
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(handle.header().null_count, 6);
     assert_eq!(handle.header().generation, 3);
-    assert_eq!(handle.read_field_handle(0, 16).unwrap().null_count(), 6);
+    assert_eq!(handle.read(0, 16).unwrap().null_count(), 6);
     close_field_handle(handle).unwrap();
 
     // compressed 路径：写带 NULL 段 → close 自动重压缩 → 读回
@@ -195,18 +195,18 @@ fn write_validity_batch_and_null_count_delta() {
     let mut pbm3 = Bitmap::ones(2);
     pbm3.set(1, false);
     let patch3 = f64_column(&[200.0, 201.0], Some(pbm3)); // [12,14)：行 12 有效、行 13 NULL
-    handle.write_field_handle(12, &patch3.as_view()).unwrap();
+    handle.write(12, &patch3.as_view()).unwrap();
     assert_eq!(handle.header().null_count, 6); // 旧有效位 {13} → 新有效位 {12}
     close_field_handle(handle).unwrap();
 
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(handle.header().null_count, 6);
     assert_eq!(handle.header().generation, 4);
-    let view = handle.read_field_handle(0, 16).unwrap();
+    let view = handle.read(0, 16).unwrap();
     assert_eq!(view.null_count(), 6);
     assert_eq!(view_values(&view)[12], 200.0);
     // 行 13 为 NULL（跨 chunk 单行读取校验）
-    assert_eq!(handle.read_field_handle(13, 1).unwrap().null_count(), 1);
+    assert_eq!(handle.read(13, 1).unwrap().null_count(), 1);
     close_field_handle(handle).unwrap();
     cleanup(&dir);
 }
@@ -233,7 +233,7 @@ fn validity_roundtrip_and_null_write() {
     .unwrap();
 
     let handle = open_field_file(&path, Mode::Read).unwrap();
-    let view = handle.read_field_handle(0, 5).unwrap();
+    let view = handle.read(0, 5).unwrap();
     assert_eq!(view.null_count(), 2);
     assert!(!view.segments()[0].validity().unwrap().is_valid(1));
     close_field_handle(handle).unwrap();
@@ -265,8 +265,8 @@ fn stream_init_matches_data_init() {
 
     let a = open_field_file(&stream_path, Mode::Read).unwrap();
     let b = open_field_file(&data_path, Mode::Read).unwrap();
-    assert_eq!(view_values(&a.read_field_handle(0, 100).unwrap()), values);
-    assert_eq!(view_values(&b.read_field_handle(0, 100).unwrap()), values);
+    assert_eq!(view_values(&a.read(0, 100).unwrap()), values);
+    assert_eq!(view_values(&b.read(0, 100).unwrap()), values);
     assert_eq!(a.row_count(), 100);
     close_field_handle(a).unwrap();
     close_field_handle(b).unwrap();
@@ -282,7 +282,7 @@ fn scan_with_predicate_and_limit() {
     let handle = open_field_file(&path, Mode::Read).unwrap();
 
     // 无谓词：全表
-    let mut scanner = handle.scan_field_handle(&ScanRequest::default()).unwrap();
+    let mut scanner = handle.scan(&ScanRequest::default()).unwrap();
     let mut ranges = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
         ranges.push(r);
@@ -292,7 +292,7 @@ fn scan_with_predicate_and_limit() {
 
     // 谓词 price > 50 → 行 1, 3, 5
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Float(50.0));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![],
         projection: vec![],
         predicate: Some(pred),
@@ -310,7 +310,7 @@ fn scan_with_predicate_and_limit() {
 
     // limit = 2：只保留前两个命中行
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Float(50.0));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![],
         projection: vec![],
         predicate: Some(pred),
@@ -327,7 +327,7 @@ fn scan_with_predicate_and_limit() {
     // ranges 输入：只在 [3, 6) 内扫描
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Float(50.0));
     let mut scanner = handle
-        .scan_field_handle(&ScanRequest {
+        .scan(&ScanRequest {
             ranges: vec![RowRange::new(3, 3)],
             projection: vec![],
             predicate: Some(pred),
@@ -360,7 +360,7 @@ fn scan_null_excluded_at_root() {
 
     // Ne 999：真实值与 NULL 行的值掩码全为 1 —— NULL 行只能由根部 validity 排除
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Ne, Scalar::Float(999.0));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
     let mut rows = Vec::new();
@@ -374,7 +374,7 @@ fn scan_null_excluded_at_root() {
     let pred = Predicate::Not(Box::new(Predicate::value_cmp(
         splayed_core::CmpOp::Lt, Scalar::Float(50.0),
     )));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
     let mut rows = Vec::new();
@@ -389,7 +389,7 @@ fn scan_null_excluded_at_root() {
         Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Float(100.0)),
         Predicate::value_cmp(splayed_core::CmpOp::Lt, Scalar::Float(20.0)),
     ]);
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
     let mut rows = Vec::new();
@@ -412,7 +412,7 @@ fn scan_typed_int_ranges_order_and_merge() {
 
     // 有符号列 × UInt 目标（跨域加宽语义）：Gt UInt(3) → 行 1, 3
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::UInt(3));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
     let mut rows = Vec::new();
@@ -424,7 +424,7 @@ fn scan_typed_int_ranges_order_and_merge() {
 
     // 段内相邻命中合并为单个连续区：Le Int(9) → [0, 5)
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Le, Scalar::Int(9));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![], projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
     let mut ranges = Vec::new();
@@ -436,7 +436,7 @@ fn scan_typed_int_ranges_order_and_merge() {
 
     // ranges 保序直接消费（不重排不合并）：[0,2) 与 [3,2)，Gt Int(2) → 行 1、3
     let pred = Predicate::value_cmp(splayed_core::CmpOp::Gt, Scalar::Int(2));
-    let mut scanner = handle.scan_field_handle(&ScanRequest {
+    let mut scanner = handle.scan(&ScanRequest {
         ranges: vec![RowRange::new(0, 2), RowRange::new(3, 2)],
         projection: vec![], predicate: Some(pred), limit: None,
     }).unwrap();
@@ -461,16 +461,16 @@ fn compress_decompress_roundtrip() {
     compress_field_file(&path, Some(vec![0, 37])).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert!(handle.is_chunked());
-    assert_eq!(view_values(&handle.read_field_handle(0, 100).unwrap()), values);
+    assert_eq!(view_values(&handle.read(0, 100).unwrap()), values);
     // 跨 chunk 读取（返回多段）
-    let view = handle.read_field_handle(30, 20).unwrap();
+    let view = handle.read(30, 20).unwrap();
     assert!(view.segments().len() >= 2);
     // 块内读取（二分定位直接命中第二块）
-    let view = handle.read_field_handle(40, 10).unwrap();
+    let view = handle.read(40, 10).unwrap();
     assert_eq!(view.length(), 10);
     assert_eq!(view_values(&view), &values[40..50]);
     // length = 0 → 空 view
-    assert_eq!(handle.read_field_handle(37, 0).unwrap().length(), 0);
+    assert_eq!(handle.read(37, 0).unwrap().length(), 0);
     close_field_handle(handle).unwrap();
 
     // 已压缩再次压缩 → 错误
@@ -479,12 +479,12 @@ fn compress_decompress_roundtrip() {
     // compressed write：修改后 close 自动重压缩写回
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
     let patch = f64_column(&[-1.0, -2.0], None);
-    handle.write_field_handle(40, &patch.as_view()).unwrap();
+    handle.write(40, &patch.as_view()).unwrap();
     close_field_handle(handle).unwrap();
 
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert!(handle.is_chunked());
-    let got = view_values(&handle.read_field_handle(0, 100).unwrap());
+    let got = view_values(&handle.read(0, 100).unwrap());
     assert_eq!(&got[40..42], &[-1.0, -2.0]);
     let mut expected = values.clone();
     expected[40] = -1.0;
@@ -496,7 +496,7 @@ fn compress_decompress_roundtrip() {
     decompress_field_file(&path).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert!(!handle.is_chunked());
-    assert_eq!(view_values(&handle.read_field_handle(0, 100).unwrap()), expected);
+    assert_eq!(view_values(&handle.read(0, 100).unwrap()), expected);
     // 未压缩再解压 → 错误
     assert!(decompress_field_file(&path).is_err());
     close_field_handle(handle).unwrap();
@@ -527,15 +527,15 @@ fn compress_decompress_streamed_with_validity() {
     assert_eq!(handle.header().null_count, 3);
     assert_eq!(handle.header().generation, 1);
     assert_eq!(
-        view_values(&handle.read_field_handle(0, 20).unwrap()),
+        view_values(&handle.read(0, 20).unwrap()),
         (0..20).map(|i| i as f64).collect::<Vec<_>>()
     );
     // NULL 行与有效行逐一校验（跨 chunk 边界两侧）
     for r in [5usize, 9, 16] {
-        assert_eq!(handle.read_field_handle(r as u64, 1).unwrap().null_count(), 1, "row {r}");
+        assert_eq!(handle.read(r as u64, 1).unwrap().null_count(), 1, "row {r}");
     }
     for r in [0usize, 6, 7, 15, 17, 19] {
-        assert_eq!(handle.read_field_handle(r as u64, 1).unwrap().null_count(), 0, "row {r}");
+        assert_eq!(handle.read(r as u64, 1).unwrap().null_count(), 0, "row {r}");
     }
     close_field_handle(handle).unwrap();
     cleanup(&dir);
@@ -551,7 +551,7 @@ fn cast_converts_values_in_place() {
     cast_field_file(&path, DataType::Int64).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(handle.data_type(), DataType::Int64);
-    let view = handle.read_field_handle(0, 3).unwrap();
+    let view = handle.read(0, 3).unwrap();
     let got: Vec<i64> = view
         .segments()
         .iter()
@@ -576,7 +576,7 @@ fn cast_preserves_validity_generation_and_compression() {
     bm.set(3, false);
     create_field_file(&path, DataType::Float64, FieldInit::Data(f64_column(&values, Some(bm))), splayed_core::CreateFieldOptions::default()).unwrap();
     let mut handle = open_field_file(&path, Mode::Write).unwrap();
-    handle.write_field_handle(0, &f64_column(&[10.0], None).as_view()).unwrap();
+    handle.write(0, &f64_column(&[10.0], None).as_view()).unwrap();
     close_field_handle(handle).unwrap();
 
     cast_field_file(&path, DataType::Int32).unwrap();
@@ -585,7 +585,7 @@ fn cast_preserves_validity_generation_and_compression() {
     assert_eq!(handle.header().generation, 2); // generation 保持源值
     assert_eq!(handle.header().null_count, 2); // validity 原样保留
     assert!(!handle.is_chunked());
-    let view = handle.read_field_handle(0, 5).unwrap();
+    let view = handle.read(0, 5).unwrap();
     assert_eq!(view.null_count(), 2);
     let got: Vec<i32> = bytemuck::cast_slice(view.segments()[0].fixed_bytes().unwrap()).to_vec();
     assert_eq!(&got[0..1], &[10]);
@@ -601,7 +601,7 @@ fn cast_preserves_validity_generation_and_compression() {
     assert!(handle.is_chunked());
     assert_eq!(handle.header().generation, 2);
     assert_eq!(handle.header().null_count, 2);
-    let view = handle.read_field_handle(0, 5).unwrap();
+    let view = handle.read(0, 5).unwrap();
     assert_eq!(view.null_count(), 2);
     let got: Vec<i64> = bytemuck::cast_slice(view.segments()[0].fixed_bytes().unwrap()).to_vec();
     assert_eq!(&got[0..1], &[10]);
@@ -629,11 +629,11 @@ fn cast_streams_across_batches() {
     assert_eq!(handle.header().null_count, 4);
     // 批边界跨点 + 首尾行均为 NULL
     for r in [0usize, 262143, 262144, N - 1] {
-        let view = handle.read_field_handle(r as u64, 1).unwrap();
+        let view = handle.read(r as u64, 1).unwrap();
         assert_eq!(view.null_count(), 1, "row {r} should be NULL");
     }
     for r in [1usize, 262145, N - 2] {
-        let view = handle.read_field_handle(r as u64, 1).unwrap();
+        let view = handle.read(r as u64, 1).unwrap();
         assert_eq!(view.null_count(), 0, "row {r} should be valid");
         let got = bytemuck::cast_slice::<u8, i64>(view.segments()[0].fixed_bytes().unwrap())[0];
         assert_eq!(got, (r as i64) * 2, "row {r}");
@@ -662,9 +662,9 @@ fn read_out_of_bounds_rejected() {
     let path = dir.join("price");
     create_field_file(&path, DataType::Float64, FieldInit::Length(5), splayed_core::CreateFieldOptions::default()).unwrap();
     let handle = open_field_file(&path, Mode::Read).unwrap();
-    assert!(handle.read_field_handle(3, 3).is_err());
-    assert!(handle.read_field_handle(5, 1).is_err());
-    assert!(handle.read_field_handle(0, 0).unwrap().is_empty());
+    assert!(handle.read(3, 3).is_err());
+    assert!(handle.read(5, 1).is_err());
+    assert!(handle.read(0, 0).unwrap().is_empty());
     close_field_handle(handle).unwrap();
 
     // read mode handle 上写入 → InvalidState
@@ -672,7 +672,7 @@ fn read_out_of_bounds_rejected() {
     let col = Column::zeroed(DataType::Float64, 1, false);
     let mut handle = handle;
     assert!(matches!(
-        handle.write_field_handle(0, &col.as_view()),
+        handle.write(0, &col.as_view()),
         Err(splayed_core::CoreError::InvalidState(_))
     ));
     close_field_handle(handle).unwrap();
@@ -702,7 +702,7 @@ fn cast_f64_f32_roundtrip_preserves_values() {
 
     let h = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(h.data_type(), DataType::Float64);
-    let view = h.read_field_handle(0, vals.len() as u64).unwrap();
+    let view = h.read(0, vals.len() as u64).unwrap();
     let got: Vec<f64> = view
         .segments()
         .iter()
@@ -763,7 +763,7 @@ fn create_compressed_field_equivalence_and_offsets() {
     let h = open_field_file(&direct, Mode::Read).unwrap();
     assert!(h.is_chunked());
     assert_eq!(h.row_count(), values.len() as u64);
-    let view = h.read_field_handle(0, values.len() as u64).unwrap();
+    let view = h.read(0, values.len() as u64).unwrap();
     assert_eq!(view.null_count(), 2);
     let got: Vec<f64> = view
         .segments()
@@ -816,7 +816,7 @@ fn create_compressed_field_equivalence_and_offsets() {
     let h = open_field_file(&all_null, Mode::Read).unwrap();
     assert!(h.is_chunked());
     assert_eq!(h.row_count(), 100);
-    let view = h.read_field_handle(0, 100).unwrap();
+    let view = h.read(0, 100).unwrap();
     assert_eq!(view.null_count(), 100);
     close_field_handle(h).unwrap();
     cleanup(&dir);
@@ -837,7 +837,7 @@ fn header_only_field_read_scan_write_lifecycle() {
 
     // 1. Read: 验证返回全 NULL
     let r_handle = open_field_file(&path, Mode::Read).unwrap();
-    let view = r_handle.read_field_handle(10, 20).unwrap();
+    let view = r_handle.read(10, 20).unwrap();
     assert_eq!(view.null_count(), 20);
     assert_eq!(view.length(), 20);
 
@@ -851,7 +851,7 @@ fn header_only_field_read_scan_write_lifecycle() {
         )),
         limit: None,
     };
-    let mut scanner = r_handle.scan_field_handle(&req).unwrap();
+    let mut scanner = r_handle.scan(&req).unwrap();
     assert_eq!(scanner.next().unwrap(), None);
     close_field_handle(r_handle).unwrap();
 
@@ -859,7 +859,7 @@ fn header_only_field_read_scan_write_lifecycle() {
     let mut w_handle = open_field_file(&path, Mode::Write).unwrap();
     let patch_vals = vec![10.0, 20.0, 30.0];
     let patch = f64_column(&patch_vals, None);
-    w_handle.write_field_handle(10, &patch.as_view()).unwrap();
+    w_handle.write(10, &patch.as_view()).unwrap();
     close_field_handle(w_handle).unwrap();
 
     // 验证物理文件已被扩展至完整大小：64 + 100*8 + ceil(100/8) = 64 + 800 + 13 = 877
@@ -870,9 +870,9 @@ fn header_only_field_read_scan_write_lifecycle() {
     let r_handle = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(r_handle.header().generation, 2);
     assert_eq!(r_handle.header().null_count, 97);
-    let view = r_handle.read_field_handle(10, 3).unwrap();
+    let view = r_handle.read(10, 3).unwrap();
     assert_eq!(view_values(&view), patch_vals);
-    let view_before = r_handle.read_field_handle(0, 10).unwrap();
+    let view_before = r_handle.read(0, 10).unwrap();
     assert_eq!(view_before.null_count(), 10);
     close_field_handle(r_handle).unwrap();
 
@@ -939,21 +939,21 @@ fn zero_length_field_boundaries() {
     assert_eq!(h.header().null_count, 0);
 
     // 读 0 行返回空视图
-    let view = h.read_field_handle(0, 0).unwrap();
+    let view = h.read(0, 0).unwrap();
     assert_eq!(view.length(), 0);
 
     // 读 >0 行应报错
-    assert!(h.read_field_handle(0, 1).is_err());
-    assert!(h.read_field_handle(1, 0).is_err());
+    assert!(h.read(0, 1).is_err());
+    assert!(h.read(1, 0).is_err());
 
     // 扫描 0 行字段返回 None
     let req = splayed_core::ScanRequest::default();
-    let mut scanner = h.scan_field_handle(&req).unwrap();
+    let mut scanner = h.scan(&req).unwrap();
     assert_eq!(scanner.next().unwrap(), None);
 
     // 写入 0 行应成功且不改变任何状态
     let empty_col = Column::zeroed(DataType::Float64, 0, false);
-    h.write_field_handle(0, &empty_col.as_view()).unwrap();
+    h.write(0, &empty_col.as_view()).unwrap();
     close_field_handle(h).unwrap();
 
     // 2. Cast 0 行字段
@@ -1010,13 +1010,13 @@ fn validity_unaligned_bit_overwrite_boundary() {
     let patch_col = f64_column(&patch_vals, Some(Bitmap::from_bytes(bits, 11)));
     assert_eq!(patch_col.null_count(), 3);
 
-    h.write_field_handle(5, &patch_col.as_view()).unwrap();
+    h.write(5, &patch_col.as_view()).unwrap();
     close_field_handle(h).unwrap();
 
     // 重新打开并精细校验每一位的有效性与值
     let h = open_field_file(&path, Mode::Read).unwrap();
     assert_eq!(h.header().null_count, 3); // 原先 0 个 NULL，新增了 3 个 NULL
-    let view = h.read_field_handle(0, 32).unwrap();
+    let view = h.read(0, 32).unwrap();
     let vals = view_values(&view);
     let validity = view.segments()[0].validity().expect("has validity");
 
@@ -1067,7 +1067,7 @@ fn chunked_field_small_chunks_crossing_boundary() {
     assert_eq!(h.row_count(), 10);
 
     // 1. 跨越多个 chunk 边界读取：offset = 1, length = 6 (覆盖第 1 到第 6 行，跨越块 0, 1, 2, 3)
-    let view = h.read_field_handle(1, 6).unwrap();
+    let view = h.read(1, 6).unwrap();
     assert_eq!(view.length(), 6);
     let values = view_values(&view);
     assert_eq!(values, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
@@ -1075,13 +1075,13 @@ fn chunked_field_small_chunks_crossing_boundary() {
     // 2. 在压缩字段跨 chunk 覆盖写：覆盖 [3..8] (跨越块 1, 2, 3)
     let patch_vals = vec![999.0, 998.0, 997.0, 996.0, 995.0];
     let patch_col = f64_column(&patch_vals, None);
-    h.write_field_handle(3, &patch_col.as_view()).unwrap();
+    h.write(3, &patch_col.as_view()).unwrap();
     close_field_handle(h).unwrap(); // 触发重压缩
 
     // 3. 重新打开并验证跨 chunk 重压缩后的数据完整性
     let h = open_field_file(&path, Mode::Read).unwrap();
     assert!(h.is_chunked());
-    let view_after = h.read_field_handle(0, 10).unwrap();
+    let view_after = h.read(0, 10).unwrap();
     let all_vals = view_values(&view_after);
     assert_eq!(
         all_vals,

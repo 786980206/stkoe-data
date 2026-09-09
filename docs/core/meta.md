@@ -2,30 +2,36 @@
 
 ## 6. Index (META) API
 
-### 6.0 总览
+### 6.0 面向对象模型与总览
 
-Index 层负责管理 `.meta` 文件，维护二维时序坐标容量网格：全局有序唯一的 `TIME AXIS`、标的字典 `SYM DICT` 以及 `SYM INDEX` 记录表。V2.1 将其全面统一为四层对称体系中的第三层——**Index 索引层**，提供首级公开对象 `IndexHandle`（与 `MetaHandle` 兼容并存）。
+Index 层负责管理 `.meta` 文件，维护二维时序坐标容量网格：全局有序唯一的 `TIME AXIS`、标的字典 `SYM DICT` 以及 `SYM INDEX` 记录表。V2.1 将其全面统一为四层对称体系中的第三层——**Index 索引层**，提供成对的核心对象：
+- **`IndexReader`**：只读索引对象，负责元数据查询、(sym, time) 零拷贝切片读取（`read`）、条件谓词快速扫描（`scan`）与主键批量二分定位（`locate`）；
+- **`IndexWriter`**：可写索引对象，负责纯元数据骨架创建（`create`）、全量构建初始化（`init`）、原子全量重建更新（`update`）以及物理销毁。
 
-| 接口 | 职责 | 层次 |
+| 核心操作 | 对象 / 方法 | 职责说明 |
 | --- | --- | --- |
-| `create_index` | 创建空索引骨架文件（仅写 64B Header，`row_count = 0`） | File |
-| `init_index` | 连带 (sym, time) 数据初始化构建完整索引网格 | File |
-| `open_index` | 打开 `.meta` 文件，返回 `IndexHandle` | File |
-| `close_index` | 关闭索引句柄，释放 mmap 映射 | File / Handle |
-| `drop_index` | 销毁并物理删除 `.meta` 索引文件 | File / Handle |
-| `IndexHandle::read_index_schema` | 返回固定主键 Schema `[sym: Utf8, time: <time_type>]` | Handle |
-| `IndexHandle::read_index` | 零拷贝读取 (sym, time) 两列构成的 `DataView`（sym 零物化） | Handle |
-| `IndexHandle::scan_index` | 谓词二分快速扫描，产出命中行区间 `RowRange` | Handle |
-| `IndexHandle::locate_index` | (sym, time) 联合键双指针单调批量定位 | Handle |
-| `IndexHandle::update_index` | 全量原子替换主索引网格并刷新映射 | Handle |
+| **创建骨架** | `IndexWriter::create(path, time_type)` | 创建空索引骨架文件（仅写 64B Header，`row_count = 0`） |
+| **数据初始化** | `IndexWriter::init(path, data)` | 连带 (sym, time) 数据初始化构建完整索引网格 |
+| **只读打开** | `IndexReader::open(path)` | 打开 `.meta` 文件，返回只读索引对象（Mmap 映射） |
+| **可写打开** | `IndexWriter::open(path)` | 打开 `.meta` 文件，返回可写索引对象 |
+| **结构查询** | `reader.schema()` / `writer.schema()` | 返回固定主键 Schema `[sym: Utf8, time: <time_type>]` |
+| **零拷贝切片读取**| `reader.read(offset, len)` | 零拷贝读取 (sym, time) 两列构成的 `DataView`（sym 零物化） |
+| **谓词快速扫描** | `reader.scan(request)` | 谓词二分快速扫描，产出命中行区间 `RowRange` |
+| **主键批量定位** | `reader.locate(pairs)` | (sym, time) 联合键双指针单调批量定位 |
+| **全量原子重建** | `writer.update(data)` | 全量原子替换主索引网格并刷新映射 |
+| **转换为只读** | `writer.as_reader()` | 转换为 `IndexReader` 供读取已提交索引数据 |
+| **安全关闭** | `reader.close()`, `writer.close()` | 关闭索引对象，安全释放底层 mmap 映射 |
+| **物理销毁** | `writer.remove()` | 显式释放句柄后彻底物理删除 `.meta` 文件 |
 
 ---
 
-### 6.1 create_index
+### 6.1 IndexWriter::create (纯元数据骨架创建)
 
 #### 函数签名
 ```rust
-pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, CoreError>;
+impl IndexWriter {
+    pub fn create(path: &Path, time_type: TimeType) -> Result<Self, CoreError>;
+}
 ```
 
 #### 参数与返回
@@ -33,7 +39,7 @@ pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, Cor
 | --- | --- | --- | --- |
 | `path` | `&Path` | 输入 | 目标 `.meta` 文件路径；已存在则报错 |
 | `time_type` | `TimeType` | 输入 | 时间轴的整数或时间戳类型 |
-| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 初始化的空索引句柄（物理大小恰为 64B） |
+| 返回 | `Result<IndexWriter, CoreError>` | 输出 | 初始化的空索引写对象（物理大小恰为 64B） |
 
 #### 内部实现流程
 ```
@@ -43,19 +49,18 @@ pub fn create_index(path: &Path, time_type: TimeType) -> Result<IndexHandle, Cor
    time_count: 0, sym_count: 0, row_count: 0, generation: 0,
    sym_dict_offset: 64, sym_index_offset: 64, file_size: 64；
 3. File::create 并 write_all 写入 64 字节 Header；
-4. 挂载只读 mmap，返回 IndexHandle，耗时 < 1μs，0 数据 I/O。
+4. 挂载 mmap，返回 IndexWriter，耗时 < 1μs，0 数据 I/O。
 ```
-
-#### 其他说明
-- 供 `create_dataset` / `create_table` 纯元数据骨架创建时使用。
 
 ---
 
-### 6.2 init_index
+### 6.2 IndexWriter::init (连带数据初始化)
 
 #### 函数签名
 ```rust
-pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreError>;
+impl IndexWriter {
+    pub fn init(path: &Path, data: &DataView<'_>) -> Result<Self, CoreError>;
+}
 ```
 
 #### 参数与返回
@@ -63,7 +68,7 @@ pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreE
 | --- | --- | --- | --- |
 | `path` | `&Path` | 输入 | 目标 `.meta` 文件路径 |
 | `data` | `&DataView<'_>` | 输入 | 必须包含按 `(sym ASC, time ASC)` 排序的 sym 与 time 两列 |
-| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 构建完成并已打开的 `IndexHandle` |
+| 返回 | `Result<IndexWriter, CoreError>` | 输出 | 构建完成并已打开的 `IndexWriter` |
 
 #### 内部实现流程
 ```
@@ -74,36 +79,36 @@ pub fn init_index(path: &Path, data: &DataView<'_>) -> Result<IndexHandle, CoreE
 5. 连续子区间硬约束校验：end >= start 且 (end - start + 1) == run.rows（违规报 NonContiguousTime）；
 6. 顺序拼接序列化为单块 Buffer：HEADER(64B) + TIME AXIS + DICT OFFSETS + STRING DATA + SYM INDEX；
 7. 原子提交：写入临时文件 <path>.tmp → sync_all → rename 原文件；
-8. 重新以 mmap 打开，返回 IndexHandle。
+8. 重新以 mmap 打开，返回 IndexWriter。
 ```
-
-#### 其他说明
-- 极速构建：无 HashMap，无逐行对象分配；网格与数据行严格数学对齐。
 
 ---
 
-### 6.3 open_index
+### 6.3 IndexReader::open 与 IndexWriter::open
 
 #### 函数签名
 ```rust
-pub fn open_index(path: &Path) -> Result<IndexHandle, CoreError>;
+impl IndexReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+}
+
+impl IndexWriter {
+    pub fn open(path: &Path) -> Result<Self, CoreError>;
+}
 ```
 
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
 | `path` | `&Path` | 输入 | 已存在的 `.meta` 文件路径 |
-| 返回 | `Result<IndexHandle, CoreError>` | 输出 | 索引生命周期句柄 |
+| 返回 | `Result<IndexReader / IndexWriter, CoreError>` | 输出 | 索引只读或可写生命周期对象 |
 
 #### 内部实现流程
 ```
 1. File::open 打开物理文件并挂载 unsafe { Mmap::map(&file) }；
 2. 解析前 64 字节 MetaHeader 并验证 magic、version 及 file_size 一致性；
-3. 返回封装了 mmap 与 Header 的 IndexHandle。
+3. 返回封装了 mmap 与 Header 的 IndexReader 或 IndexWriter。
 ```
-
-#### 其他说明
-- 零拷贝挂载，打开耗时仅几微秒。
 
 ---
 
@@ -269,16 +274,16 @@ impl IndexHandle {
 ```
 
 #### 其他说明
-- 为 `write_table` 与 `write_dataset` 提供高效定位基础设施。
+- 为 `TableWriter::write` 与 `DatasetWriter::write` 提供高效定位基础设施。
 
 ---
 
-### 6.10 IndexHandle::update_index
+### 6.10 IndexHandle::update (原子替换索引)
 
 #### 函数签名
 ```rust
 impl IndexHandle {
-    pub fn update_index(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError>;
 }
 ```
 

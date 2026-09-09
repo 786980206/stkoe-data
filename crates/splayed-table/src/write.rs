@@ -102,20 +102,23 @@ fn scan_partition_runs(
     Ok(buckets)
 }
 
-/// 阶段②：分区存在性校验 + 逐分区定位，把输入行段映射回网格偏移。
+/// 阶段②：分区存在性校验（不存在则自动创建新分区）+ 逐分区定位，把输入行段映射回网格偏移。
 ///
 /// 逐分区 `locate_dataset_index`（Dataset 缓存复用）+ 匹配行数校验——**任何写入/建列前**
-/// 完成全部定位与校验，key 缺失 / 分区不存在 / 定位不足都不产生部分修改。
+/// 完成全部定位与校验，key 缺失 / 定位不足都不产生部分修改。
+/// 若分区尚不存在，自动通过分区创建流程安全初始化该新分区！
 /// 返回按分区名 ASC 排序的 `PartitionWrite`（网格偏移对齐）。
 fn locate_partition_plan(
     table: &TableHandle,
     data: &DataView<'_>,
     buckets: &HashMap<String, Vec<(usize, usize)>>,
 ) -> Result<Vec<PartitionWrite>, CoreError> {
-    // 前置校验：分区存在性（不创建分区）
     let scheme = table.scheme();
     let none_scheme = scheme == PartitionScheme::None;
     let existing: HashSet<String> = table.discover_partitions().into_iter().collect();
+
+    // 检查是否有缺失分区：若有，先通过 gather_runs 提取该分区数据并自动创建新分区
+    let mut missing_partitions: Vec<String> = Vec::new();
     for name in buckets.keys() {
         if none_scheme {
             if !name.is_empty() {
@@ -124,9 +127,17 @@ fn locate_partition_plan(
                 ));
             }
         } else if !existing.contains(name) {
-            return Err(CoreError::Invalid(format!(
-                "partition '{name}' does not exist; input spans a missing partition"
-            )));
+            missing_partitions.push(name.clone());
+        }
+    }
+
+    if !missing_partitions.is_empty() {
+        let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
+        for name in &missing_partitions {
+            let runs = &buckets[name];
+            let sub = crate::table::gather_runs(&owned, runs)?;
+            let sub_view = sub.as_view();
+            table.create_partition(name, &sub_view, None)?;
         }
     }
 
@@ -155,7 +166,7 @@ fn locate_partition_plan(
                 ));
             }
         }
-        let located = ds.locate_dataset_index_borrowed(&pairs)?;
+        let located = ds.locate_borrowed(&pairs)?;
         let total: u64 = located.iter().map(|r| r.length).sum();
         if total as usize != pairs.len() {
             return Err(CoreError::InvalidState(format!(
@@ -218,6 +229,10 @@ pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreE
     }
     let buckets = scan_partition_runs(table, data)?;
     let plan = locate_partition_plan(table, data, &buckets)?;
+
+    // 检查并自动补全缺失列（支持缺列自愈）：
+    // 若输入数据包含表中尚不存在的列，先自动为各分区创建缺失列并对齐
+    ensure_missing_columns(table, data, &plan)?;
 
     // ③ 写入：单分区 / 并行度 1 → 串行（Field 级并行拿满预算）；
     //    否则分区级并行，Field 级预算切分（P_field = max(1, max_parallelism / P_part)）
@@ -328,57 +343,29 @@ fn write_partition(
             );
         }
         let sliced = DataView::new(schema.clone(), columns).map_err(CoreError::from)?;
-        ds.write_dataset(offset, &sliced)?;
+        ds.write(offset, &sliced)?;
     }
     Ok(())
 }
 
-/// 为 Table 中**不存在的列**建列（按分区 + 按 index 对齐），**绝不覆盖已有列数据**。
-///
-/// 接口与 `write_table` 一致（`(sym ASC, time ASC)` 严格有序唯一、`sym/time` 必含、
-/// `.lock` 写互斥）；输入行数可**少于** Table 总行数（子集）。
-/// 流程：
-/// ① 一次扫描校验（`scan_partition_runs`）
-/// ② 逐分区定位对齐（`locate_partition_plan`：把输入行段映射回各分区 META 网格偏移，
-///    任何建列前完成全部定位与校验）
-/// ③ 规划（只读）：逐分区确定缺失列 + 类型校验 + 预构建全长度对齐列
-/// ④ 执行：逐分区 `create_dataset_field(Data(full_lp_col), field_options)`
-/// 语义：
-/// - 新列在**所有已发现分区统一创建**（表 Schema 一致）：新列铺满该分区 `L_p` 逻辑行，
-///   输入覆盖的网格行有值、未覆盖的分区/行为 NULL（validity=0）。
-/// - 列在分区中已存在且类型一致 → 跳过（不建不写，绝不覆盖）。
-/// - 列在分区中已存在但类型不一致 → `Invalid`（前置报错，无任何修改）。
-/// - 建列失败不回滚：已建成的列保留，返回首个错误。
-pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
-    table.mode().require_write("create_table_columns")?;
-    let _lock = LockGuard::acquire(table.path())?;
-
-    if data.column("sym").is_none() || data.column("time").is_none() {
-        return Err(CoreError::Invalid(
-            "create_table_columns requires sym and time columns".into(),
-        ));
-    }
-    if data.length() == 0 {
-        return Ok(());
-    }
-    let buckets = scan_partition_runs(table, data)?;
-    let plan = locate_partition_plan(table, data, &buckets)?;
-
+/// 为 Table 中不存在的列自动补全建列（按分区 + 按 index 对齐）。
+/// 新列在所有已发现分区统一创建（表 Schema 一致）；输入未覆盖的分区全 NULL。
+fn ensure_missing_columns(
+    table: &TableHandle,
+    data: &DataView<'_>,
+    plan: &[PartitionWrite],
+) -> Result<(), CoreError> {
     let compression = table
         .options
         .compression
         .unwrap_or(splayed_format::Compression::None);
     let chunk_target_rows = table.options.chunk_target_rows.unwrap_or(8192);
 
-    // ③ 规划（只读，不改）：跨全部分区确定缺失列 + 类型校验 + 预构建对齐列
-    //    （任何类型冲突 / 校验失败 → 提前返回，无任何建列残留）。
-    //    新列在所有已发现分区统一创建（表 Schema 一致）；输入未覆盖的分区全 NULL。
     let partitions = table.discover_partitions();
     let mut queue: Vec<(String, String, DataType, DatasetFieldInit)> = Vec::new();
     for p in &partitions {
         let ds = table.dataset_for(p)?;
-        let l_p = ds.read_dataset_statistics()?.row_count as usize;
-        // 该分区在输入中的对齐段（输入未覆盖的分区为空）
+        let l_p = ds.statistics()?.row_count as usize;
         let pw = plan.iter().find(|w| &w.name == p);
         let writes: &[(u64, usize, usize)] = pw.map(|w| w.writes.as_slice()).unwrap_or(&[]);
         for field in &data.schema.fields {
@@ -386,7 +373,7 @@ pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<
             if name == "sym" || name == "time" {
                 continue;
             }
-            match ds.read_dataset_schema().data_type_of(name) {
+            match ds.schema().data_type_of(name) {
                 Some(dt) if dt != field.data_type => {
                     return Err(CoreError::Invalid(format!(
                         "field '{name}' exists with type {dt:?}, but input has type {:?}",
@@ -411,7 +398,7 @@ pub fn create_table_columns(table: &TableHandle, data: &DataView<'_>) -> Result<
         return Ok(());
     }
 
-    // ④ 执行（&mut DatasetHandle）：逐分区 create_dataset_field
+    // 执行：逐分区 create_dataset_field
     let mut guard = table.datasets.borrow_mut();
     let mut handles: HashMap<&str, &mut DatasetHandle> = guard
         .iter_mut()
@@ -583,4 +570,141 @@ pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), Core
     }
     table.stats_cache.borrow_mut().clear();
     Ok(())
+}
+
+/// 可写表对象（统一负责单批写入、连续批次写入与所有 DDL 管理能力）
+pub struct TableWriter {
+    pub(crate) inner: TableHandle,
+}
+
+impl TableWriter {
+    pub fn create(
+        path: &Path,
+        schema: &Schema,
+        scheme: PartitionScheme,
+        initial_partition: Option<&str>,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError> {
+        let inner = crate::table::create_table(path, schema, scheme, initial_partition, options)?;
+        Ok(Self { inner })
+    }
+
+    pub fn init(
+        path: &Path,
+        scheme: PartitionScheme,
+        data: &DataView<'_>,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError> {
+        let inner = crate::table::init_table(path, scheme, data, options)?;
+        Ok(Self { inner })
+    }
+
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = crate::table::open_table(path, Mode::Write, TableOptions::default())?;
+        Ok(Self { inner })
+    }
+
+    pub fn open_with_options(path: &Path, options: TableOptions) -> Result<Self, CoreError> {
+        let inner = crate::table::open_table(path, Mode::Write, options)?;
+        Ok(Self { inner })
+    }
+
+    /// 写入通道：按分区自动切分并分发，支持原地局部覆盖与缺列自愈，全表 .lock 互斥
+    pub fn write(&self, data: &DataView<'_>) -> Result<(), CoreError> {
+        write_table(&self.inner, data)
+    }
+
+    /// 全量替换更新表数据：支持按分区原子替换，或自动追加新分区，全表 .lock 互斥
+    pub fn update(&self, data: &DataView<'_>) -> Result<(), CoreError> {
+        update_table(&self.inner, data)
+    }
+
+    /// 分区生命周期管理：删除分区
+    pub fn delete_partition(&self, partition_name: &str) -> Result<(), CoreError> {
+        self.inner.delete_partition(partition_name)
+    }
+
+    // DDL 字段结构变更
+    /// 在已有表中新增单列初始化（仅在最新分区创建物理文件，无需指定 rows，自动与最新分区的 index 行数对齐）
+    pub fn init_field(
+        &self,
+        field_name: &str,
+        data_type: DataType,
+        opts: Option<splayed_core::CreateFieldOptions>,
+    ) -> Result<(), CoreError> {
+        self.inner.init_field(field_name, data_type, opts)
+    }
+
+    pub fn delete_field(&self, field: &str) -> Result<(), CoreError> {
+        self.inner.delete_field(field)
+    }
+
+    pub fn rename_field(&self, field: &str, new_name: &str) -> Result<(), CoreError> {
+        self.inner.rename_field(field, new_name)
+    }
+
+    pub fn cast_field(&self, field: &str, target_type: DataType) -> Result<(), CoreError> {
+        self.inner.cast_field(field, target_type)
+    }
+
+    pub fn compress_field(&self, field: &str) -> Result<(), CoreError> {
+        self.inner.compress_field(field)
+    }
+
+    pub fn decompress_field(&self, field: &str) -> Result<(), CoreError> {
+        self.inner.decompress_field(field)
+    }
+
+    /// 检查并修复表物理存储与元数据完整性：
+    /// 1. 遍历每个分区清理因删除字段产生的空文件夹；
+    /// 2. 检查是否有历史/中间分区存在的字段而最新分区缺少，若存在则在最新分区中通过 `create_field` 补齐。
+    pub fn fix(&self) -> Result<(), CoreError> {
+        self.inner.fix()
+    }
+
+    pub fn update_field(&self, field: &str, header: &splayed_format::FieldHeader) -> Result<(), CoreError> {
+        self.inner.update_field(field, *header)
+    }
+
+    pub fn as_reader(&self) -> Result<crate::query::TableReader, CoreError> {
+        crate::query::TableReader::open(self.inner.path())
+    }
+
+    pub fn schema(&self) -> Result<Schema, CoreError> {
+        self.inner.schema()
+    }
+
+    pub fn metadata(&self) -> Result<crate::table::TableMetadata, CoreError> {
+        self.inner.metadata()
+    }
+
+    pub fn statistics(&self) -> Result<crate::table::TableStatistics, CoreError> {
+        self.inner.statistics()
+    }
+
+    pub fn max_parallelism(&self) -> usize {
+        self.inner.max_parallelism()
+    }
+
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        self.inner.set_max_parallelism(max_parallelism);
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn scheme(&self) -> PartitionScheme {
+        self.inner.scheme()
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close()
+    }
+
+    pub fn remove(self) -> Result<(), CoreError> {
+        let path = self.inner.path().to_path_buf();
+        self.close()?;
+        crate::table::delete_table(&path)
+    }
 }

@@ -135,13 +135,13 @@ fn single_symbol_single_timestamp_boundary() {
     assert_eq!(meta.sym_id_of("GOOG").unwrap(), None);
 
     // 读取第 0 行
-    let r_view = meta.read_index_handle(0, 1).unwrap();
+    let r_view = meta.read(0, 1).unwrap();
     assert_eq!(r_view.length(), 1);
     assert_eq!(r_view.column("sym").unwrap().string_at(0), Some("AAPL"));
 
     // 读超出范围
-    assert!(meta.read_index_handle(0, 2).is_err());
-    assert!(meta.read_index_handle(1, 1).is_err());
+    assert!(meta.read(0, 2).is_err());
+    assert!(meta.read(1, 1).is_err());
 
     meta.close().unwrap();
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -166,7 +166,7 @@ fn read_index_multi_sym_crossing_segments() {
 
     // 1. 跨越 A 尾部到 B 头部：从第 2 行读到第 5 行 (offset 2, length 4)
     // 覆盖 A[2..3] (1 行) 和 B[0..3] (3 行)
-    let read_view = meta.read_index_handle(2, 4).unwrap();
+    let read_view = meta.read(2, 4).unwrap();
     assert_eq!(read_view.length(), 4);
     let sym_col = read_view.column("sym").unwrap();
     assert_eq!(sym_col.string_at(0), Some("A"));
@@ -176,7 +176,7 @@ fn read_index_multi_sym_crossing_segments() {
 
     // 2. 跨越所有标的：从第 1 行读到第 8 行 (offset 1, length 7)
     // 覆盖 A 的后 2 行，B 的全部 4 行，C 的前 1 行
-    let read_all = meta.read_index_handle(1, 7).unwrap();
+    let read_all = meta.read(1, 7).unwrap();
     assert_eq!(read_all.length(), 7);
     let sym_col2 = read_all.column("sym").unwrap();
     assert_eq!(sym_col2.string_at(0), Some("A"));
@@ -186,7 +186,7 @@ fn read_index_multi_sym_crossing_segments() {
     assert_eq!(sym_col2.string_at(6), Some("C"));
 
     // 3. 读取 length = 0 边界
-    let empty_view = meta.read_index_handle(0, 0).unwrap();
+    let empty_view = meta.read(0, 0).unwrap();
     assert_eq!(empty_view.length(), 0);
 
     meta.close().unwrap();
@@ -209,7 +209,7 @@ fn locate_index_edge_cases() {
     let meta = splayed_core::MetaHandle::open(&meta_path).unwrap();
 
     // 1. 空查询
-    let ranges = meta.locate_index_handle(&[]).unwrap();
+    let ranges = meta.locate(&[]).unwrap();
     assert!(ranges.is_empty());
 
     // 2. 正常查询所有点
@@ -220,34 +220,34 @@ fn locate_index_edge_cases() {
         ("B".into(), 20),
         ("C".into(), 30),
     ];
-    let ranges = meta.locate_index_handle(&pairs).unwrap();
+    let ranges = meta.locate(&pairs).unwrap();
     assert_eq!(ranges.len(), 1);
     assert_eq!(ranges[0].offset, 0);
     assert_eq!(ranges[0].length, 5);
 
     // 3. 不存在的 sym（小于首个标的）
     let bad_sym_lo = [("0000".into(), 10i64)];
-    assert!(meta.locate_index_handle(&bad_sym_lo).is_err());
+    assert!(meta.locate(&bad_sym_lo).is_err());
 
     // 4. 不存在的 sym（中间缺失）
     let bad_sym_mid = [("B_MISSED".into(), 10i64)];
-    assert!(meta.locate_index_handle(&bad_sym_mid).is_err());
+    assert!(meta.locate(&bad_sym_mid).is_err());
 
     // 5. 不存在的 sym（大于末尾标的）
     let bad_sym_hi = [("Z".into(), 10i64)];
-    assert!(meta.locate_index_handle(&bad_sym_hi).is_err());
+    assert!(meta.locate(&bad_sym_hi).is_err());
 
     // 6. 存在的 sym，但时间不在轴上
     let bad_time = [("A".into(), 15i64)];
-    assert!(meta.locate_index_handle(&bad_time).is_err());
+    assert!(meta.locate(&bad_time).is_err());
 
     // 7. 乱序输入应该被拒绝
     let unsorted = [("B".into(), 10i64), ("A".into(), 10i64)];
-    assert!(meta.locate_index_handle(&unsorted).is_err());
+    assert!(meta.locate(&unsorted).is_err());
 
     // 8. 重复输入应该被拒绝
     let dups = [("A".into(), 10i64), ("A".into(), 10i64)];
-    assert!(meta.locate_index_handle(&dups).is_err());
+    assert!(meta.locate(&dups).is_err());
 
     meta.close().unwrap();
     let _ = std::fs::remove_dir_all(&temp_dir);
@@ -270,7 +270,7 @@ fn scan_index_boundary_conditions() {
 
     // 1. 扫描整个范围（无谓词）
     let req_all = splayed_core::ScanRequest::default();
-    let mut scanner = meta.scan_index_handle(&req_all).unwrap();
+    let mut scanner = meta.scan(&req_all).unwrap();
     let mut total_rows = 0;
     while let Some(r) = scanner.next().unwrap() {
         total_rows += r.length;
@@ -284,7 +284,7 @@ fn scan_index_boundary_conditions() {
         predicate: Some(splayed_core::Predicate::cmp("sym", splayed_core::CmpOp::Eq, splayed_core::Scalar::Str("TSLA".into()))),
         limit: None,
     };
-    let mut scanner = meta.scan_index_handle(&req_sym).unwrap();
+    let mut scanner = meta.scan(&req_sym).unwrap();
     let r = scanner.next().unwrap().unwrap();
     assert_eq!(r.offset, 3);
     assert_eq!(r.length, 2);
@@ -297,7 +297,7 @@ fn scan_index_boundary_conditions() {
         predicate: Some(splayed_core::Predicate::cmp("time", splayed_core::CmpOp::Lt, splayed_core::Scalar::Int(50))),
         limit: None,
     };
-    let mut scanner = meta.scan_index_handle(&req_time_before).unwrap();
+    let mut scanner = meta.scan(&req_time_before).unwrap();
     assert_eq!(scanner.next().unwrap(), None);
 
     // 4. 时间窗口完全在数据右侧（命中 0 行）
@@ -307,7 +307,7 @@ fn scan_index_boundary_conditions() {
         predicate: Some(splayed_core::Predicate::cmp("time", splayed_core::CmpOp::Gt, splayed_core::Scalar::Int(500))),
         limit: None,
     };
-    let mut scanner = meta.scan_index_handle(&req_time_after).unwrap();
+    let mut scanner = meta.scan(&req_time_after).unwrap();
     assert_eq!(scanner.next().unwrap(), None);
 
     // 5. limit = 1 早停
@@ -317,7 +317,7 @@ fn scan_index_boundary_conditions() {
         predicate: None,
         limit: Some(1),
     };
-    let mut scanner = meta.scan_index_handle(&req_limit).unwrap();
+    let mut scanner = meta.scan(&req_limit).unwrap();
     let r = scanner.next().unwrap().unwrap();
     assert_eq!(r.length, 1);
     assert_eq!(scanner.next().unwrap(), None);

@@ -21,7 +21,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType as ArrowDt, Field as ArrowField, Schema as ArrowSchema,
                     TimeUnit};
 
-use splayed_table::{TableHandle, TableReader, TableScanner};
+use splayed_table::{TableBatchReader, TableHandle, TableScanner};
 use splayed_format::{Data, DataView};
 use splayed_format::{
     Bitmap, Buffer, Column, DataType, DictBuffers, FieldSchema, Schema,
@@ -122,13 +122,14 @@ pub fn from_arrow_type(dt: &ArrowDt) -> Result<DataType> {
 
 // ---------------------------------------------------------------- validity
 
-/// V2.0 Bitmap → Arrow NullBuffer（位序一致，按字节拷贝）。
+/// V2.0 Bitmap → Arrow NullBuffer（位序完全一致，LSB-first 直接字节级零解包映射）。
 fn bitmap_to_null_buffer(bm: &Bitmap) -> NullBuffer {
     let view = bm.as_view();
-    let bits: Vec<bool> = (0..view.len()).map(|i| view.is_valid(i)).collect();
-    NullBuffer::from(bits)
+    let raw = view.as_raw();
+    let buffer = arrow_buffer::Buffer::from(raw);
+    let boolean_buf = arrow_buffer::BooleanBuffer::new(buffer, view.bit_offset(), view.len());
+    NullBuffer::new(boolean_buf)
 }
-// 说明：位图 → bool vec 为一次 O(n) 拷贝；零拷贝路径依赖 Buffer 的 Arc 变体（§4）
 
 /// Arrow null buffer → V2.0 Bitmap。
 fn null_buffer_to_bitmap(nulls: &NullBuffer) -> Bitmap {
@@ -304,9 +305,11 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
     let dt = arrays[0].data_type().clone();
     let merged: ArrayRef = match dt {
         ArrowDt::Dictionary(_k, v) => {
+            use std::collections::HashMap;
+            let mut key_map: HashMap<String, i32> = HashMap::new();
+            let mut unique_strings: Vec<String> = Vec::new();
             let mut keys: Vec<Option<i32>> = Vec::new();
-            let mut dict_values: Vec<Option<String>> = Vec::new();
-            let mut offset = 0i32;
+
             for arr in &arrays {
                 let d = arr
                     .as_any()
@@ -320,17 +323,25 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
                 for k in d.keys().iter() {
                     match k {
                         Some(idx) => {
-                            dict_values.push(Some(vals.value(idx as usize).to_owned()));
-                            keys.push(Some(idx as i32 + offset));
+                            let s = vals.value(idx as usize);
+                            let mapped_id = match key_map.get(s) {
+                                Some(&id) => id,
+                                None => {
+                                    let new_id = unique_strings.len() as i32;
+                                    unique_strings.push(s.to_string());
+                                    key_map.insert(s.to_string(), new_id);
+                                    new_id
+                                }
+                            };
+                            keys.push(Some(mapped_id));
                         }
                         None => keys.push(None),
                     }
                 }
-                offset += vals.len() as i32;
                 let _ = v;
             }
             let keys_arr = Int32Array::from(keys);
-            let values_arr = StringArray::from(dict_values);
+            let values_arr = StringArray::from(unique_strings);
             Arc::new(DictionaryArray::try_new(keys_arr, Arc::new(values_arr))?)
         }
         _ => {
@@ -381,14 +392,7 @@ fn segment_to_owned(
 }
 
 fn pack_bits(view: splayed_format::BitmapView<'_>) -> Vec<u8> {
-    let len = view.len();
-    let mut out = vec![0u8; (len + 7) / 8];
-    for i in 0..len {
-        if view.is_valid(i) {
-            out[i / 8] |= 1 << (i % 8);
-        }
-    }
-    out
+    view.to_packed_bytes()
 }
 
 /// Schema → Arrow 字段列表（类型映射统一入口，两条 batch 路径共用）。
@@ -429,35 +433,14 @@ pub fn data_view_to_record_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch>
 
 // ---------------------------------------------------------------- Table → Arrow
 
-/// Table → Arrow 流式适配器（Layer 3）：包装 `TableReader`，逐批输出
-/// `RecordBatch`。**不拥有查询语义**——裁剪 / 谓词 / limit 由 `TableScanner`
-/// 完成，本层只做 DataView → RecordBatch 转换；流式输出不物化整个结果集。
-pub struct TableArrowReader<'t> {
-    inner: TableReader<'t>,
+// ---------------------------------------------------------------- TableArrowReader & TableArrowWriter
+
+/// Table → Arrow 流式批次读取器
+pub struct TableArrowBatchReader<'t> {
+    inner: TableBatchReader<'t>,
 }
 
-/// Table 端到端流式读取（Layer 3）：`scan_table` 产出的 `TableScanner` +
-/// `batch_size` → 构造 Arrow Reader。直接接收 Scanner（而非 ScanRequest）——
-/// 查询语义归 Table 层，Arrow 层不重新 scan。构造无 I/O（错误延迟到 `next()`）。
-///
-/// ```text
-/// TableScanRequest → scan_table → TableScanner
-///     → read_table_as_arrow → TableArrowReader
-///     → next() → RecordBatch（逐批，流式）
-/// ```
-pub fn read_table_as_arrow<'t>(
-    table: &'t TableHandle,
-    scanner: TableScanner<'t>,
-    batch_size: Option<usize>,
-) -> TableArrowReader<'t> {
-    TableArrowReader {
-        inner: splayed_table::read_table(table, scanner, batch_size),
-    }
-}
-
-impl<'t> TableArrowReader<'t> {
-    /// 下一批 `RecordBatch`；结束返回 `None`。`batch_size = Some(n)` 时每批
-    /// 恰好 n 行（最后一批允许小）；`None` 时一 range 一批。
+impl<'t> TableArrowBatchReader<'t> {
     pub fn next(&mut self) -> Result<Option<RecordBatch>> {
         match self.inner.next()? {
             None => Ok(None),
@@ -465,10 +448,255 @@ impl<'t> TableArrowReader<'t> {
         }
     }
 
-    /// 关闭：任何时刻（正常结束 / LIMIT 提前结束 / 错误 / 取消）都可安全调用。
     pub fn close(self) -> Result<()> {
         self.inner.close().map_err(ArrowConvError::from)
     }
+}
+
+/// TableArrowReader：与 TableReader 完全对齐的 Arrow 原生只读表对象
+pub struct TableArrowReader {
+    inner: splayed_table::TableReader,
+}
+
+impl TableArrowReader {
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let inner = splayed_table::TableReader::open(path)?;
+        Ok(Self { inner })
+    }
+
+    pub fn open_with_options(path: &std::path::Path, options: splayed_table::TableOptions) -> Result<Self> {
+        let inner = splayed_table::TableReader::open_with_options(path, options)?;
+        Ok(Self { inner })
+    }
+
+    /// 惰性条件扫描
+    pub fn scan(&self, request: splayed_table::TableScanRequest) -> Result<splayed_table::TableScanner<'_>> {
+        self.inner.scan(request).map_err(ArrowConvError::from)
+    }
+
+    /// 一步式流式读取为 Arrow RecordBatch
+    pub fn read<'t>(
+        &'t self,
+        request: splayed_table::TableScanRequest,
+        batch_size: Option<usize>,
+    ) -> Result<TableArrowBatchReader<'t>> {
+        let scanner = self.inner.scan(request)?;
+        Ok(TableArrowBatchReader {
+            inner: scanner.into_reader(batch_size),
+        })
+    }
+
+    /// 读取指定分区行范围并转为 Arrow RecordBatch
+    pub fn read_range(
+        &self,
+        range: &splayed_table::PartitionRowRange,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch> {
+        let view = self.inner.read_range(range, projection)?;
+        data_view_to_record_batch(&view)
+    }
+
+    /// 读取 Arrow Schema
+    pub fn schema(&self) -> Result<Arc<ArrowSchema>> {
+        let splayed_schema = self.inner.schema()?;
+        let fields = arrow_fields(&splayed_schema);
+        Ok(Arc::new(ArrowSchema::new(fields)))
+    }
+
+    pub fn metadata(&self) -> Result<splayed_table::TableMetadata> {
+        self.inner.metadata().map_err(ArrowConvError::from)
+    }
+
+    pub fn statistics(&self) -> Result<splayed_table::TableStatistics> {
+        self.inner.statistics().map_err(ArrowConvError::from)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
+
+    pub fn scheme(&self) -> splayed_table::PartitionScheme {
+        self.inner.scheme()
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.inner.close().map_err(ArrowConvError::from)
+    }
+}
+
+/// TableArrowWriter：与 TableWriter 完全对齐的 Arrow 原生可写表对象
+pub struct TableArrowWriter {
+    inner: splayed_table::TableWriter,
+}
+
+impl TableArrowWriter {
+    pub fn create(
+        path: &std::path::Path,
+        arrow_schema: &ArrowSchema,
+        scheme: splayed_table::PartitionScheme,
+        initial_partition: Option<&str>,
+        options: Option<splayed_table::TableOptions>,
+    ) -> Result<Self> {
+        let mut fields = Vec::with_capacity(arrow_schema.fields().len());
+        for f in arrow_schema.fields() {
+            let dt = from_arrow_type(f.data_type())?;
+            fields.push(FieldSchema::new(f.name().as_str(), dt));
+        }
+        let schema = Schema::new(fields);
+        let inner = splayed_table::TableWriter::create(path, &schema, scheme, initial_partition, options)?;
+        Ok(Self { inner })
+    }
+
+    pub fn init(
+        path: &std::path::Path,
+        scheme: splayed_table::PartitionScheme,
+        batch: &RecordBatch,
+        options: Option<splayed_table::TableOptions>,
+    ) -> Result<Self> {
+        let data = record_batch_to_data(batch)?;
+        let inner = splayed_table::TableWriter::init(path, scheme, &data.as_view(), options)?;
+        Ok(Self { inner })
+    }
+
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let inner = splayed_table::TableWriter::open(path)?;
+        Ok(Self { inner })
+    }
+
+    pub fn open_with_options(path: &std::path::Path, options: splayed_table::TableOptions) -> Result<Self> {
+        let inner = splayed_table::TableWriter::open_with_options(path, options)?;
+        Ok(Self { inner })
+    }
+
+    /// 接收 RecordBatch，覆盖写入对应分区
+    pub fn write(&self, batch: &RecordBatch) -> Result<()> {
+        let data = record_batch_to_data(batch)?;
+        self.inner.write(&data.as_view()).map_err(ArrowConvError::from)
+    }
+
+    /// 接收 RecordBatch，全量原子替换更新表数据
+    pub fn update(&self, batch: &RecordBatch) -> Result<()> {
+        let data = record_batch_to_data(batch)?;
+        self.inner.update(&data.as_view()).map_err(ArrowConvError::from)
+    }
+
+    /// 删除分区
+    pub fn delete_partition(&self, partition_name: &str) -> Result<()> {
+        self.inner.delete_partition(partition_name).map_err(ArrowConvError::from)
+    }
+
+    /// 字段初始化 DDL 操作：仅在最新分区创建物理文件，自动与最新分区 index 行数对齐
+    pub fn init_field(
+        &self,
+        field_name: &str,
+        data_type: DataType,
+        opts: Option<splayed_core::CreateFieldOptions>,
+    ) -> Result<()> {
+        self.inner.init_field(field_name, data_type, opts).map_err(ArrowConvError::from)
+    }
+
+    pub fn delete_field(&self, field: &str) -> Result<()> {
+        self.inner.delete_field(field).map_err(ArrowConvError::from)
+    }
+
+    pub fn rename_field(&self, field: &str, new_name: &str) -> Result<()> {
+        self.inner.rename_field(field, new_name).map_err(ArrowConvError::from)
+    }
+
+    pub fn cast_field(&self, field: &str, target_type: DataType) -> Result<()> {
+        self.inner.cast_field(field, target_type).map_err(ArrowConvError::from)
+    }
+
+    pub fn compress_field(&self, field: &str) -> Result<()> {
+        self.inner.compress_field(field).map_err(ArrowConvError::from)
+    }
+
+    pub fn decompress_field(&self, field: &str) -> Result<()> {
+        self.inner.decompress_field(field).map_err(ArrowConvError::from)
+    }
+
+    /// 检查并修复表物理存储与元数据完整性（清理空文件夹，补齐最新分区缺失字段）
+    pub fn fix(&self) -> Result<()> {
+        self.inner.fix().map_err(ArrowConvError::from)
+    }
+
+    /// 转换为只读 TableArrowReader
+    pub fn as_reader(&self) -> Result<TableArrowReader> {
+        TableArrowReader::open(self.inner.path())
+    }
+
+    pub fn schema(&self) -> Result<Arc<ArrowSchema>> {
+        let splayed_schema = self.inner.schema()?;
+        let fields = arrow_fields(&splayed_schema);
+        Ok(Arc::new(ArrowSchema::new(fields)))
+    }
+
+    pub fn metadata(&self) -> Result<splayed_table::TableMetadata> {
+        self.inner.metadata().map_err(ArrowConvError::from)
+    }
+
+    pub fn statistics(&self) -> Result<splayed_table::TableStatistics> {
+        self.inner.statistics().map_err(ArrowConvError::from)
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
+
+    pub fn scheme(&self) -> splayed_table::PartitionScheme {
+        self.inner.scheme()
+    }
+
+    pub fn close(self) -> Result<()> {
+        self.inner.close().map_err(ArrowConvError::from)
+    }
+
+    pub fn remove(self) -> Result<()> {
+        self.inner.remove().map_err(ArrowConvError::from)
+    }
+}
+
+/// Table 端到端流式读取兼容函数
+pub fn read_table_as_arrow<'t>(
+    _table: &'t TableHandle,
+    scanner: TableScanner<'t>,
+    batch_size: Option<usize>,
+) -> TableArrowBatchReader<'t> {
+    TableArrowBatchReader {
+        inner: scanner.into_reader(batch_size),
+    }
+}
+
+/// 直接自 TableReader 构造流式 Arrow 读取器
+pub fn read_reader_as_arrow<'t>(
+    reader: &'t splayed_table::TableReader,
+    request: splayed_table::TableScanRequest,
+    batch_size: Option<usize>,
+) -> Result<TableArrowBatchReader<'t>> {
+    let scanner = reader.scan(request)?;
+    Ok(TableArrowBatchReader {
+        inner: scanner.into_reader(batch_size),
+    })
+}
+
+/// 将来自外部系统的 RecordBatch 数据直接通过 TableWriter 写入表
+pub fn write_record_batch(
+    writer: &splayed_table::TableWriter,
+    batch: &RecordBatch,
+) -> Result<()> {
+    let data = record_batch_to_data(batch)?;
+    writer.write(&data.as_view())?;
+    Ok(())
+}
+
+/// 将来自外部系统的 RecordBatch 数据直接全量更新到表
+pub fn update_record_batch(
+    writer: &splayed_table::TableWriter,
+    batch: &RecordBatch,
+) -> Result<()> {
+    let data = record_batch_to_data(batch)?;
+    writer.update(&data.as_view())?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- from arrow

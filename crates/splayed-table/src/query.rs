@@ -98,7 +98,21 @@ impl<'t> TableScanner<'t> {
                 limit: self.remaining,
             };
             self.current_partition = Some(partition.clone());
-            self.current_scanner = Some(ds.scan_dataset(&core_req)?);
+            self.current_scanner = Some(ds.scan(&core_req)?);
+        }
+    }
+
+    /// 核心转换接口：将 scanner 直接无缝转换为流式批次读取器
+    pub fn into_reader(self, batch_size: Option<usize>) -> TableBatchReader<'t> {
+        let table = self.table;
+        let projection = Some(self.projection.clone());
+        TableBatchReader {
+            table,
+            scanner: self,
+            projection,
+            batch_size,
+            pending: None,
+            exhausted: false,
         }
     }
 
@@ -112,17 +126,9 @@ impl<'t> TableScanner<'t> {
     }
 }
 
-/// Table Reader（**流式**）：消费 Scanner 定位的 ranges，装配为 `DataView` 输出。
+/// Table 流式批次读取器：消费 Scanner 定位的 ranges，装配为 `DataView` 输出。
 /// 只做物理读取与 batch 装配，不重复任何查询逻辑（谓词 / 裁剪归 Scanner）。
-///
-/// 两条路径（`batch_size`）：
-/// - `None`（原始路径）：一次 `next()` 原样返回一个 `PartitionRowRange` 的 DataView，
-///   零聚合开销；
-/// - `Some(n)`（聚合路径）：跨分区跨 range 零拷贝装配恰好 n 行（多段 ColumnView 拼接，
-///   无 row-level memcpy）；range 超出剩余行数 → 按**截断头**读取、剩余 range 放回
-///   `pending`（range 不可变，延迟读等价，避免跨 `next()` 持有 DataView 借用）；
-///   最后一批允许小于 n。
-pub struct TableReader<'t> {
+pub struct TableBatchReader<'t> {
     table: &'t TableHandle,
     scanner: TableScanner<'t>,
     /// `Some(v)` 且 v 非空 = 已展开；`Some(vec![])` / `None` = 待首次 next() 展开。
@@ -133,7 +139,7 @@ pub struct TableReader<'t> {
     exhausted: bool,
 }
 
-impl<'t> TableReader<'t> {
+impl<'t> TableBatchReader<'t> {
     /// 每次返回一批 `DataView`；结束返回 `None`（exhausted 后幂等）。
     pub fn next(&mut self) -> Result<Option<DataView<'_>>, splayed_core::CoreError> {
         if self.exhausted {
@@ -187,7 +193,7 @@ impl<'t> TableReader<'t> {
         cols: &[&str],
     ) -> Result<DataView<'t>, splayed_core::CoreError> {
         let ds = self.table.dataset_for(partition)?;
-        ds.read_dataset(offset, length, Some(cols))
+        ds.read(offset, length, Some(cols))
     }
 
     /// 原始路径：一个 range 原样返回。
@@ -247,21 +253,10 @@ impl<'t> TableReader<'t> {
         ))
     }
 
-    /// 关闭：任何时刻（正常结束 / LIMIT 提前结束 / 错误 / 取消）都可安全调用。
-    /// 只关闭当前实际打开的 DatasetScanner（Dataset 句柄归 TableHandle 缓存所有）。
+    /// 显式关闭批次读取器。
     pub fn close(self) -> Result<(), splayed_core::CoreError> {
         self.scanner.close()
     }
-}
-
-/// 组合入口：`query_table ≡ read_table(scan_table(table, request), batch_size)`。
-pub fn query_table(
-    table: &TableHandle,
-    request: TableScanRequest,
-    batch_size: Option<usize>,
-) -> Result<TableReader<'_>, splayed_core::CoreError> {
-    let scanner = scan_table(table, request)?;
-    Ok(read_table(table, scanner, batch_size))
 }
 
 /// Table 级条件扫描（**惰性**）：主线程只做校验、裁剪与构造，不打开任何 Dataset。
@@ -342,17 +337,89 @@ pub fn scan_table<'t>(
 
 /// 消费 Scanner，读取实际 `DataView` 并按 `batch_size` 聚合输出。
 pub fn read_table<'t>(
-    table: &'t TableHandle,
+    _table: &'t TableHandle,
     scanner: TableScanner<'t>,
     batch_size: Option<usize>,
-) -> TableReader<'t> {
-    let projection = Some(scanner.projection.clone());
-    TableReader {
-        table,
-        scanner,
-        projection,
-        batch_size,
-        pending: None,
-        exhausted: false,
+) -> TableBatchReader<'t> {
+    scanner.into_reader(batch_size)
+}
+
+/// 扫描加读取一步式查询入口。
+pub fn query_table<'t>(
+    table: &'t TableHandle,
+    request: TableScanRequest,
+    batch_size: Option<usize>,
+) -> Result<TableBatchReader<'t>, splayed_core::CoreError> {
+    let scanner = scan_table(table, request)?;
+    Ok(scanner.into_reader(batch_size))
+}
+
+/// 只读表对象
+pub struct TableReader {
+    pub(crate) inner: TableHandle,
+}
+
+impl TableReader {
+    pub fn open(table_path: &std::path::Path) -> Result<Self, splayed_core::CoreError> {
+        let inner = crate::table::open_table(table_path, splayed_core::Mode::Read, crate::table::TableOptions::default())?;
+        Ok(Self { inner })
+    }
+
+    pub fn open_with_options(table_path: &std::path::Path, options: crate::table::TableOptions) -> Result<Self, splayed_core::CoreError> {
+        let inner = crate::table::open_table(table_path, splayed_core::Mode::Read, options)?;
+        Ok(Self { inner })
+    }
+
+    /// 1. 惰性分区剪枝扫描（仅返回 PartitionRowRange 迭代器）
+    pub fn scan(&self, request: TableScanRequest) -> Result<TableScanner<'_>, splayed_core::CoreError> {
+        scan_table(&self.inner, request)
+    }
+
+    /// 2. 一步式便捷流式读取（内部自动 scan + 转换为 TableBatchReader）
+    pub fn read<'t>(&'t self, request: TableScanRequest, batch_size: Option<usize>) -> Result<TableBatchReader<'t>, splayed_core::CoreError> {
+        let scanner = self.scan(request)?;
+        Ok(scanner.into_reader(batch_size))
+    }
+
+    /// 3. 细粒度点查：直接读取单个 PartitionRowRange 的数据视图
+    pub fn read_range(
+        &self,
+        range: &PartitionRowRange,
+        projection: Option<&[&str]>,
+    ) -> Result<DataView<'_>, splayed_core::CoreError> {
+        let ds = self.inner.dataset_for(&range.partition)?;
+        ds.read(range.row_range.offset, range.row_range.length, projection)
+    }
+
+    pub fn schema(&self) -> Result<splayed_format::Schema, splayed_core::CoreError> {
+        self.inner.schema()
+    }
+
+    pub fn metadata(&self) -> Result<crate::table::TableMetadata, splayed_core::CoreError> {
+        self.inner.metadata()
+    }
+
+    pub fn statistics(&self) -> Result<crate::table::TableStatistics, splayed_core::CoreError> {
+        self.inner.statistics()
+    }
+
+    pub fn max_parallelism(&self) -> usize {
+        self.inner.max_parallelism()
+    }
+
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        self.inner.set_max_parallelism(max_parallelism);
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.inner.path()
+    }
+
+    pub fn scheme(&self) -> crate::partition::PartitionScheme {
+        self.inner.scheme()
+    }
+
+    pub fn close(self) -> Result<(), splayed_core::CoreError> {
+        self.inner.close()
     }
 }

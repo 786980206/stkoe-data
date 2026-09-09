@@ -199,6 +199,6 @@ META 创建后 layout 固定、进入只读状态；不提供 update / compress 
 
 - `generation`：uint64，严格单调递增。
 - `META.generation` 是 Dataset 的数据版本；`FIELD.generation` 必须与之匹配，打开 / 首次访问时校验，不一致按过期或损坏处理。
-- `write_field_handle` / `update_field_handle` 成功后递增 `FIELD.generation`。
+- Field 的 `write` / `update_header` 成功后递增 `FIELD.generation`。
 - 文件级替换（META 重建、cast 产物切换）：写临时文件 → fsync → 原子 rename。
 - FIELD data / validity 原地写以 generation 屏障 + 读侧校验保证一致性。

@@ -41,6 +41,10 @@ impl Schema {
     pub fn data_type_of(&self, name: &str) -> Option<DataType> {
         self.position(name).map(|i| self.fields[i].data_type)
     }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.fields.iter().map(|f| f.name.as_ref()).collect()
+    }
 }
 
 #[cfg(test)]

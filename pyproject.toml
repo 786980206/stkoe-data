@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "splayed"
+version = "0.2.0"
+description = "Fast columnar storage engine for financial time series via PyArrow"
+authors = [{ name = "windsing" }]
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "pyarrow>=14.0.0",
+]
+
+[project.urls]
+repository = "https://github.com/windsing/splayed"
+
+[tool.maturin]
+manifest-path = "crates/splayed-python/Cargo.toml"
+module-name = "splayed._splayed"
+python-source = "crates/splayed-python/python"
+bindings = "pyo3"
+features = ["pyo3/extension-module"]
+strip = true

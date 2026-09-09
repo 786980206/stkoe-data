@@ -82,17 +82,17 @@ fn dataset_create_read_write_roundtrip() {
     assert!(create_dataset_data(&root, sample_data(), splayed_core::CreateDatasetOptions::default()).is_err());
 
     let ds = open_dataset(&root, Mode::Read).unwrap();
-    let schema = ds.read_dataset_schema();
+    let schema = ds.schema();
     assert_eq!(schema.len(), 3);
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
 
     // 默认列语义：columns = None → 只返回 sym 与 time（设计文档 §7.10）
-    let view = ds.read_dataset(0, 8, None).unwrap();
+    let view = ds.read(0, 8, None).unwrap();
     assert_eq!(view.schema.len(), 2);
     assert!(view.column("price").is_none());
 
     // 全量读取：sym / time / price
-    let view = ds.read_dataset(0, 8, Some(&["price"])).unwrap();
+    let view = ds.read(0, 8, Some(&["price"])).unwrap();
     assert_eq!(view.length(), 8);
     assert_eq!(view.schema.len(), 3);
     let sym_col = view.column("sym").unwrap();
@@ -115,12 +115,12 @@ fn dataset_create_read_write_roundtrip() {
     assert_eq!(prices, vec![10.0, 11.0, 12.0, 30.0, 31.0, 32.0, 20.0, 21.0]);
 
     // projection：只取 price（sym/time 恒在）
-    let view = ds.read_dataset(0, 8, Some(&["price"])).unwrap();
+    let view = ds.read(0, 8, Some(&["price"])).unwrap();
     assert_eq!(view.schema.len(), 3); // sym + time + price
     assert!(view.column("price").is_some());
 
     // statistics（容量网格：row_count = 8）
-    let stats = ds.read_dataset_statistics().unwrap();
+    let stats = ds.statistics().unwrap();
     assert_eq!(stats.row_count, 8);
     assert_eq!(stats.sym_count, 3);
     assert_eq!(stats.sym_min.as_deref(), Some("AAPL"));
@@ -129,7 +129,7 @@ fn dataset_create_read_write_roundtrip() {
     assert_eq!(stats.time_max, 300);
 
     // 越界
-    assert!(ds.read_dataset(5, 5, None).is_err());
+    assert!(ds.read(5, 5, None).is_err());
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }
@@ -150,10 +150,10 @@ fn dataset_write_and_scan() {
     };
     let schema = Schema::new(vec![FieldSchema::new("price", DataType::Float64)]);
     let view = splayed_format::DataView::new(schema, vec![patch.as_view()]).unwrap();
-    ds.write_dataset(3, &view).unwrap();
+    ds.write(3, &view).unwrap();
 
     // read 验证
-    let view = ds.read_dataset(3, 2, Some(&["price"])).unwrap();
+    let view = ds.read(3, 2, Some(&["price"])).unwrap();
     let prices: Vec<f64> = view
         .column("price")
         .unwrap()
@@ -165,7 +165,7 @@ fn dataset_write_and_scan() {
 
     // scan：time >= 200 → AAPL [1,3) + MSFT [4,5) + GOOG [6,8)
     let pred = Predicate::cmp("time", CmpOp::Ge, Scalar::Int(200));
-    let mut scanner = ds.scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
+    let mut scanner = ds.scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
         for i in 0..r.length {
@@ -177,7 +177,7 @@ fn dataset_write_and_scan() {
 
     // scan：sym == "MSFT" → 行 [6, 8)
     let pred = Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("MSFT".into()));
-    let mut scanner = ds.scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
+    let mut scanner = ds.scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
         for i in 0..r.length {
@@ -189,7 +189,7 @@ fn dataset_write_and_scan() {
 
     // scan：price < 15 → AAPL 的行 [0, 3) 中 10, 11, 12 命中 → 行 0, 1, 2
     let pred = Predicate::cmp("price", CmpOp::Lt, Scalar::Float(15.0));
-    let mut scanner = ds.scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
+    let mut scanner = ds.scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
         for i in 0..r.length {
@@ -204,7 +204,7 @@ fn dataset_write_and_scan() {
         Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("GOOG".into())),
         Predicate::cmp("price", CmpOp::Gt, Scalar::Float(30.0)),
     ]);
-    let mut scanner = ds.scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
+    let mut scanner = ds.scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None }).unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
         for i in 0..r.length {
@@ -229,8 +229,8 @@ fn dataset_struct_ops_and_compression() {
     ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).unwrap();
     // 验证底层物理文件仅 64 字节
     assert_eq!(std::fs::metadata(root.join("volume")).unwrap().len(), 64);
-    assert_eq!(ds.read_dataset_schema().data_type_of("volume"), Some(DataType::Int64));
-    let view = ds.read_dataset(0, 8, Some(&["volume"])).unwrap();
+    assert_eq!(ds.schema().data_type_of("volume"), Some(DataType::Int64));
+    let view = ds.read(0, 8, Some(&["volume"])).unwrap();
     assert_eq!(view.column("volume").unwrap().null_count(), 8);
     // 重复创建 → Error；保留名 → Error
     assert!(ds.create_dataset_field( "volume", DataType::Int64, DatasetFieldInit::AllNull, splayed_core::CreateFieldOptions::default()).is_err());
@@ -253,12 +253,12 @@ fn dataset_struct_ops_and_compression() {
 
     // rename
     ds.rename_dataset_field( "qty", "quantity").unwrap();
-    assert_eq!(ds.read_dataset_schema().data_type_of("quantity"), Some(DataType::Int64));
-    assert!(ds.read_dataset_schema().data_type_of("qty").is_none());
+    assert_eq!(ds.schema().data_type_of("quantity"), Some(DataType::Int64));
+    assert!(ds.schema().data_type_of("qty").is_none());
 
     // cast：f64 → i64（as 语义）
     ds.cast_dataset_field("price", DataType::Int64).unwrap();
-    let view = ds.read_dataset(0, 8, Some(&["price"])).unwrap();
+    let view = ds.read(0, 8, Some(&["price"])).unwrap();
     let prices: Vec<i64> = view
         .column("price")
         .unwrap()
@@ -271,7 +271,7 @@ fn dataset_struct_ops_and_compression() {
     // compress + compressed 下 read/write
     ds.cast_dataset_field("price", DataType::Float64).unwrap();
     ds.compress_dataset_field("price").unwrap();
-    let view = ds.read_dataset(2, 4, Some(&["price"])).unwrap();
+    let view = ds.read(2, 4, Some(&["price"])).unwrap();
     let prices: Vec<f64> = view
         .column("price")
         .unwrap()
@@ -283,7 +283,7 @@ fn dataset_struct_ops_and_compression() {
 
     // delete
     ds.delete_dataset_field( "volume").unwrap();
-    assert!(ds.read_dataset_schema().data_type_of("volume").is_none());
+    assert!(ds.schema().data_type_of("volume").is_none());
 
     ds.close_dataset().unwrap();
 
@@ -338,7 +338,7 @@ fn dataset_index_rebuild() {
     let data = sample_data();
     create_dataset_index(&root, &data.as_view()).unwrap();
     let ds = open_dataset(&root, Mode::Read).unwrap();
-    let view = ds.read_dataset(0, 8, None).unwrap();
+    let view = ds.read(0, 8, None).unwrap();
     assert_eq!(view.length(), 8);
     ds.close_dataset().unwrap();
 
@@ -382,12 +382,12 @@ fn create_dataset_field_failure_leaves_no_residue() {
     assert!(matches!(err, CoreError::Invalid(_)));
     // 半成品不落痕：文件不存在、Schema 不含该字段
     assert!(!root.join("vol").exists());
-    assert!(ds.read_dataset_schema().position("vol").is_none());
+    assert!(ds.schema().position("vol").is_none());
     ds.close_dataset().unwrap();
 
     // 重新 open 不受残留影响（这是修复前的失败场景：零填充占位 header 破坏 build_schema）
     let ds = open_dataset(&root, Mode::Read).unwrap();
-    assert!(ds.read_dataset_schema().position("vol").is_none());
+    assert!(ds.schema().position("vol").is_none());
     ds.close_dataset().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -424,8 +424,8 @@ fn create_dataset_parallel_options() {
 
     for root in [&root1, &root2] {
         let ds = open_dataset(&root, Mode::Read).unwrap();
-        assert_eq!(ds.read_dataset_schema().fields.len(), 4); // sym / time / price / volume
-        let view = ds.read_dataset(0, 4, Some(&["price", "volume"])).unwrap();
+        assert_eq!(ds.schema().fields.len(), 4); // sym / time / price / volume
+        let view = ds.read(0, 4, Some(&["price", "volume"])).unwrap();
         assert_eq!(view.length(), 4);
         assert_eq!(view.column("volume").unwrap().length(), 4);
         ds.close_dataset().unwrap();
@@ -529,7 +529,7 @@ fn write_dataset_parallel_large_matches_expected() {
         vec![price_col.as_view(), volume_col.as_view()],
     )
     .unwrap();
-    ds.write_dataset(0, &patch).unwrap();
+    ds.write(0, &patch).unwrap();
 
     // 重复列名显式拒绝（并行分桶依赖字段唯一）
     let dup = splayed_format::DataView::new(
@@ -541,7 +541,7 @@ fn write_dataset_parallel_large_matches_expected() {
     )
     .unwrap();
     assert!(matches!(
-        ds.write_dataset(0, &dup),
+        ds.write(0, &dup),
         Err(CoreError::Invalid(_))
     ));
 
@@ -549,7 +549,7 @@ fn write_dataset_parallel_large_matches_expected() {
 
     // 重开验证：两字段均被并行写入正确值，NULL 数不变，sym/time 未受影响
     let ds = open_dataset(&root, Mode::Read).unwrap();
-    let view = ds.read_dataset(0, n as u64, Some(&["volume", "price"])).unwrap();
+    let view = ds.read(0, n as u64, Some(&["volume", "price"])).unwrap();
     assert_eq!(
         view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
         vec!["sym", "time", "volume", "price"] // 请求序组装
@@ -591,7 +591,7 @@ fn scan_dataset_parallel_multi_field_matches_brute_force() {
         Predicate::cmp("volume", CmpOp::Lt, Scalar::Int(3)),
     ]);
     let mut scanner = ds
-        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
         .unwrap();
     let mut got = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
@@ -616,7 +616,7 @@ fn scan_dataset_parallel_multi_field_matches_brute_force() {
     // 单字段谓词保持串行快路径语义不变
     let pred = Predicate::cmp("volume", CmpOp::Lt, Scalar::Int(2));
     let mut scanner = ds
-        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
         .unwrap();
     let mut rows = 0u64;
     while let Some(r) = scanner.next().unwrap() {
@@ -637,19 +637,19 @@ fn read_dataset_projection_request_order_and_validation() {
     let ds = open_dataset(&root, Mode::Read).unwrap();
 
     // 输出按 projection 请求序（schema 序为 price, volume）
-    let view = ds.read_dataset(0, 4, Some(&["volume", "price"])).unwrap();
+    let view = ds.read(0, 4, Some(&["volume", "price"])).unwrap();
     assert_eq!(
         view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
         vec!["sym", "time", "volume", "price"]
     );
     // 保留名 / 重复请求被跳过去重，sym/time 恒在最前
-    let view = ds.read_dataset(0, 4, Some(&["price", "sym", "price"])).unwrap();
+    let view = ds.read(0, 4, Some(&["price", "sym", "price"])).unwrap();
     assert_eq!(
         view.schema.fields.iter().map(|f| f.name.as_ref()).collect::<Vec<_>>(),
         vec!["sym", "time", "price"]
     );
     assert!(matches!(
-        ds.read_dataset(0, 4, Some(&["nope"])),
+        ds.read(0, 4, Some(&["nope"])),
         Err(CoreError::Invalid(_))
     ));
     ds.close_dataset().unwrap();
@@ -680,7 +680,7 @@ fn create_dataset_with_compression() {
 
     // 读回值一致
     let ds = open_dataset(&root, Mode::Read).unwrap();
-    let view = ds.read_dataset(0, 4, Some(&["price"])).unwrap();
+    let view = ds.read(0, 4, Some(&["price"])).unwrap();
     let prices: Vec<f64> = view
         .column("price")
         .unwrap()
@@ -705,7 +705,7 @@ fn scan_dataset_symbol_in_or_pushdown() {
     // sym IN ("B") —— 单元素 Or 等价 IN
     let pred = Predicate::Or(vec![Predicate::cmp("sym", CmpOp::Eq, Scalar::Str("B".into()))]);
     let mut scanner = ds
-        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
         .unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
@@ -725,7 +725,7 @@ fn scan_dataset_symbol_in_or_pushdown() {
         Predicate::cmp("time", CmpOp::Ge, Scalar::Int(2)),
     ]);
     let mut scanner = ds
-        .scan_dataset(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
+        .scan(&ScanRequest { ranges: vec![], projection: vec![], predicate: Some(pred), limit: None })
         .unwrap();
     let mut rows = Vec::new();
     while let Some(r) = scanner.next().unwrap() {
@@ -748,28 +748,28 @@ fn dataset_read_write_boundaries_and_zero_length() {
     let ds = open_dataset(&root, Mode::Write).unwrap();
 
     // 1. 读取 length = 0：应成功返回空 DataView，且 schema 保持 (None 只读 sym, time)
-    let view_zero = ds.read_dataset(0, 0, None).unwrap();
+    let view_zero = ds.read(0, 0, None).unwrap();
     assert_eq!(view_zero.length(), 0);
     assert_eq!(view_zero.schema.len(), 2);
 
-    let view_zero_proj = ds.read_dataset(3, 0, Some(&["price"])).unwrap();
+    let view_zero_proj = ds.read(3, 0, Some(&["price"])).unwrap();
     assert_eq!(view_zero_proj.length(), 0);
     assert_eq!(view_zero_proj.schema.len(), 3);
 
     // 2. 越界读取检查
-    assert!(ds.read_dataset(0, 9, None).is_err());
-    assert!(ds.read_dataset(8, 1, None).is_err());
-    assert!(ds.read_dataset(u64::MAX, 1, None).is_err());
+    assert!(ds.read(0, 9, None).is_err());
+    assert!(ds.read(8, 1, None).is_err());
+    assert!(ds.read(u64::MAX, 1, None).is_err());
 
     // 3. 包含保留名字段作为 projection（sym, time 被内部识别并安全处理）
-    let view_res = ds.read_dataset(2, 3, Some(&["sym", "time", "price"])).unwrap();
+    let view_res = ds.read(2, 3, Some(&["sym", "time", "price"])).unwrap();
     assert_eq!(view_res.length(), 3);
     assert_eq!(view_res.column("sym").unwrap().length(), 3);
     assert_eq!(view_res.column("time").unwrap().length(), 3);
     assert_eq!(view_res.column("price").unwrap().length(), 3);
 
     // 4. 重复指定列名投影（去重返回）
-    let view_dup = ds.read_dataset(0, 2, Some(&["price", "price"])).unwrap();
+    let view_dup = ds.read(0, 2, Some(&["price", "price"])).unwrap();
     assert_eq!(view_dup.schema.len(), 3); // sym, time, price（不重复出现 price）
 
     // 5. 写入越界检查
@@ -785,11 +785,11 @@ fn dataset_read_write_boundaries_and_zero_length() {
     )
     .unwrap();
     // offset 7 写入 2 行（7+2 = 9 > 8），应报错
-    assert!(ds.write_dataset(7, &patch_data.as_view()).is_err());
+    assert!(ds.write(7, &patch_data.as_view()).is_err());
 
     // 正好写入末尾：offset 6 写入 2 行（6+2 = 8 == 8），应成功
-    ds.write_dataset(6, &patch_data.as_view()).unwrap();
-    let read_tail = ds.read_dataset(6, 2, Some(&["price"])).unwrap();
+    ds.write(6, &patch_data.as_view()).unwrap();
+    let read_tail = ds.read(6, 2, Some(&["price"])).unwrap();
     assert_eq!(
         bytemuck::cast_slice::<u8, f64>(read_tail.column("price").unwrap().segments()[0].fixed_bytes().unwrap()),
         &[99.0, 100.0]
@@ -810,7 +810,7 @@ fn dataset_skeleton_create_and_schema_read() {
         FieldSchema::new("factor.ret20", DataType::Float32),
     ]);
     let ds = create_dataset(&root, &schema).unwrap();
-    assert_eq!(ds.read_dataset_schema().len(), 4);
+    assert_eq!(ds.schema().len(), 4);
     assert!(root.join(".meta").exists());
     assert_eq!(std::fs::metadata(root.join("price")).unwrap().len(), 64);
     assert_eq!(std::fs::metadata(root.join("factor/ret20")).unwrap().len(), 64);
@@ -825,7 +825,7 @@ fn dataset_update_and_rename_and_read_schema() {
     let data1 = sample_data(); // 8 rows
     splayed_core::init_dataset(&root, &data1.as_view(), None).unwrap();
     let mut ds = splayed_core::open_dataset(&root, Mode::Write).unwrap();
-    assert_eq!(ds.read_dataset_schema().len(), 3); // sym, time, price
+    assert_eq!(ds.schema().len(), 3); // sym, time, price
 
     // 1. read_dataset_schema free function from path
     let schema_from_path = splayed_core::read_dataset_schema(&root).unwrap();
@@ -834,9 +834,9 @@ fn dataset_update_and_rename_and_read_schema() {
     // 2. update_dataset 全量原子替换（更新为 2 行，包含新列 volume）
     let data2 = make_data(&["AAPL", "GOOG"], &[100, 200], &[10.5, 20.5]);
     ds.update_dataset(&data2.as_view()).unwrap();
-    assert_eq!(ds.read_dataset_statistics().unwrap().row_count, 2);
+    assert_eq!(ds.statistics().unwrap().row_count, 2);
 
-    let read_back = ds.read_dataset(0, 2, None).unwrap();
+    let read_back = ds.read(0, 2, None).unwrap();
     assert_eq!(read_back.length(), 2);
 
     ds.close_dataset().unwrap();
@@ -848,13 +848,70 @@ fn dataset_update_and_rename_and_read_schema() {
     assert!(new_root.exists());
 
     let reopened = splayed_core::open_dataset(&new_root, Mode::Read).unwrap();
-    assert_eq!(reopened.read_dataset_statistics().unwrap().row_count, 2);
+    assert_eq!(reopened.statistics().unwrap().row_count, 2);
     reopened.close_dataset().unwrap();
 
     // 4. drop_dataset
     let to_drop = splayed_core::open_dataset(&new_root, Mode::Write).unwrap();
     splayed_core::drop_dataset(to_drop).unwrap();
     assert!(!new_root.exists());
+
+    cleanup(&dir);
+}
+
+#[test]
+fn dataset_reader_writer_oop_lifecycle() {
+    let dir = temp_dir("ds_oop");
+    let root = dir.join("ds");
+    let schema = Schema::new(vec![
+        FieldSchema::new("sym", DataType::Utf8),
+        FieldSchema::new("time", DataType::TimestampUs),
+        FieldSchema::new("price", DataType::Float64),
+    ]);
+
+    // 1. DatasetWriter::create
+    let writer = splayed_core::DatasetWriter::create(&root, &schema).unwrap();
+    assert_eq!(writer.schema().len(), 3);
+    writer.close().unwrap();
+
+    // 2. FieldReader / FieldWriter
+    let price_path = root.join("price");
+    let fw = splayed_core::FieldWriter::open(&price_path).unwrap();
+    assert_eq!(fw.schema().data_type, DataType::Float64);
+    assert_eq!(fw.row_count(), 0);
+    fw.close().unwrap();
+
+    let fr = splayed_core::FieldReader::open(&price_path).unwrap();
+    assert_eq!(fr.row_count(), 0);
+    fr.close().unwrap();
+
+    // 3. IndexReader / IndexWriter
+    let meta_path = root.join(".meta");
+    let iw = splayed_core::IndexWriter::open(&meta_path).unwrap();
+    assert_eq!(iw.schema().len(), 2);
+    iw.close().unwrap();
+
+    let ir = splayed_core::IndexReader::open(&meta_path).unwrap();
+    assert_eq!(ir.schema().len(), 2);
+    ir.close().unwrap();
+
+    // 4. DatasetWriter::init and DatasetReader::open
+    let root_init = dir.join("ds_init");
+    let sample = sample_data();
+    let dw = splayed_core::DatasetWriter::init(&root_init, &sample.as_view(), None).unwrap();
+    assert_eq!(dw.schema().len(), 3);
+    dw.close().unwrap();
+
+    let dr = splayed_core::DatasetReader::open(&root_init).unwrap();
+    assert_eq!(dr.statistics().unwrap().row_count, 8);
+    let view = dr.read(0, 4, None).unwrap();
+    assert_eq!(view.length(), 4);
+    dr.close().unwrap();
+
+    // 5. DatasetWriter::remove
+    let dw_del = splayed_core::DatasetWriter::open(&root_init).unwrap();
+    dw_del.remove().unwrap();
+    assert!(!root_init.exists());
 
     cleanup(&dir);
 }

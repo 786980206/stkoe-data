@@ -318,9 +318,14 @@ pub fn column_view_to_owned_column(view: &ColumnView<'_>) -> Column {
     }
 }
 
-/// 创建仅包含 64 字节文件头的空字段骨架（row_count = 0, null_count = 0, data_length = 0）。
-pub fn create_field(path: &Path, field_type: DataType) -> Result<(), CoreError> {
-    create_field_file(path, field_type, FieldInit::Length(0), CreateFieldOptions::default())
+/// 创建空字段骨架或指定行数的全 NULL 字段（当 rows = None 或 rows = Some(0) 时为 0 行骨架；当 rows > 0 时为指定行数的全 NULL Header-Only 延迟展开字段）。
+pub fn create_field(
+    path: &Path,
+    field_type: DataType,
+    rows: Option<u64>,
+    options: Option<CreateFieldOptions>,
+) -> Result<(), CoreError> {
+    create_field_file(path, field_type, FieldInit::Length(rows.unwrap_or(0)), options.unwrap_or_default())
 }
 
 /// 连带数据初始化创建字段文件（带数据一步直写，全 NULL 产出 64B Header-Only 文件，零缓冲内存分配）。
@@ -330,6 +335,16 @@ pub fn init_field(
     options: Option<CreateFieldOptions>,
 ) -> Result<(), CoreError> {
     create_field_file_from_view(path, column, &options.unwrap_or_default())
+}
+
+/// 指定行数初始化全 NULL 字段文件（64B Header-Only 延迟展开，零磁盘数据页分配）。
+pub fn init_field_empty(
+    path: &Path,
+    data_type: DataType,
+    rows: u64,
+    options: Option<CreateFieldOptions>,
+) -> Result<(), CoreError> {
+    create_field_file(path, data_type, FieldInit::Length(rows), options.unwrap_or_default())
 }
 
 /// 直接基于 `&ColumnView` 零拷贝写入 Field 文件。
@@ -490,6 +505,166 @@ fn create_field_file_view_chunked(
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&header.to_bytes())?;
     Ok(())
+}
+
+/// 只读字段对象
+pub struct FieldReader {
+    inner: FieldHandle,
+}
+
+impl FieldReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = open_field_file(path, Mode::Read)?;
+        Ok(Self { inner })
+    }
+
+    pub fn read(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
+        self.inner.read(offset, length)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn schema(&self) -> FieldSchema {
+        self.inner.schema()
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.inner.row_count()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close_field()
+    }
+}
+
+/// 可写字段对象
+pub struct FieldWriter {
+    inner: FieldHandle,
+}
+
+impl FieldWriter {
+    pub fn create(
+        path: &Path,
+        field_type: DataType,
+        rows: Option<u64>,
+        options: Option<CreateFieldOptions>,
+    ) -> Result<Self, CoreError> {
+        create_field(path, field_type, rows, options)?;
+        Self::open(path)
+    }
+
+    pub fn init(path: &Path, data: &ColumnView<'_>, options: Option<CreateFieldOptions>) -> Result<Self, CoreError> {
+        init_field(path, data, options)?;
+        Self::open(path)
+    }
+
+    /// 指定行数初始化全 NULL 字段（64B Header-Only 延迟展开）
+    pub fn init_empty(path: &Path, data_type: DataType, rows: u64, options: Option<CreateFieldOptions>) -> Result<Self, CoreError> {
+        init_field_empty(path, data_type, rows, options)?;
+        Self::open(path)
+    }
+
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = open_field_file(path, Mode::Write)?;
+        Ok(Self { inner })
+    }
+
+    pub fn write(&mut self, offset: u64, data: &ColumnView<'_>) -> Result<(), CoreError> {
+        self.inner.write(offset, data)
+    }
+
+    pub fn read(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
+        self.inner.read(offset, length)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn update(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError> {
+        self.inner.update(data)
+    }
+
+    pub fn rename(&mut self, new_name: &str) -> Result<(), CoreError> {
+        let old_path = self.inner.path.clone();
+        let parent = old_path.parent().unwrap_or_else(|| Path::new("."));
+        let target = parent.join(new_name);
+        if target.exists() {
+            return Err(CoreError::AlreadyExists(target));
+        }
+        self.inner.mode = Mode::Read;
+        drop(std::mem::replace(&mut self.inner.backing, Backing::Empty));
+        self.inner.working = None;
+        fs::rename(&old_path, &target).map_err(|e| map_io(&old_path, e))?;
+        self.inner = open_field_file(&target, Mode::Write)?;
+        Ok(())
+    }
+
+    pub fn cast(&mut self, target_type: DataType) -> Result<(), CoreError> {
+        let path = self.inner.path.clone();
+        self.inner.mode = Mode::Read;
+        drop(std::mem::replace(&mut self.inner.backing, Backing::Empty));
+        self.inner.working = None;
+        cast_field_file(&path, target_type)?;
+        self.inner = open_field_file(&path, Mode::Write)?;
+        Ok(())
+    }
+
+    pub fn compress(&mut self) -> Result<(), CoreError> {
+        let path = self.inner.path.clone();
+        self.inner.mode = Mode::Read;
+        drop(std::mem::replace(&mut self.inner.backing, Backing::Empty));
+        self.inner.working = None;
+        compress_field_file(&path, None)?;
+        self.inner = open_field_file(&path, Mode::Write)?;
+        Ok(())
+    }
+
+    pub fn decompress(&mut self) -> Result<(), CoreError> {
+        let path = self.inner.path.clone();
+        self.inner.mode = Mode::Read;
+        drop(std::mem::replace(&mut self.inner.backing, Backing::Empty));
+        self.inner.working = None;
+        decompress_field_file(&path)?;
+        self.inner = open_field_file(&path, Mode::Write)?;
+        Ok(())
+    }
+
+    pub fn update_header(&mut self, header: FieldHeader) -> Result<(), CoreError> {
+        self.inner.update_header(header)
+    }
+
+    pub fn schema(&self) -> FieldSchema {
+        self.inner.schema()
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.inner.row_count()
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn as_reader(&self) -> Result<FieldReader, CoreError> {
+        FieldReader::open(self.inner.path())
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close_field()
+    }
+
+    pub fn remove(self) -> Result<(), CoreError> {
+        let path = self.inner.path.clone();
+        self.close()?;
+        delete_field_file(&path)
+    }
 }
 
 /// 打开已有 Field（open 不负责创建）。
@@ -753,9 +928,15 @@ impl FieldHandle {
         self.header.is_chunked()
     }
 
-    pub fn read_field_schema(&self) -> FieldSchema {
+    #[inline]
+    pub fn schema(&self) -> FieldSchema {
         let name = self.path.file_name().unwrap_or_default().to_string_lossy().to_string();
         FieldSchema::new(name, self.data_type())
+    }
+
+    #[inline]
+    pub fn read_field_schema(&self) -> FieldSchema {
+        self.schema()
     }
 
     fn uncompressed_slices(&self) -> Result<(&[u8], Option<&[u8]>), CoreError> {
@@ -849,19 +1030,34 @@ impl FieldHandle {
 
     // --------------------------------------------------------------- read
 
-    #[inline]
-    pub fn read_field(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
+    /// 按逻辑行（= 物理行）读取，返回 zero-copy ColumnView。
+    pub fn read(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
         self.read_field_handle(offset, length)
     }
 
     #[inline]
-    pub fn write_field(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
+    pub fn read_field(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError> {
+        self.read(offset, length)
+    }
+
+    #[inline]
+    pub fn write(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
         self.write_field_handle(offset, data)
     }
 
     #[inline]
+    pub fn write_field(&mut self, offset: u64, data: &ColumnView) -> Result<(), CoreError> {
+        self.write(offset, data)
+    }
+
+    #[inline]
+    pub fn update(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError> {
+        self.update_field(data)
+    }
+
+    #[inline]
     pub fn scan_field(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
-        self.scan_field_handle(request)
+        self.scan(request)
     }
 
     pub fn update_field(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError> {
@@ -1096,8 +1292,8 @@ impl FieldHandle {
 
     /// 修改 header（不改 data）：data_type / row_count 必须与现值一致；
     /// 成功后递增 generation。uncompressed 立即落盘（mmap），compressed 随 close 收尾。
-    pub fn update_field_handle(&mut self, mut header: FieldHeader) -> Result<(), CoreError> {
-        self.mode.require_write("update_field_handle")?;
+    pub fn update_header(&mut self, mut header: FieldHeader) -> Result<(), CoreError> {
+        self.mode.require_write("update_header")?;
         header.magic = self.header.magic;
         header.version = self.header.version;
         header.data_type = self.header.data_type;
@@ -1125,13 +1321,18 @@ impl FieldHandle {
         Ok(())
     }
 
+    #[inline]
+    pub fn update_field_handle(&mut self, header: FieldHeader) -> Result<(), CoreError> {
+        self.update_header(header)
+    }
+
     // --------------------------------------------------------------- scan
 
     /// 条件扫描：只返回 ranges，不物化数据（docs/core/field.md §5.7）。
     ///
     /// ranges 直接顺序消费：仅与 `[0, row_count)` 求交防越界（保序，不排序不合并——
     /// 有序不重叠由上游保证）；空 ranges = 整个 Field。
-    pub fn scan_field_handle(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
+    pub fn scan(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
         let ranges = if request.ranges.is_empty() {
             vec![RowRange::new(0, self.row_count())]
         } else {
@@ -1153,6 +1354,11 @@ impl FieldHandle {
             mask_pos: 0,
             done: false,
         })
+    }
+
+    #[inline]
+    pub fn scan_field_handle(&self, request: &ScanRequest) -> Result<FieldScanner<'_>, CoreError> {
+        self.scan(request)
     }
 
     /// 供 scanner 的整段连续视图（PLAIN: mmap 切片；compressed: working 切片，零拷贝）。
@@ -1314,7 +1520,7 @@ impl FieldChunkReader for CastReader {
             return Ok(None);
         }
         let n = CAST_BATCH_ROWS.min(self.total - self.offset) as usize;
-        let view = self.handle.read_field_handle(self.offset, n as u64)?;
+        let view = self.handle.read(self.offset, n as u64)?;
         // 逐段处理：values 按段转换拼接；validity 按段位级拼接进全局位流。
         // （clone_view 的 validity 是逐段字节对齐拼接，段边界非字节对齐时不能跨段消费）
         let mut converted = Vec::with_capacity(n * self.dst.size_of());

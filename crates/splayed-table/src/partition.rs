@@ -15,6 +15,14 @@ pub enum PartitionScheme {
 }
 
 impl PartitionScheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PartitionScheme::None => "none",
+            PartitionScheme::Year => "year",
+            PartitionScheme::Month => "month",
+            PartitionScheme::Date => "date",
+        }
+    }
     /// 从分区目录名前缀推断方案（`year=2026` → Year）。
     pub fn from_partition_name(name: &str) -> Option<Self> {
         let prefix = name.split('=').next()?;

@@ -1,0 +1,22 @@
+[package]
+name = "splayed-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Python bindings for Splayed columnar storage engine via PyArrow"
+
+[lib]
+name = "_splayed"
+crate-type = ["cdylib"]
+
+[dependencies]
+splayed-format = { path = "../splayed-format" }
+splayed-core = { path = "../splayed-core" }
+splayed-table = { path = "../splayed-table" }
+splayed-arrow = { path = "../splayed-arrow" }
+arrow = { version = "56", features = ["ffi", "pyarrow"] }
+arrow-array = "56"
+arrow-schema = "56"
+pyo3 = { version = "=0.25.1", features = ["extension-module", "abi3", "abi3-py38"] }

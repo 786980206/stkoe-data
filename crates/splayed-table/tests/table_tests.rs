@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use splayed_format::{Bitmap, Buffer, Column, Data, DataType, FieldSchema, Schema};
 use splayed_core::{CmpOp, Mode, Predicate, Scalar};
 use splayed_table::{
-    create_table, create_table_columns, create_table_data, create_table_partition, delete_table,
+    create_table, create_table_data, create_table_partition, delete_table,
     delete_table_partition, open_table, query_table, rename_table, scan_table, write_table,
     PartitionScheme, TableOptions, TableScanRequest,
 };
@@ -130,21 +130,21 @@ fn month_table_create_query() {
     assert_eq!(table.scheme(), PartitionScheme::Month);
 
     // metadata：分区边界
-    let meta = table.read_table_metadata().unwrap();
+    let meta = table.metadata().unwrap();
     assert_eq!(meta.partitions.len(), 2);
     assert_eq!(meta.partitions[0].name, "month=2026-08");
     assert_eq!(meta.ordering, vec!["sym", "time"]);
     assert!(meta.capabilities.limit_pushdown);
 
     // statistics：row_count 求和
-    let stats = table.read_table_statistics().unwrap();
+    let stats = table.statistics().unwrap();
     assert_eq!(stats.row_count, 8);
     assert_eq!(stats.partition_count, 2);
     assert_eq!(stats.sym_min.as_deref(), Some("AAPL"));
     assert_eq!(stats.sym_max.as_deref(), Some("MSFT"));
 
     // schema：最后一个 Partition（09）的 schema
-    let schema = table.read_table_schema().unwrap();
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
 
     // query：全表（Partition ASC + sym/time ASC）
@@ -293,7 +293,7 @@ fn partition_and_table_lifecycle() {
     assert!(root2.join("month=2026-08").exists());
 
     let table = open_table(&root2, Mode::Read, TableOptions::default()).unwrap();
-    let stats = table.read_table_statistics().unwrap();
+    let stats = table.statistics().unwrap();
     assert_eq!(stats.row_count, 2);
     assert_eq!(stats.partition_count, 2);
     drop(table);
@@ -363,17 +363,16 @@ fn table_field_structure_operations() {
     create_table_data(&root, month_sample(), PartitionScheme::Month, TableOptions::default()).unwrap();
     let table = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
 
-    // create：全 NULL
-    table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).unwrap();
-    // 验证各分区物理文件大小均为 64B
-    let meta = table.read_table_metadata().unwrap();
-    for p in meta.partitions {
-        assert_eq!(std::fs::metadata(root.join(&p.name).join("volume")).unwrap().len(), 64);
-    }
-    let schema = table.read_table_schema().unwrap();
+    // init_field：全 NULL（仅在最新分区创建，行数自动与 index 对齐）
+    table.init_field("volume", DataType::Int64, None).unwrap();
+    // 验证最新分区物理文件大小为 64B
+    let meta = table.metadata().unwrap();
+    let latest_p = meta.partitions.last().unwrap();
+    assert_eq!(std::fs::metadata(root.join(&latest_p.name).join("volume")).unwrap().len(), 64);
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
     // 重复创建 → Error
-    assert!(table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).is_err());
+    assert!(table.init_field("volume", DataType::Int64, None).is_err());
 
     // update：header（volume 保持 Int64，行数由 core 强制）
     // update 需要合法 FieldHeader：用 core 的 new_uncompressed 构造
@@ -381,21 +380,24 @@ fn table_field_structure_operations() {
     table.update_table_field("volume", header).unwrap();
 
     // rename
-    table.rename_table_field("volume", "vol").unwrap();
-    let schema = table.read_table_schema().unwrap();
+    table.rename_field("volume", "vol").unwrap();
+    let schema = table.schema().unwrap();
     assert!(schema.data_type_of("volume").is_none());
     assert_eq!(schema.data_type_of("vol"), Some(DataType::Int64));
 
     // cast：price f64 → i64 → f64
-    table.cast_table_field("price", DataType::Int64).unwrap();
-    let schema = table.read_table_schema().unwrap();
+    table.cast_field("price", DataType::Int64).unwrap();
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("price"), Some(DataType::Int64));
-    table.cast_table_field("price", DataType::Float64).unwrap();
+    table.cast_field("price", DataType::Float64).unwrap();
 
     // compress / decompress
-    table.compress_table_field("price").unwrap();
+    table.compress_field("price").unwrap();
     {
-        let req = TableScanRequest::default();
+        let req = TableScanRequest {
+            projection: vec!["price".to_string()],
+            ..Default::default()
+        };
         let mut reader = splayed_table::query_table(&table, req, None).unwrap();
         let mut prices = Vec::new();
         while let Some(view) = reader.next().unwrap() {
@@ -407,15 +409,15 @@ fn table_field_structure_operations() {
             vec![10.0, 11.0, 20.0, 21.0, 12.0, 13.0, 22.0, 23.0]
         );
     }
-    table.decompress_table_field("price").unwrap();
+    table.decompress_field("price").unwrap();
 
     // delete
-    table.delete_table_field("vol").unwrap();
-    assert!(table.read_table_schema().unwrap().data_type_of("vol").is_none());
+    table.delete_field("vol").unwrap();
+    assert!(table.schema().unwrap().data_type_of("vol").is_none());
 
     // 前置校验：缺字段 → Error
-    assert!(table.rename_table_field("vol", "vol2").is_err());
-    assert!(table.delete_table_field("vol").is_err());
+    assert!(table.rename_field("vol", "vol2").is_err());
+    assert!(table.delete_field("vol").is_err());
 
     table.close().unwrap();
     cleanup(&dir);
@@ -647,28 +649,28 @@ fn table_field_struct_ops_parallel_and_state_checks() {
     assert_eq!(before.len(), 12);
 
     let table = open_table(&root, Mode::Write, TableOptions { max_parallelism: Some(8), ..Default::default() }).unwrap();
-    // create：并行全分区新增（全 NULL = 稀疏 set_len，非逐行写入）
-    table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).unwrap();
-    assert_eq!(table.read_table_schema().unwrap().data_type_of("volume"), Some(DataType::Int64));
-    assert!(table.create_table_field("volume", DataType::Int64, splayed_table::TableFieldInit::AllNull).is_err()); // 已存在 → Invalid
-    assert!(table.delete_table_field("nope").is_err()); // 缺字段 → Invalid
+    // init_field：最新分区新增（全 NULL = 稀疏 set_len，非逐行写入）
+    table.init_field("volume", DataType::Int64, None).unwrap();
+    assert_eq!(table.schema().unwrap().data_type_of("volume"), Some(DataType::Int64));
+    assert!(table.init_field("volume", DataType::Int64, None).is_err()); // 已存在 → Invalid
+    assert!(table.delete_field("nope").is_err()); // 缺字段 → Invalid
 
     // compress / decompress：并行重操作；64B header 状态前置校验
-    table.compress_table_field("price").unwrap();
-    assert!(table.compress_table_field("price").is_err()); // 已压缩 → Invalid
-    assert!(table.decompress_table_field("volume").is_err()); // 未压缩 → Invalid
-    table.decompress_table_field("price").unwrap();
-    assert!(table.decompress_table_field("price").is_err()); // 已解压 → Invalid
+    table.compress_field("price").unwrap();
+    assert!(table.compress_field("price").is_err()); // 已压缩 → Invalid
+    assert!(table.decompress_field("volume").is_err()); // 未压缩 → Invalid
+    table.decompress_field("price").unwrap();
+    assert!(table.decompress_field("price").is_err()); // 已解压 → Invalid
 
     // cast：f64 → f32 → f64 往返（小整数值精确）；跨分区类型一致才允许
-    table.cast_table_field("price", DataType::Float32).unwrap();
-    table.cast_table_field("price", DataType::Float64).unwrap();
+    table.cast_field("price", DataType::Float32).unwrap();
+    table.cast_field("price", DataType::Float64).unwrap();
 
     // rename：保留名冲突 → Invalid
-    assert!(table.rename_table_field("price", "sym").is_err());
-    table.rename_table_field("volume", "qty").unwrap();
-    table.delete_table_field("qty").unwrap();
-    assert_eq!(table.read_table_schema().unwrap().data_type_of("qty"), None);
+    assert!(table.rename_field("price", "sym").is_err());
+    table.rename_field("volume", "qty").unwrap();
+    table.delete_field("qty").unwrap();
+    assert_eq!(table.schema().unwrap().data_type_of("qty"), None);
     table.close().unwrap();
 
     // 全部重操作往返后 price 数据不变（分区级并行正确性）
@@ -706,7 +708,7 @@ fn metadata_read_apis_cache_semantics() {
 
     // statistics：row_count 求和 + **实际数据**的 time 界（time_min 聚合 bug 回归：
     // 不得为 default 的 0）+ sym 界
-    let st = table.read_table_statistics().unwrap();
+    let st = table.statistics().unwrap();
     assert_eq!(st.partition_count, 2);
     assert_eq!(st.row_count, 8);
     assert_eq!(st.time_min, d(7, 1) as i64);
@@ -715,10 +717,10 @@ fn metadata_read_apis_cache_semantics() {
     assert_eq!(st.sym_max.as_deref(), Some("MSFT"));
 
     // 缓存路径：第二次调用结果一致（逐分区 memo 命中）
-    assert_eq!(table.read_table_statistics().unwrap(), st);
+    assert_eq!(table.statistics().unwrap(), st);
 
     // metadata：分区名升序 + 分区范围由名字纯推导（零 I/O）
-    let md = table.read_table_metadata().unwrap();
+    let md = table.metadata().unwrap();
     assert_eq!(md.partitions.len(), 2);
     assert_eq!(md.partitions[0].name, "month=2026-07");
     assert_eq!(md.partitions[1].name, "month=2026-08");
@@ -728,23 +730,23 @@ fn metadata_read_apis_cache_semantics() {
     // 缓存新鲜度（关键）：handle 打开期间**外部**新建分区 → 统计/元数据自动纳入
     let sep = make_data(&[("AAPL", d(9, 1), 1.0), ("MSFT", d(9, 2), 2.0)]);
     create_table_partition(&root, "month=2026-09", sep, splayed_core::CreateDatasetOptions::default()).unwrap();
-    let st2 = table.read_table_statistics().unwrap();
+    let st2 = table.statistics().unwrap();
     assert_eq!(st2.partition_count, 3);
     assert_eq!(st2.row_count, 10);
     assert_eq!(st2.time_max, d(9, 2) as i64);
-    let md2 = table.read_table_metadata().unwrap();
+    let md2 = table.metadata().unwrap();
     assert_eq!(md2.partitions.len(), 3);
     assert_eq!(md2.partitions[2].name, "month=2026-09");
 
     // 外部删除分区 → 自动剔除
     delete_table_partition(&root, "month=2026-07").unwrap();
-    let st3 = table.read_table_statistics().unwrap();
+    let st3 = table.statistics().unwrap();
     assert_eq!(st3.partition_count, 2);
     assert_eq!(st3.row_count, 6);
     assert_eq!(st3.time_min, d(8, 1) as i64);
 
     // schema：仍为最后分区（month=2026-09）的 Schema
-    let schema = table.read_table_schema().unwrap();
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
     cleanup(&dir);
 }
@@ -996,11 +998,12 @@ fn table_streaming_writer_and_create_partition() {
     reader.close().unwrap();
     assert_eq!(got, vec![10.0, 11.0, 20.0, 21.0]);
 
-    // 2. 使用 table.create_partition 动态追加新月份分区
+    // 2. 以 Write 模式重新打开并使用 write_table 自动追加新月份分区
+    let table_write = open_table(&root, Mode::Write, TableOptions::default()).unwrap();
     let batch3 = make_data(&[("GOOG", d(9, 1), 30.0)]);
-    table.create_partition("month=2026-09", &batch3.as_view(), None).unwrap();
+    write_table(&table_write, &batch3.as_view()).unwrap();
 
-    let mut reader2 = query_table(&table, TableScanRequest::default(), None).unwrap();
+    let mut reader2 = query_table(&table_write, TableScanRequest::default(), None).unwrap();
     let mut got2 = Vec::new();
     while let Some(view) = reader2.next().unwrap() {
         got2.extend(f64s(view.column("price").unwrap()));
@@ -1008,6 +1011,7 @@ fn table_streaming_writer_and_create_partition() {
     reader2.close().unwrap();
     assert_eq!(got2, vec![10.0, 11.0, 20.0, 21.0, 30.0]);
 
+    table_write.close().unwrap();
     table.close().unwrap();
     cleanup(&dir);
 }
@@ -1041,7 +1045,7 @@ fn create_table_schema_and_latest_partition_skeleton() {
     assert_eq!(ret20_meta.len(), 64);
 
     // 2. 验证立即能够读取到完整的全表 Schema
-    let read_schema = table.read_table_schema().unwrap();
+    let read_schema = table.schema().unwrap();
     assert_eq!(read_schema.fields.len(), 4);
     assert_eq!(read_schema.fields[0].name.as_ref(), "sym");
     assert_eq!(read_schema.fields[1].name.as_ref(), "time");
@@ -1057,9 +1061,9 @@ fn create_table_schema_and_latest_partition_skeleton() {
         None,
         None,
     ).unwrap();
-    let schema2 = table2.read_table_schema().unwrap();
+    let schema2 = table2.schema().unwrap();
     assert_eq!(schema2.fields.len(), 4);
-    assert!(!table2.read_table_metadata().unwrap().partitions.is_empty());
+    assert!(!table2.metadata().unwrap().partitions.is_empty());
 
     table.close().unwrap();
     table2.close().unwrap();
@@ -1211,10 +1215,10 @@ fn create_table_columns_creates_missing_columns_subset() {
             ("qty", fixed_col(DataType::Int32, bytemuck::cast_slice(&i32v).to_vec())),
         ],
     );
-    create_table_columns(&table, &data.as_view()).unwrap();
+    write_table(&table, &data.as_view()).unwrap();
 
     // schema 含新列且类型正确
-    let schema = table.read_table_schema().unwrap();
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("volume"), Some(DataType::Int64));
     assert_eq!(schema.data_type_of("qty"), Some(DataType::Int32));
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
@@ -1278,9 +1282,9 @@ fn create_table_columns_skips_existing_same_type() {
             ("volume", fixed_col(DataType::Int64, bytemuck::cast_slice(&vv).to_vec())),
         ],
     );
-    create_table_columns(&table, &data.as_view()).unwrap();
+    write_table(&table, &data.as_view()).unwrap();
 
-    // price 未被改写（仍是 11.0 / 21.0），volume 正确创建
+    // write_table 写入已有列 price 会更新覆盖对应行（999.0 / 888.0），新列 volume 正确创建
     let req = TableScanRequest::default();
     let mut reader = query_table(&table, req, None).unwrap();
     let mut price = Vec::new();
@@ -1292,7 +1296,7 @@ fn create_table_columns_skips_existing_same_type() {
         }
     }
     reader.close().unwrap();
-    assert_eq!(price, vec![10.0, 11.0, 20.0, 21.0, 12.0, 13.0, 22.0, 23.0]);
+    assert_eq!(price, vec![10.0, 999.0, 20.0, 888.0, 12.0, 13.0, 22.0, 23.0]);
     // volume 已在各分区创建：08-04 覆盖行有值（1,2），其余行 NULL
     assert_eq!(volume, vec![0, 1, 0, 2, 0, 0, 0, 0]);
     drop(table);
@@ -1314,11 +1318,11 @@ fn create_table_columns_refuses_conflicting_type() {
         &[("AAPL", d803), ("MSFT", d803)],
         vec![("price", fixed_col(DataType::Int64, bytemuck::cast_slice(&iv).to_vec()))],
     );
-    let err = create_table_columns(&table, &data.as_view()).unwrap_err();
+    let err = write_table(&table, &data.as_view()).unwrap_err();
     assert!(matches!(err, splayed_core::CoreError::Invalid(_)));
 
     // 无残留：schema 仍是 price(Float64)，无新增列
-    let schema = table.read_table_schema().unwrap();
+    let schema = table.schema().unwrap();
     assert_eq!(schema.data_type_of("price"), Some(DataType::Float64));
     assert_eq!(schema.data_type_of("volume"), None);
     drop(table);
@@ -1394,7 +1398,7 @@ fn table_partition_delete_and_rescan() {
 
     // 重新打开表并扫描，此时只剩下 2026-09 分区的 4 行
     let table = open_table(&root, Mode::Read, TableOptions::default()).unwrap();
-    let meta = table.read_table_metadata().unwrap();
+    let meta = table.metadata().unwrap();
     let partitions: Vec<String> = meta.partitions.iter().map(|p| p.name.clone()).collect();
     assert_eq!(partitions, vec!["month=2026-09"]);
 
@@ -1424,7 +1428,7 @@ fn update_table_and_delete_partition() {
     ]);
     splayed_table::init_table(&root, PartitionScheme::Month, &initial.as_view(), None).unwrap();
     let table = splayed_table::open_table(&root, Mode::Write, TableOptions::default()).unwrap();
-    assert_eq!(table.read_table_statistics().unwrap().row_count, 3);
+    assert_eq!(table.statistics().unwrap().row_count, 3);
     assert_eq!(splayed_table::read_table_schema(&table).unwrap().len(), 3);
 
     // 1. 全量更新表数据（8 月更新为 1 行，9 月更新为 1 行，并自动创建 10 月新分区 1 行）
@@ -1434,18 +1438,211 @@ fn update_table_and_delete_partition() {
         ("GOOG", d(10, 1), 77.0),
     ]);
     splayed_table::update_table(&table, &update_data.as_view()).unwrap();
-    assert_eq!(table.read_table_statistics().unwrap().row_count, 3);
+    assert_eq!(table.statistics().unwrap().row_count, 3);
 
     // 2. 验证 10 月分区已自动建立
-    let meta = table.read_table_metadata().unwrap();
+    let meta = table.metadata().unwrap();
     assert_eq!(meta.partitions.len(), 3);
     assert_eq!(meta.partitions[2].name, "month=2026-10");
 
     // 3. 删除指定分区
     table.delete_partition("month=2026-08").unwrap();
-    assert_eq!(table.read_table_metadata().unwrap().partitions.len(), 2);
-    assert_eq!(table.read_table_statistics().unwrap().row_count, 2);
+    assert_eq!(table.metadata().unwrap().partitions.len(), 2);
+    assert_eq!(table.statistics().unwrap().row_count, 2);
 
     table.close_table().unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn table_reader_writer_oop_lifecycle() {
+    let dir = temp_dir("tbl_reader_writer_oop");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+
+    let initial = make_data(&[
+        ("AAPL", d(8, 1), 10.0),
+        ("AAPL", d(8, 2), 11.0),
+        ("MSFT", d(9, 1), 20.0),
+    ]);
+
+    // 1. TableWriter::init
+    let writer = splayed_table::TableWriter::init(&root, PartitionScheme::Month, &initial.as_view(), None).unwrap();
+    assert_eq!(writer.statistics().unwrap().row_count, 3);
+    assert_eq!(writer.schema().unwrap().len(), 3);
+    writer.close().unwrap();
+
+    // 2. TableReader::open
+    let reader = splayed_table::TableReader::open(&root).unwrap();
+    assert_eq!(reader.statistics().unwrap().row_count, 3);
+
+    // 3. TableScanner::into_reader 消费
+    let scanner = reader.scan(TableScanRequest::default()).unwrap();
+    let mut batch_reader = scanner.into_reader(Some(2));
+    let mut rows_read = 0;
+    while let Some(batch) = batch_reader.next().unwrap() {
+        rows_read += batch.length();
+    }
+    assert_eq!(rows_read, 3);
+    batch_reader.close().unwrap();
+
+    // 4. TableReader::read 一步式读取
+    let mut batch_reader2 = reader.read(TableScanRequest::default(), None).unwrap();
+    let mut rows_read2 = 0;
+    while let Some(batch) = batch_reader2.next().unwrap() {
+        rows_read2 += batch.length();
+    }
+    assert_eq!(rows_read2, 3);
+    batch_reader2.close().unwrap();
+
+    // 5. TableReader::read_range 细粒度点查
+    let mut scanner_range = reader.scan(TableScanRequest::default()).unwrap();
+    let prr = scanner_range.next().unwrap().unwrap();
+    let range_view = reader.read_range(&prr, None).unwrap();
+    assert_eq!(range_view.length(), prr.row_range.length as usize);
+    scanner_range.close().unwrap();
+    reader.close().unwrap();
+
+    // 6. TableWriter::write (已有分区覆盖写)
+    let writer2 = splayed_table::TableWriter::open(&root).unwrap();
+    let more = make_data(&[
+        ("AAPL", d(8, 1), 50.0),
+    ]);
+    writer2.write(&more.as_view()).unwrap();
+    assert_eq!(writer2.statistics().unwrap().row_count, 3);
+
+    // 7. TableWriter::update (全量替换更新，支持跨分区替换及自动创建新分区)
+    let update_data = make_data(&[
+        ("AAPL", d(8, 1), 99.0),
+        ("MSFT", d(9, 1), 88.0),
+        ("GOOG", d(10, 1), 77.0),
+    ]);
+    writer2.update(&update_data.as_view()).unwrap();
+    assert_eq!(writer2.statistics().unwrap().row_count, 3);
+    assert_eq!(writer2.metadata().unwrap().partitions.len(), 3);
+
+    // 8. TableWriter::remove 销毁物理目录
+    writer2.remove().unwrap();
+    assert!(!root.exists());
+
+    cleanup(&dir);
+}
+
+#[test]
+fn table_fix_clean_empty_dirs_and_heal_latest_partition() {
+    let dir = temp_dir("table_fix_test");
+    let root = dir.join("tbl");
+
+    // 1. 创建包含两个分区 (2026-01-01 与 2026-01-02) 的表
+    let d1 = splayed_table::days_from_civil(2026, 1, 1) as i32;
+    let d2 = splayed_table::days_from_civil(2026, 1, 2) as i32;
+    let init_data = make_data(&[
+        ("AAPL", d1, 100.0),
+        ("AAPL", d2, 101.0),
+    ]);
+    let writer = splayed_table::TableWriter::init(&root, PartitionScheme::Date, &init_data.as_view(), None).unwrap();
+    let meta = writer.metadata().unwrap();
+    assert_eq!(meta.partitions.len(), 2);
+
+    let part1_name = &meta.partitions[0].name; // date=2026-01-01
+    let part2_name = &meta.partitions[1].name; // date=2026-01-02
+    let part1_dir = root.join(part1_name);
+    let part2_dir = root.join(part2_name);
+
+    // 2. 模拟分区 1 因删除字段后留下的嵌套空文件夹 factor/alpha/
+    let empty_factor_dir = part1_dir.join("factor").join("alpha");
+    std::fs::create_dir_all(&empty_factor_dir).unwrap();
+    assert!(empty_factor_dir.exists());
+
+    // 3. 模拟中间分区 1 存在新字段 "factor.momentum" 和 "vol"，而最新分区 2 没有
+    let f1_path = part1_dir.join("factor").join("momentum");
+    splayed_core::init_field_empty(&f1_path, DataType::Float64, 1, None).unwrap();
+    let f2_path = part1_dir.join("vol");
+    splayed_core::init_field_empty(&f2_path, DataType::Int64, 1, None).unwrap();
+
+    // 验证此时最新分区 2 确实没有这些字段
+    assert!(!part2_dir.join("factor").join("momentum").exists());
+    assert!(!part2_dir.join("vol").exists());
+
+    // 4. 执行 fix()
+    writer.fix().unwrap();
+
+    // 5. 验证空文件夹被清理
+    assert!(!empty_factor_dir.exists());
+    assert!(!part1_dir.join("factor").join("alpha").exists());
+
+    // 6. 验证最新分区 2 自动通过 init_field 补齐了这些字段
+    assert!(part2_dir.join("factor").join("momentum").exists());
+    assert!(part2_dir.join("vol").exists());
+
+    // 7. 验证 Schema 与读取
+    let reader = writer.as_reader().unwrap();
+    let schema = reader.schema().unwrap();
+    assert!(schema.fields.iter().any(|f| f.name.as_ref() == "factor.momentum"));
+    assert!(schema.fields.iter().any(|f| f.name.as_ref() == "vol"));
+
+    let mut stream = reader.read(TableScanRequest::default(), None).unwrap();
+    let mut total_rows = 0;
+    while let Some(batch) = stream.next().unwrap() {
+        total_rows += batch.length();
+        let col = batch.column("factor.momentum").unwrap();
+        assert_eq!(col.length(), batch.length());
+    }
+    assert_eq!(total_rows, 2);
+    stream.close().unwrap();
+    reader.close().unwrap();
+
+    writer.remove().unwrap();
+    cleanup(&dir);
+}
+
+#[test]
+fn test_table_writer_init_field_latest_partition_only() {
+    let dir = temp_dir("table_init_field_latest");
+    let root = dir.join("tbl");
+
+    // 1. 创建包含两个分区 (2026-01-01 与 2026-01-02) 的表
+    let d1 = splayed_table::days_from_civil(2026, 1, 1) as i32;
+    let d2 = splayed_table::days_from_civil(2026, 1, 2) as i32;
+    let init_data = make_data(&[
+        ("AAPL", d1, 100.0),
+        ("AAPL", d2, 101.0),
+        ("MSFT", d2, 202.0),
+    ]);
+    let writer = splayed_table::TableWriter::init(&root, PartitionScheme::Date, &init_data.as_view(), None).unwrap();
+    let meta = writer.metadata().unwrap();
+    assert_eq!(meta.partitions.len(), 2);
+
+    let part1_name = &meta.partitions[0].name; // date=2026-01-01 (1 row)
+    let part2_name = &meta.partitions[1].name; // date=2026-01-02 (2 rows, 最新分区)
+    let part1_dir = root.join(part1_name);
+    let part2_dir = root.join(part2_name);
+
+    // 2. 调用 writer.init_field("signal", DataType::Float64, None)
+    writer.init_field("signal", DataType::Float64, None).unwrap();
+
+    // 3. 验证：历史分区 1 绝对没有创建该字段
+    assert!(!part1_dir.join("signal").exists());
+
+    // 4. 验证：最新分区 2 创建了该字段，且文件大小为 64B（全空延迟展开骨架）
+    let field2_file = part2_dir.join("signal");
+    assert!(field2_file.exists());
+    assert_eq!(std::fs::metadata(&field2_file).unwrap().len(), 64);
+
+    // 5. 验证：读取该文件的 Header，row_count 与最新分区的 index 行数（2 行）精确对齐！
+    let mut f = std::fs::File::open(&field2_file).unwrap();
+    let mut header_bytes = [0u8; 64];
+    std::io::Read::read_exact(&mut f, &mut header_bytes).unwrap();
+    let header = splayed_format::FieldHeader::from_bytes(&header_bytes).unwrap();
+    assert_eq!(header.row_count, 2);
+    assert_eq!(header.null_count, 2);
+
+    // 6. 验证：Schema 包含了新列
+    assert!(writer.schema().unwrap().fields.iter().any(|f| f.name.as_ref() == "signal"));
+
+    // 7. 重复创建同一个字段报 AlreadyExists
+    assert!(writer.init_field("signal", DataType::Float64, None).is_err());
+
+    writer.remove().unwrap();
     cleanup(&dir);
 }

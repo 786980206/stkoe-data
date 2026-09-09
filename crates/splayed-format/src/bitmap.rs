@@ -46,6 +46,10 @@ impl<'a> BitmapView<'a> {
         self.data.as_slice()
     }
 
+    pub fn bit_offset(&self) -> usize {
+        self.bit_offset
+    }
+
     /// 全部有效时返回 true（不分配的快速路径由调用方用 `Option<BitmapView>` 表达）。
     pub fn all_valid(&self) -> bool {
         self.count_ones() == self.len

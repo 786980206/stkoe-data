@@ -138,7 +138,7 @@ impl DatasetHandle {
     }
 
     fn field_path(&self, name: &str) -> PathBuf {
-        self.root.join(name)
+        self.root.join(name.replace('.', "/"))
     }
 
     fn logical_length(&self) -> u64 {
@@ -163,7 +163,7 @@ impl DatasetHandle {
         name: &str,
     ) -> Result<(), CoreError> {
         if !fields.borrow().contains_key(name) {
-            let path = root.join(name);
+            let path = root.join(name.replace('.', "/"));
             let handle = Box::new(open_field_file(&path, mode)?);
             fields.borrow_mut().insert(name.to_string(), handle);
         }
@@ -249,7 +249,7 @@ impl DatasetHandle {
             DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
         }
         // ② META 零拷贝：sym RepeatDict 段（零物化）+ time 轴切片
-        let base = self.meta.read_index_handle(offset, length)?;
+        let base = self.meta.read(offset, length)?;
         let mut columns_out: Vec<splayed_format::ColumnView<'_>> =
             Vec::with_capacity(2 + requested.len());
         columns_out.extend(base.columns);
@@ -257,7 +257,7 @@ impl DatasetHandle {
         let mut schema_fields: Vec<FieldSchema> = base.schema.fields.to_vec();
         for name in &requested {
             let handle = DatasetHandle::field_handle(&self.fields, name)?;
-            columns_out.push(handle.read_field_handle(offset, length)?);
+            columns_out.push(handle.read(offset, length)?);
             schema_fields.push(FieldSchema::new(name.as_str(), handle.data_type()));
         }
         DataView::new(Schema::new(schema_fields), columns_out).map_err(CoreError::from)
@@ -333,7 +333,7 @@ impl DatasetHandle {
         let p = self.max_parallelism();
         if targets.len() <= 1 || total < WRITE_PARALLEL_MIN_BYTES || p <= 1 {
             for (i, handle) in targets {
-                handle.write_field_handle(offset, &data.columns[i])?;
+                handle.write(offset, &data.columns[i])?;
             }
             return Ok(());
         }
@@ -350,7 +350,7 @@ impl DatasetHandle {
             for bucket in buckets {
                 joins.push(s.spawn(move || -> Result<(), CoreError> {
                     for (i, handle) in bucket {
-                        handle.write_field_handle(offset, &data.columns[i])?;
+                        handle.write(offset, &data.columns[i])?;
                     }
                     Ok(())
                 }));
@@ -395,7 +395,7 @@ impl DatasetHandle {
                     predicate: Some(sym_time),
                     limit: None,
                 };
-                let mut scanner = self.meta.scan_index_handle(&index_req)?;
+                let mut scanner = self.meta.scan(&index_req)?;
                 let mut narrowed = Vec::new();
                 while let Some(r) = scanner.next()? {
                     narrowed.push(r);
@@ -444,7 +444,7 @@ impl DatasetHandle {
                                             predicate: Some(sub),
                                             limit: None,
                                         };
-                                        let mut sc = handles_ref[gi].scan_field_handle(&req)?;
+                                        let mut sc = handles_ref[gi].scan(&req)?;
                                         let mut hit = Vec::new();
                                         while let Some(r) = sc.next()? {
                                             hit.push(r);
@@ -477,7 +477,7 @@ impl DatasetHandle {
                             predicate: Some(sub.clone()),
                             limit: None,
                         };
-                        let mut sc = handles[gi].scan_field_handle(&req)?;
+                        let mut sc = handles[gi].scan(&req)?;
                         let mut hit = Vec::new();
                         while let Some(r) = sc.next()? {
                             hit.push(r);
@@ -534,10 +534,14 @@ impl DatasetHandle {
                 reader: Box::new(LengthCheckReader { inner: reader, expected: l, got_values: 0, got_validity: 0 }),
             },
         };
-        if let Err(e) = create_field_file(&self.field_path(name), data_type, init, field_options) {
+        let fp = self.field_path(name);
+        if let Some(p) = fp.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        if let Err(e) = create_field_file(&fp, data_type, init, field_options) {
             // 失败清理半成品：create 直接写最终路径，残留文件带零填充占位 header，
             // 会污染后续 build_schema / open_dataset（Schema 尚未同步，文件必须不落痕）
-            let _ = fs::remove_file(self.field_path(name));
+            let _ = fs::remove_file(&fp);
             return Err(e);
         }
         self.reload_schema();
@@ -552,6 +556,19 @@ impl DatasetHandle {
         }
         self.fields.borrow_mut().remove(name);
         delete_field_file(&self.field_path(name))?;
+        // 清理因嵌套字段删除后可能遗留的空父目录
+        let mut cur = self.field_path(name).parent().map(|p| p.to_path_buf());
+        while let Some(parent) = cur {
+            if parent == self.root {
+                break;
+            }
+            if fs::read_dir(&parent).map(|mut it| it.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir(&parent);
+                cur = parent.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
         self.reload_schema();
         Ok(())
     }
@@ -694,18 +711,106 @@ impl DatasetHandle {
     /// `(sym, time)` 联合键批量定位（转发 META，供 Table 层 write_table 使用）。
     #[inline]
     pub fn locate_dataset_index(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
-        self.meta.locate_index(pairs)
+        self.meta.locate(pairs)
     }
 
     /// 零拷贝借用 `&str` 的联合键批量定位。
     #[inline]
     pub fn locate_dataset_index_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
-        self.meta.locate_index_borrowed(pairs)
+        self.meta.locate_borrowed(pairs)
     }
 
     /// sym 对齐的压缩 chunk 边界（创建即压缩 / compress 共用）——**自动规划**：
     /// 按 sym 边界累积行数，达到 `target_rows` 即收口（chunk 保持整 sym、
     /// 行数 ≈ target）；行数超过 `row_cap` 的 sym 按 cap 劈开。
+    // --------------------------------------------------------------- read / write / scan
+
+    #[inline]
+    pub fn read(
+        &self,
+        offset: u64,
+        length: u64,
+        columns: Option<&[&str]>,
+    ) -> Result<DataView<'_>, CoreError> {
+        self.read_dataset(offset, length, columns)
+    }
+
+    #[inline]
+    pub fn write(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.write_dataset(offset, data)
+    }
+
+    #[inline]
+    pub fn scan(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+        self.scan_dataset(request)
+    }
+
+    #[inline]
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.update_dataset(data)
+    }
+
+    #[inline]
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_dataset_index(pairs)
+    }
+
+    #[inline]
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.locate_dataset_index_borrowed(pairs)
+    }
+
+    #[inline]
+    pub fn schema(&self) -> Schema {
+        self.read_dataset_schema()
+    }
+
+    #[inline]
+    pub fn statistics(&self) -> Result<DatasetStatistics, CoreError> {
+        self.read_dataset_statistics()
+    }
+
+    #[inline]
+    pub fn create_field(
+        &mut self,
+        name: &str,
+        data_type: DataType,
+        init: DatasetFieldInit,
+        field_options: CreateFieldOptions,
+    ) -> Result<(), CoreError> {
+        self.create_dataset_field(name, data_type, init, field_options)
+    }
+
+    #[inline]
+    pub fn delete_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.delete_dataset_field(name)
+    }
+
+    #[inline]
+    pub fn rename_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError> {
+        self.rename_dataset_field(name, new_name)
+    }
+
+    #[inline]
+    pub fn cast_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError> {
+        self.cast_dataset_field(name, target_type)
+    }
+
+    #[inline]
+    pub fn compress_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.compress_dataset_field(name)
+    }
+
+    #[inline]
+    pub fn decompress_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.decompress_dataset_field(name)
+    }
+
+    #[inline]
+    pub fn update_field(&self, name: &str, header: &splayed_format::FieldHeader) -> Result<(), CoreError> {
+        self.update_dataset_field_header(name, *header)
+    }
+
     pub fn sym_aligned_chunk_offsets(&self, target_rows: usize, row_cap: u64) -> Vec<u64> {
         let mut boundaries: Vec<u64> = vec![0];
         let mut acc: u64 = 0;
@@ -1182,7 +1287,7 @@ pub fn create_dataset(
             if let Some(p) = field_path.parent() {
                 fs::create_dir_all(p).map_err(CoreError::Io)?;
             }
-            crate::field_file::create_field(&field_path, f.data_type)?;
+            crate::field_file::create_field(&field_path, f.data_type, None, None)?;
         }
     }
     open_dataset(path, Mode::Write)
@@ -1282,4 +1387,164 @@ pub fn rename_dataset(dataset_path: &Path, new_name: &str) -> Result<(), CoreErr
 pub fn read_dataset_schema(path: &Path) -> Result<Schema, CoreError> {
     let meta = MetaHandle::open(&path.join(META_FILE_NAME))?;
     build_schema(path, meta.time_type())
+}
+
+/// 只读数据集对象
+pub struct DatasetReader {
+    inner: DatasetHandle,
+}
+
+impl DatasetReader {
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = open_dataset(path, Mode::Read)?;
+        Ok(Self { inner })
+    }
+
+    pub fn read(&self, offset: u64, length: u64, projection: Option<&[&str]>) -> Result<DataView<'_>, CoreError> {
+        self.inner.read(offset, length, projection)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate(pairs)
+    }
+
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate_borrowed(pairs)
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.inner.schema()
+    }
+
+    pub fn statistics(&self) -> Result<DatasetStatistics, CoreError> {
+        self.inner.statistics()
+    }
+
+    pub fn max_parallelism(&self) -> usize {
+        self.inner.max_parallelism()
+    }
+
+    pub fn set_max_parallelism(&self, max_parallelism: usize) {
+        self.inner.set_max_parallelism(max_parallelism);
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close_dataset()
+    }
+}
+
+/// 可写数据集对象
+pub struct DatasetWriter {
+    inner: DatasetHandle,
+}
+
+impl DatasetWriter {
+    pub fn create(path: &Path, schema: &Schema) -> Result<Self, CoreError> {
+        let inner = create_dataset(path, schema)?;
+        Ok(Self { inner })
+    }
+
+    pub fn init(path: &Path, data: &DataView<'_>, options: Option<CreateDatasetOptions>) -> Result<Self, CoreError> {
+        create_dataset_from_view(path, data, options.unwrap_or_default())?;
+        Self::open(path)
+    }
+
+    pub fn open(path: &Path) -> Result<Self, CoreError> {
+        let inner = open_dataset(path, Mode::Write)?;
+        Ok(Self { inner })
+    }
+
+    pub fn write(&self, offset: u64, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.inner.write(offset, data)
+    }
+
+    pub fn read(&self, offset: u64, length: u64, projection: Option<&[&str]>) -> Result<DataView<'_>, CoreError> {
+        self.inner.read(offset, length, projection)
+    }
+
+    pub fn scan(&self, request: &ScanRequest) -> Result<DatasetScanner, CoreError> {
+        self.inner.scan(request)
+    }
+
+    pub fn locate(&self, pairs: &[(String, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate(pairs)
+    }
+
+    pub fn locate_borrowed(&self, pairs: &[(&str, i64)]) -> Result<Vec<RowRange>, CoreError> {
+        self.inner.locate_borrowed(pairs)
+    }
+
+    pub fn update(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.inner.update(data)
+    }
+
+    pub fn create_field(&mut self, name: &str, data_type: DataType, init: DatasetFieldInit, options: CreateFieldOptions) -> Result<(), CoreError> {
+        self.inner.create_field(name, data_type, init, options)
+    }
+
+    pub fn delete_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.inner.delete_field(name)
+    }
+
+    pub fn rename_field(&mut self, name: &str, new_name: &str) -> Result<(), CoreError> {
+        self.inner.rename_field(name, new_name)
+    }
+
+    pub fn cast_field(&mut self, name: &str, target_type: DataType) -> Result<(), CoreError> {
+        self.inner.cast_field(name, target_type)
+    }
+
+    pub fn compress_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.inner.compress_field(name)
+    }
+
+    pub fn decompress_field(&mut self, name: &str) -> Result<(), CoreError> {
+        self.inner.decompress_field(name)
+    }
+
+    pub fn update_field(&self, name: &str, header: &splayed_format::FieldHeader) -> Result<(), CoreError> {
+        self.inner.update_field(name, header)
+    }
+
+    pub fn schema(&self) -> Schema {
+        self.inner.schema()
+    }
+
+    pub fn statistics(&self) -> Result<DatasetStatistics, CoreError> {
+        self.inner.statistics()
+    }
+
+    pub fn max_parallelism(&self) -> usize {
+        self.inner.max_parallelism()
+    }
+
+    pub fn set_max_parallelism(&self, max_parallelism: usize) {
+        self.inner.set_max_parallelism(max_parallelism);
+    }
+
+    pub fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    pub fn as_reader(&self) -> Result<DatasetReader, CoreError> {
+        DatasetReader::open(self.inner.path())
+    }
+
+    pub fn close(self) -> Result<(), CoreError> {
+        self.inner.close_dataset()
+    }
+
+    pub fn remove(self) -> Result<(), CoreError> {
+        let path = self.inner.root.clone();
+        self.close()?;
+        delete_dataset(&path)
+    }
 }
