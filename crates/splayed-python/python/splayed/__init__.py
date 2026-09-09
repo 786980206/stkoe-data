@@ -115,6 +115,7 @@ def sink_splayed(
     path: str | Path,
     *,
     scheme: str = "none",
+    compression: str = "zstd",
     max_parallelism: int | None = None,
 ) -> None:
     """
@@ -128,6 +129,7 @@ def sink_splayed(
         data: polars.DataFrame 或 polars.LazyFrame 对象。
         path: 目标表根目录。
         scheme: 分区策略，可选 'none' | 'day' | 'month' | 'year'（仅建表时生效，默认 'none'）。
+        compression: 压缩算法，可选 'zstd' | 'lz4' | 'none'（默认 'zstd'，对标 Parquet 压缩存储）。
         max_parallelism: 并发执行度。
     """
     try:
@@ -163,14 +165,22 @@ def sink_splayed(
 
     if not has_meta:
         # 首次初始化建表并写入首个批次
-        writer = TableWriter.init(path_str, batches[0], scheme=scheme, max_parallelism=max_parallelism)
+        writer = TableWriter.init(
+            path_str,
+            batches[0],
+            scheme=scheme,
+            compression=compression,
+            max_parallelism=max_parallelism,
+        )
         for b in batches[1:]:
             writer.write(b)
+        writer.close()
     else:
         # 已存在表：打开并覆盖写
         writer = TableWriter.open(path_str, max_parallelism=max_parallelism)
         for b in batches:
             writer.write(b)
+        writer.close()
 
 
 # 注册 Polars 扩展命名空间与链式调用方法
@@ -184,25 +194,57 @@ def _register_polars_extensions():
             def __init__(self, ldf: pl.LazyFrame):
                 self._ldf = ldf
 
-            def sink(self, path: str | Path, scheme: str = "none", max_parallelism: int | None = None) -> None:
-                sink_splayed(self._ldf, path, scheme=scheme, max_parallelism=max_parallelism)
+            def sink(
+                self,
+                path: str | Path,
+                scheme: str = "none",
+                compression: str = "zstd",
+                max_parallelism: int | None = None,
+            ) -> None:
+                sink_splayed(
+                    self._ldf,
+                    path,
+                    scheme=scheme,
+                    compression=compression,
+                    max_parallelism=max_parallelism,
+                )
 
         @pl.api.register_dataframe_namespace("splayed")
         class _SplayedDataNamespace:
             def __init__(self, df: pl.DataFrame):
                 self._df = df
 
-            def sink(self, path: str | Path, scheme: str = "none", max_parallelism: int | None = None) -> None:
-                sink_splayed(self._df, path, scheme=scheme, max_parallelism=max_parallelism)
+            def sink(
+                self,
+                path: str | Path,
+                scheme: str = "none",
+                compression: str = "zstd",
+                max_parallelism: int | None = None,
+            ) -> None:
+                sink_splayed(
+                    self._df,
+                    path,
+                    scheme=scheme,
+                    compression=compression,
+                    max_parallelism=max_parallelism,
+                )
 
         # 2. 直接为 LazyFrame 和 DataFrame 打上原生链式方法 .sink_splayed(...)
         if not hasattr(pl.LazyFrame, "sink_splayed"):
-            pl.LazyFrame.sink_splayed = lambda self, path, scheme="none", max_parallelism=None: sink_splayed(
-                self, path, scheme=scheme, max_parallelism=max_parallelism
+            pl.LazyFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None: sink_splayed(
+                self,
+                path,
+                scheme=scheme,
+                compression=compression,
+                max_parallelism=max_parallelism,
             )
         if not hasattr(pl.DataFrame, "sink_splayed"):
-            pl.DataFrame.sink_splayed = lambda self, path, scheme="none", max_parallelism=None: sink_splayed(
-                self, path, scheme=scheme, max_parallelism=max_parallelism
+            pl.DataFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None: sink_splayed(
+                self,
+                path,
+                scheme=scheme,
+                compression=compression,
+                max_parallelism=max_parallelism,
             )
         if not hasattr(pl, "scan_splayed"):
             pl.scan_splayed = scan_splayed

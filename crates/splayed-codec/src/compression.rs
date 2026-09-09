@@ -2,14 +2,14 @@ use crate::error::CodecError;
 use splayed_format::Compression;
 
 /// ZSTD 内置默认压缩级别（docs/splayed-codec.md §4.1：级别为 codec 常量，不进 header）。
-pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
+pub const DEFAULT_ZSTD_LEVEL: i32 = 1;
 
 /// 压缩一段字节（`NONE` = 直通拷贝）。
 pub fn compress(compression: Compression, data: &[u8]) -> Result<Vec<u8>, CodecError> {
     match compression {
         Compression::None => Ok(data.to_vec()),
         Compression::Zstd => {
-            zstd::stream::encode_all(data, DEFAULT_ZSTD_LEVEL)
+            zstd::bulk::compress(data, DEFAULT_ZSTD_LEVEL)
                 .map_err(|e| CodecError::Io(e.to_string()))
         }
         Compression::Lz4 => Ok(lz4_flex::compress_prepend_size(data)),

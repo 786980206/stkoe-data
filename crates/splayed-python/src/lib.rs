@@ -30,6 +30,17 @@ fn parse_scheme(s: &str) -> PyResult<PartitionScheme> {
     }
 }
 
+fn parse_compression(s: Option<&str>) -> PyResult<splayed_format::Compression> {
+    match s.unwrap_or("zstd").to_ascii_lowercase().as_str() {
+        "none" | "uncompressed" => Ok(splayed_format::Compression::None),
+        "zstd" => Ok(splayed_format::Compression::Zstd),
+        "lz4" => Ok(splayed_format::Compression::Lz4),
+        other => Err(PyValueError::new_err(format!(
+            "invalid compression: '{other}'. Expected 'zstd', 'lz4', or 'none'"
+        ))),
+    }
+}
+
 fn parse_data_type(s: &str) -> PyResult<DataType> {
     match s.to_lowercase().as_str() {
         "bool" | "boolean" => Ok(DataType::Bool),
@@ -269,6 +280,14 @@ pub struct PyTableWriter {
     inner: Option<CoreArrowWriter>,
 }
 
+impl Drop for PyTableWriter {
+    fn drop(&mut self) {
+        if let Some(w) = self.inner.take() {
+            let _ = w.close();
+        }
+    }
+}
+
 impl PyTableWriter {
     fn inner_writer(&self) -> PyResult<&CoreArrowWriter> {
         self.inner
@@ -280,19 +299,22 @@ impl PyTableWriter {
 #[pymethods]
 impl PyTableWriter {
     #[classmethod]
-    #[pyo3(signature = (path, schema, scheme="none", initial_partition=None, max_parallelism=None))]
+    #[pyo3(signature = (path, schema, scheme="none", initial_partition=None, compression=None, max_parallelism=None))]
     fn create(
         _cls: &Bound<'_, PyType>,
         path: &str,
         schema: &Bound<'_, PyAny>,
         scheme: &str,
         initial_partition: Option<&str>,
+        compression: Option<&str>,
         max_parallelism: Option<usize>,
     ) -> PyResult<Self> {
         let arrow_schema = ArrowSchema::from_pyarrow_bound(schema)?;
         let partition_scheme = parse_scheme(scheme)?;
+        let comp = parse_compression(compression)?;
         let mut options = TableOptions::default();
         options.max_parallelism = max_parallelism;
+        options.compression = Some(comp);
         let writer = CoreArrowWriter::create(
             std::path::Path::new(path),
             &arrow_schema,
@@ -305,18 +327,21 @@ impl PyTableWriter {
     }
 
     #[classmethod]
-    #[pyo3(signature = (path, batch, scheme="none", max_parallelism=None))]
+    #[pyo3(signature = (path, batch, scheme="none", compression=None, max_parallelism=None))]
     fn init(
         _cls: &Bound<'_, PyType>,
         path: &str,
         batch: &Bound<'_, PyAny>,
         scheme: &str,
+        compression: Option<&str>,
         max_parallelism: Option<usize>,
     ) -> PyResult<Self> {
         let rb = extract_record_batch(batch)?;
         let partition_scheme = parse_scheme(scheme)?;
+        let comp = parse_compression(compression)?;
         let mut options = TableOptions::default();
         options.max_parallelism = max_parallelism;
+        options.compression = Some(comp);
         let writer = CoreArrowWriter::init(
             std::path::Path::new(path),
             partition_scheme,
