@@ -13,38 +13,42 @@
     top: 0;
     left: 0;
     right: 0;
-    height: 56px;
-    background: rgba(15, 23, 42, 0.9);
+    min-height: 56px;
+    background: rgba(15, 23, 42, 0.95);
     backdrop-filter: blur(8px);
     border-bottom: 1px solid #1e293b;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    padding: 0 24px;
+    padding: 8px 16px;
+    gap: 8px;
     z-index: 10;
   }
   .title-group {
     display: flex;
-    align-items: baseline;
-    gap: 12px;
+    flex-direction: column;
+    gap: 2px;
   }
-  h1 { font-size: 18px; font-weight: 700; color: #f8fafc; letter-spacing: 0.5px; }
-  .subtitle { font-size: 12px; color: #94a3b8; }
+  h1 { font-size: 16px; font-weight: 700; color: #f8fafc; letter-spacing: 0.5px; }
+  .subtitle { font-size: 11px; color: #94a3b8; }
   
   .controls {
     display: flex;
     align-items: center;
-    gap: 12px;
+    flex-wrap: wrap;
+    gap: 6px;
   }
   .btn {
     background: #1e293b;
     color: #cbd5e1;
     border: 1px solid #334155;
-    padding: 6px 14px;
+    padding: 5px 10px;
     border-radius: 6px;
-    font-size: 12px;
+    font-size: 11px;
     cursor: pointer;
     transition: all 0.2s;
+    touch-action: manipulation;
   }
   .btn:hover {
     background: #334155;
@@ -59,22 +63,23 @@
   #container {
     width: 100%;
     height: 100%;
-    padding-top: 56px;
+    padding-top: 60px;
   }
   
   #detail-panel {
     position: absolute;
-    bottom: 20px;
-    right: 20px;
-    width: 320px;
-    background: rgba(15, 23, 42, 0.92);
+    bottom: 16px;
+    left: 16px;
+    right: 16px;
+    max-width: 360px;
+    background: rgba(15, 23, 42, 0.96);
     backdrop-filter: blur(12px);
     border: 1px solid #334155;
     border-radius: 8px;
-    padding: 16px;
-    font-size: 13px;
+    padding: 14px;
+    font-size: 12px;
     color: #cbd5e1;
-    z-index: 10;
+    z-index: 20;
     box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
     display: none;
   }
@@ -98,6 +103,12 @@
   }
 </style>
 <script src="echarts.min.js"></script>
+<script>
+  // 如果本地 echarts.min.js 因某种原因未加载，自动降级回退到可靠的公共 CDN
+  if (typeof echarts === 'undefined') {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"><\/script>');
+  }
+</script>
 </head>
 <body>
 
