@@ -869,6 +869,50 @@ pub fn open_table(
             }
         }
     };
+    let mut options = options;
+    if options.compression.is_none() {
+        let first_dir = if scheme == PartitionScheme::None {
+            Some(table_path.to_path_buf())
+        } else if let Ok(it) = fs::read_dir(table_path) {
+            it.flatten()
+                .find(|e| {
+                    e.file_type().map_or(false, |ft| ft.is_dir())
+                        && PartitionScheme::from_partition_name(&e.file_name().to_string_lossy())
+                            .is_some()
+                })
+                .map(|e| e.path())
+        } else {
+            None
+        };
+        if let Some(dir) = first_dir {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.is_file()
+                        && p.file_name()
+                            .map_or(false, |n| n != ".meta" && !n.to_string_lossy().starts_with('.'))
+                    {
+                        if let Ok(mut f) = fs::File::open(&p) {
+                            use std::io::Read;
+                            let mut buf = [0u8; 64];
+                            if f.read_exact(&mut buf).is_ok() {
+                                if let Ok(hdr) = splayed_format::FieldHeader::from_bytes(&buf) {
+                                    if let Ok(c) =
+                                        splayed_format::Compression::from_id(hdr.compression)
+                                    {
+                                        if c != splayed_format::Compression::None {
+                                            options.compression = Some(c);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(TableHandle {
         root: table_path.to_path_buf(),
         scheme,

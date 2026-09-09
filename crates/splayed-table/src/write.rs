@@ -537,22 +537,26 @@ impl TableStreamWriter {
 
 /// 全量替换更新表数据（.lock 互斥，支持按分区原子替换，或自动追加新分区）。
 pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
+    let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
+    update_table_data(table, owned)
+}
+
+pub fn update_table_data(table: &TableHandle, owned: splayed_format::Data) -> Result<(), CoreError> {
     table.mode.require_write("update_table")?;
     let _lock = LockGuard::acquire(&table.root)?;
-    if data.column("sym").is_none() || data.column("time").is_none() {
+    if owned.column("sym").is_none() || owned.column("time").is_none() {
         return Err(CoreError::Invalid("table input requires sym and time columns".into()));
     }
-    let tt = infer_tt(data.column("time").unwrap().data_type())?;
+    let tt = infer_tt(owned.column("time").unwrap().data_type)?;
     if table.scheme == PartitionScheme::None {
         table.ensure_dataset("")?;
         let mut guard = table.datasets.borrow_mut();
         let ds = guard.get_mut("").expect("just ensured");
-        ds.update_dataset(data)?;
+        ds.update_dataset(&owned.as_view())?;
         table.stats_cache.borrow_mut().clear();
         return Ok(());
     }
 
-    let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
     let buckets = partition_spans(&owned, table.scheme, tt)?;
     let mut sorted_buckets = buckets;
     sorted_buckets.sort_by_key(|(_, runs)| std::cmp::Reverse(runs.iter().map(|&(_, l)| l).sum::<usize>()));
@@ -685,6 +689,10 @@ impl TableWriter {
     /// 全量替换更新表数据：支持按分区原子替换，或自动追加新分区，全表 .lock 互斥
     pub fn update(&self, data: &DataView<'_>) -> Result<(), CoreError> {
         update_table(&self.inner, data)
+    }
+
+    pub fn update_data(&self, data: splayed_format::Data) -> Result<(), CoreError> {
+        update_table_data(&self.inner, data)
     }
 
     /// 分区生命周期管理：删除分区

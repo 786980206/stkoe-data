@@ -578,7 +578,7 @@ impl TableArrowWriter {
     /// 接收 RecordBatch，全量原子替换更新表数据
     pub fn update(&self, batch: &RecordBatch) -> Result<()> {
         let data = record_batch_to_data(batch)?;
-        self.inner.update(&data.as_view()).map_err(ArrowConvError::from)
+        self.inner.update_data(data).map_err(ArrowConvError::from)
     }
 
     /// 删除分区
