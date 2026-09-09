@@ -704,14 +704,49 @@ pub fn update_record_batch(
 
 /// RecordBatch → 拥有型 Data（create / write 路径的反向映射）。
 pub fn record_batch_to_data(batch: &RecordBatch) -> Result<Data> {
-    let mut fields = Vec::with_capacity(batch.num_columns());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (arrow_field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+    let num_cols = batch.num_columns();
+    let mut fields = Vec::with_capacity(num_cols);
+    let mut dts = Vec::with_capacity(num_cols);
+    for arrow_field in batch.schema().fields() {
         let dt = from_arrow_type(arrow_field.data_type())?;
-        let (values, validity, dict) = array_to_column(array, dt)?;
         fields.push(FieldSchema::new(arrow_field.name().as_str(), dt));
-        columns.push(Column { data_type: dt, values, validity, dict });
+        dts.push(dt);
     }
+
+    let columns = if num_cols <= 2 || batch.num_rows() < 10_000 {
+        let mut cols = Vec::with_capacity(num_cols);
+        for (&dt, array) in dts.iter().zip(batch.columns()) {
+            let (values, validity, dict) = array_to_column(array, dt)?;
+            cols.push(Column { data_type: dt, values, validity, dict });
+        }
+        cols
+    } else {
+        // 多列并行转换：多核并发执行 array_to_column
+        let max_p = std::thread::available_parallelism().map_or(1, |n| n.get()).min(num_cols);
+        let chunk_size = (num_cols + max_p - 1) / max_p;
+        let pairs: Vec<(DataType, &ArrayRef)> = dts.iter().copied().zip(batch.columns()).collect();
+
+        std::thread::scope(|s| -> Result<Vec<Column>> {
+            let mut handles = Vec::new();
+            for chunk in pairs.chunks(chunk_size) {
+                handles.push(s.spawn(move || -> Result<Vec<Column>> {
+                    let mut chunk_cols = Vec::with_capacity(chunk.len());
+                    for &(dt, arr) in chunk {
+                        let (values, validity, dict) = array_to_column(arr, dt)?;
+                        chunk_cols.push(Column { data_type: dt, values, validity, dict });
+                    }
+                    Ok(chunk_cols)
+                }));
+            }
+            let mut all_cols = Vec::with_capacity(num_cols);
+            for h in handles {
+                let chunk_cols = h.join().map_err(|_| ArrowConvError::Unsupported("column conversion panicked".into()))??;
+                all_cols.extend(chunk_cols);
+            }
+            Ok(all_cols)
+        })?
+    };
+
     Ok(Data { schema: Schema::new(fields), columns })
 }
 

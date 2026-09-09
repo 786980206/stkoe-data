@@ -317,10 +317,17 @@ pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreErr
                 let mut new_strings: Vec<u8> = Vec::new();
                 let mut dict_count: u32 = 0;
                 let keys = col.values.as_slice();
+                let keys_u32: &[u32] = bytemuck::cast_slice(keys);
+                let mut last_k = u32::MAX;
+                let mut last_id = 0u32;
                 for &(start, len) in runs {
-                    let row_keys = &keys[start * 4..(start + len) * 4];
-                    for kb in row_keys.chunks_exact(4) {
-                        let k = u32::from_le_bytes(kb.try_into().unwrap()) as usize;
+                    let sub_keys = &keys_u32[start..start + len];
+                    for &k_raw in sub_keys {
+                        if k_raw == last_k {
+                            new_keys.push(last_id);
+                            continue;
+                        }
+                        let k = k_raw as usize;
                         let id = match remap[k] {
                             u32::MAX => {
                                 let lo_bytes = dict_offsets
@@ -335,15 +342,15 @@ pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreErr
                                     u64::from_le_bytes(hi_bytes.try_into().unwrap()) as usize;
                                 if hi > dict_strings.len() {
                                     panic!(
-                                        "dict strings out of range: field={} k={k} lo={lo} hi={hi} strings_len={} offs_len={} n_dict={n_dict}",
+                                        "dict strings out of range: field={} k={k} lo={lo} hi={hi} strings_len={} offs_len={} n_dict={}",
                                         field.name,
                                         dict_strings.len(),
                                         dict_offsets.len(),
+                                        n_dict,
                                     );
                                 }
                                 new_strings.extend_from_slice(&dict_strings[lo..hi]);
                                 new_offsets.push(new_strings.len() as u64);
-                                // id 独立计数（new_offsets[0] 为哨兵，不能以 len-1 推 id）
                                 let id = dict_count;
                                 dict_count += 1;
                                 remap[k] = id;
@@ -351,6 +358,8 @@ pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreErr
                             }
                             mapped => mapped,
                         };
+                        last_k = k_raw;
+                        last_id = id;
                         new_keys.push(id);
                     }
                 }
@@ -440,28 +449,75 @@ pub(crate) fn partition_spans(
     scheme: PartitionScheme,
     tt: TimeType,
 ) -> Result<Vec<(String, Vec<RowSpan>)>, CoreError> {
-    let time_view = data.column("time").unwrap().as_view();
+    let time_col = data.column("time").unwrap();
+    let time_bytes = time_col.values.as_slice();
+    let rows = data.length();
     let mut buckets: HashMap<String, Vec<RowSpan>> = HashMap::new();
     let mut cur_key: Option<i64> = None;
     let mut cur_first_t = 0i64;
     let (mut cur_start, mut cur_len) = (0usize, 0usize);
-    for i in 0..data.length() {
-        let t = time_value_at(&time_view, i)?;
-        let key = partition_key(scheme, t, tt);
-        match cur_key {
-            Some(k) if k == key => cur_len += 1,
-            _ => {
-                if let Some(_) = cur_key {
-                    let name = partition_name(scheme, cur_first_t, tt);
-                    buckets.entry(name).or_default().push((cur_start, cur_len));
-                }
-                cur_key = Some(key);
-                cur_first_t = t;
-                cur_start = i;
-                cur_len = 1;
+
+    let mut last_days: i64 = i64::MIN;
+    let mut last_k: i64 = 0;
+
+    let mut compute_key = |t: i64| -> i64 {
+        if scheme == PartitionScheme::None {
+            return 0;
+        }
+        let days = value_to_days(t, tt);
+        if days == last_days {
+            return last_k;
+        }
+        let k = match scheme {
+            PartitionScheme::Date => days,
+            PartitionScheme::Year => {
+                let (y, _, _) = civil_from_days(days);
+                y
             }
+            PartitionScheme::Month => {
+                let (y, m, _) = civil_from_days(days);
+                y * 12 + i64::from(m) - 1
+            }
+            PartitionScheme::None => 0,
+        };
+        last_days = days;
+        last_k = k;
+        k
+    };
+
+    macro_rules! scan_time {
+        ($slice:expr) => {
+            for i in 0..rows {
+                let t = $slice[i] as i64;
+                let key = compute_key(t);
+                match cur_key {
+                    Some(k) if k == key => cur_len += 1,
+                    _ => {
+                        if cur_key.is_some() {
+                            let name = partition_name(scheme, cur_first_t, tt);
+                            buckets.entry(name).or_default().push((cur_start, cur_len));
+                        }
+                        cur_key = Some(key);
+                        cur_first_t = t;
+                        cur_start = i;
+                        cur_len = 1;
+                    }
+                }
+            }
+        };
+    }
+
+    match tt {
+        TimeType::Date32 => {
+            let slice: &[i32] = bytemuck::cast_slice(time_bytes);
+            scan_time!(slice);
+        }
+        TimeType::TimestampUs => {
+            let slice: &[i64] = bytemuck::cast_slice(time_bytes);
+            scan_time!(slice);
         }
     }
+
     if cur_key.is_some() {
         let name = partition_name(scheme, cur_first_t, tt);
         buckets.entry(name).or_default().push((cur_start, cur_len));
