@@ -3,238 +3,378 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Splayed V2.1 纯对象式统一接口调用链 (Table > Dataset > Index > Field)</title>
+<title>Splayed V2.1 四层统一对象架构调用关系大图 (ECharts Graph)</title>
 <style>
-  :root {
-    --bg: #090d16;
-    --card: #111827;
-    --border: #1f2937;
-    --text: #e5e7eb;
-    --text-dim: #9ca3af;
-    --table: #38bdf8;
-    --dataset: #818cf8;
-    --index: #34d399;
-    --field: #f472b6;
-    --action: #fb923c;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
-  body { background: var(--bg); color: var(--text); padding: 32px; font-size: 13px; line-height: 1.4; }
-
-  header { margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
-  h1 { font-size: 20px; color: #fff; margin-bottom: 6px; }
-  .desc { color: var(--text-dim); font-size: 13px; margin-bottom: 8px; }
-  .legend { display: flex; gap: 20px; font-size: 12px; margin-top: 10px; }
-  .legend span { display: inline-flex; align-items: center; gap: 6px; font-weight: bold; }
-  .dot { width: 10px; height: 10px; border-radius: 50%; }
-
-  .flow-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 20px; margin-bottom: 24px; }
-  .flow-title { font-size: 15px; font-weight: bold; color: #fff; margin-bottom: 16px; border-bottom: 1px solid #1f2937; padding-bottom: 8px; }
-
-  .chain { display: flex; flex-direction: column; align-items: flex-start; gap: 0; margin-left: 20px; }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+  body, html { width: 100%; height: 100%; overflow: hidden; background: #0b0f19; color: #e2e8f0; }
   
-  .step { display: flex; align-items: center; gap: 12px; }
-  .fn { padding: 6px 14px; border-radius: 6px; font-weight: bold; font-size: 13px; border: 1px solid; white-space: nowrap; }
-  .fn-table { background: rgba(56, 189, 248, 0.12); color: var(--table); border-color: var(--table); }
-  .fn-dataset { background: rgba(129, 140, 248, 0.12); color: var(--dataset); border-color: var(--dataset); }
-  .fn-index { background: rgba(52, 211, 153, 0.12); color: var(--index); border-color: var(--index); }
-  .fn-field { background: rgba(244, 114, 182, 0.12); color: var(--field); border-color: var(--field); }
-
-  .comment { color: var(--text-dim); font-size: 12px; }
-
-  .conn { display: flex; align-items: center; height: 32px; padding-left: 24px; position: relative; color: #6b7280; font-size: 12px; }
-  .conn::before { content: ""; position: absolute; left: 14px; top: 0; bottom: 0; width: 2px; background: #374151; }
-  .conn-arrow { margin-left: 12px; color: #9ca3af; font-weight: 600; display: inline-flex; align-items: center; gap: 4px; }
-  .conn-arrow::before { content: "↓"; margin-right: 4px; color: #60a5fa; }
-
-  .branch { display: flex; flex-direction: column; gap: 8px; margin: 4px 0 4px 28px; border-left: 2px dashed #4b5563; padding-left: 16px; }
-  .branch-item { display: flex; align-items: center; gap: 10px; }
-  .cond { background: #1f2937; color: #fbbf24; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+  #header {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 56px;
+    background: rgba(15, 23, 42, 0.9);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid #1e293b;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 24px;
+    z-index: 10;
+  }
+  .title-group {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+  h1 { font-size: 18px; font-weight: 700; color: #f8fafc; letter-spacing: 0.5px; }
+  .subtitle { font-size: 12px; color: #94a3b8; }
+  
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .btn {
+    background: #1e293b;
+    color: #cbd5e1;
+    border: 1px solid #334155;
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .btn:hover {
+    background: #334155;
+    color: #fff;
+  }
+  .btn.active {
+    background: #3b82f6;
+    border-color: #60a5fa;
+    color: #fff;
+  }
+  
+  #container {
+    width: 100%;
+    height: 100%;
+    padding-top: 56px;
+  }
+  
+  #detail-panel {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    width: 320px;
+    background: rgba(15, 23, 42, 0.92);
+    backdrop-filter: blur(12px);
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 16px;
+    font-size: 13px;
+    color: #cbd5e1;
+    z-index: 10;
+    box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+    display: none;
+  }
+  #detail-panel h3 {
+    font-size: 14px;
+    color: #f8fafc;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #334155;
+  }
+  #detail-panel .meta-item {
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+  #detail-panel .meta-key {
+    color: #94a3b8;
+  }
+  #detail-panel .meta-val {
+    font-weight: 600;
+  }
 </style>
+<script src="echarts.min.js"></script>
 </head>
 <body>
 
-<header>
-  <h1>Splayed V2.1 统一对象式接口调用链图谱</h1>
-  <div class="desc">四层纯对偶接口对齐：Table(Reader/Writer) &gt; Dataset(Reader/Writer) &gt; Index(Reader/Writer) &gt; Field(Reader/Writer)</div>
-  <div class="legend">
-    <span><span class="dot" style="background:var(--table)"></span>Table (Reader/Writer)</span>
-    <span><span class="dot" style="background:var(--dataset)"></span>Dataset (Reader/Writer)</span>
-    <span><span class="dot" style="background:var(--index)"></span>Index (Reader/Writer)</span>
-    <span><span class="dot" style="background:var(--field)"></span>Field (Reader/Writer)</span>
+<div id="header">
+  <div class="title-group">
+    <h1>Splayed V2.1 架构全层级关系图</h1>
+    <span class="subtitle">Table &gt; Dataset &gt; Index &gt; Field (调用链路与对象拓扑)</span>
   </div>
-</header>
-
-<!-- 1. 写入调用链 -->
-<div class="flow-box">
-  <div class="flow-title">1. 数据写入调用链 (.write)</div>
-  <div class="chain">
-    <div class="step">
-      <div class="fn fn-table">TableWriter.write(data)</div>
-      <div class="comment">// 获得 .lock 互斥锁，解析分区与行计划</div>
-    </div>
-    
-    <!-- 分区自愈分支 -->
-    <div class="branch">
-      <div class="branch-item">
-        <span class="cond">[新分区不存在]</span>
-        <span style="color:#6b7280">&rarr;</span>
-        <span class="fn fn-dataset">DatasetWriter.init(part_path, sub_data)</span>
-        <span class="comment">// 自动初始化新分区</span>
-      </div>
-      <div class="branch-item">
-        <span class="cond">[新列不存在]</span>
-        <span style="color:#6b7280">&rarr;</span>
-        <span class="fn fn-dataset">DatasetWriter.create_field(name, dt, init)</span>
-        <span class="comment">// 跨分区自愈建列 (未覆盖置NULL)</span>
-      </div>
-    </div>
-
-    <div class="conn"><span class="conn-arrow">按 max_parallelism 切分 P_part &times; P_field 并发调度</span></div>
-
-    <div class="step">
-      <div class="fn fn-dataset">DatasetWriter.write(offset, sliced_view)</div>
-      <div class="comment">// 校验行限，按列并发分发至各个 FieldWriter</div>
-    </div>
-
-    <div class="conn"><span class="conn-arrow">逐列下推 (std::thread::scope)</span></div>
-
-    <div class="step">
-      <div class="fn fn-field">FieldWriter.write(offset, col_view)</div>
-      <div class="comment">// MmapMut 切片原地覆写 + copy_bits_into 批量更新 Validity 位</div>
-    </div>
-
-    <!-- 骨架展开分支 -->
-    <div class="branch">
-      <div class="branch-item">
-        <span class="cond">[若为 Header-Only 延迟骨架]</span>
-        <span style="color:#6b7280">&rarr;</span>
-        <span class="comment">自动触发物理空间就地展开并重新 MmapMut</span>
-      </div>
-    </div>
+  <div class="controls">
+    <button class="btn active" id="btn-all" onclick="filterCategory('all')">全部链路</button>
+    <button class="btn" id="btn-read" onclick="filterCategory('read')">查询/读取链路</button>
+    <button class="btn" id="btn-write" onclick="filterCategory('write')">写入/更新链路</button>
+    <button class="btn" id="btn-ddl" onclick="filterCategory('ddl')">DDL结构操作</button>
+    <button class="btn" onclick="resetZoom()">复位视图</button>
   </div>
 </div>
 
-<!-- 2. 查询与扫描调用链 -->
-<div class="flow-box">
-  <div class="flow-title">2. 查询与扫描调用链 (.scan & .read)</div>
-  <div class="chain">
-    <div class="step">
-      <div class="fn fn-table">TableReader.scan(request)</div>
-      <div class="comment">// 分区目录名二分剪枝 (零 META I/O)，产出 TableScanner</div>
-    </div>
+<div id="container"></div>
 
-    <div class="conn"><span class="conn-arrow">TableScanner.next() [惰性迭代命中分区]</span></div>
-
-    <div class="step">
-      <div class="fn fn-dataset">DatasetReader.scan(request)</div>
-      <div class="comment">// 产出 DatasetScanner，协调索引定位与谓词计算</div>
-    </div>
-
-    <div class="conn"><span class="conn-arrow">第一阶段: 索引定位</span></div>
-
-    <div class="step">
-      <div class="fn fn-index">IndexReader.scan(request)</div>
-      <div class="comment">// 12B SYM INDEX 二分 &rarr; TIME AXIS 二分 &rarr; 输出 [row_start, row_start + count)</div>
-    </div>
-
-    <div class="conn"><span class="conn-arrow">第二阶段: 逐谓词求值 (Predicate Pushdown)</span></div>
-
-    <div class="step">
-      <div class="fn fn-field">FieldReader.scan(request)</div>
-      <div class="comment">// 向量化计算位图，与 Index 行区间求交集</div>
-    </div>
-
-    <div class="conn"><span class="conn-arrow">第三阶段: 投影列提取 (Projection)</span></div>
-
-    <div class="step">
-      <div class="fn fn-field">FieldReader.read(offset, length)</div>
-      <div class="comment">// Zero-Copy 零拷贝：直接从 Mmap 虚拟内存切片返回 ColumnView</div>
-    </div>
-  </div>
+<div id="detail-panel">
+  <h3 id="panel-title">节点详情</h3>
+  <div id="panel-body"></div>
 </div>
 
-<!-- 3. DDL 与结构操作调用链 -->
-<div class="flow-box">
-  <div class="flow-title">3. DDL 结构变更与自愈修复 (.init_field & .fix)</div>
-  <div class="chain">
-    <!-- 链路 A: init_field -->
-    <div class="step">
-      <div class="fn fn-table">TableWriter.init_field(name, dt)</div>
-      <div class="comment">// 仅在自然排序的最新分区新增单列结构 (免传 rows)</div>
-    </div>
+<script>
+const chartDom = document.getElementById('container');
+const myChart = echarts.init(chartDom, 'dark');
 
-    <div class="conn"><span class="conn-arrow">提取最新分区 latest_rows = dataset_reader.row_count()</span></div>
+// 统一配色：Table(#38bdf8), Dataset(#818cf8), Index(#34d399), Field(#f472b6), Client/Adapt(#fb923c)
+const colors = {
+  adapter: '#fb923c',
+  table: '#38bdf8',
+  dataset: '#818cf8',
+  index: '#34d399',
+  field: '#f472b6'
+};
 
-    <div class="step">
-      <div class="fn fn-field">FieldWriter.init_empty(path, dt, latest_rows)</div>
-      <div class="comment">// 物理写入 64B Header-Only 延迟骨架 (磁盘数据页分配为 0)</div>
-    </div>
+const categories = [
+  { name: 'Client / Adapter', itemStyle: { color: colors.adapter } },
+  { name: 'Table Layer', itemStyle: { color: colors.table } },
+  { name: 'Dataset Layer', itemStyle: { color: colors.dataset } },
+  { name: 'Index Layer', itemStyle: { color: colors.index } },
+  { name: 'Field Layer', itemStyle: { color: colors.field } }
+];
 
-    <div style="height: 16px;"></div>
+// X 坐标按层级分列：Adapter(100), Table(320), Dataset(580), Index(860), Field(860 或 1120)
+// 这样在保持力导向微调的同时，大体层次结构一目了然
+const nodes = [
+  // Adapter / Client
+  { id: 'client_query', name: 'Client: read / scan', category: 0, x: 100, y: 150, symbolSize: 34, desc: '外部 Python/Arrow/Polars 发起读取或条件扫描请求' },
+  { id: 'client_write', name: 'Client: write / update', category: 0, x: 100, y: 400, symbolSize: 34, desc: '外部 Python/Arrow 覆盖写或全量表替换' },
+  { id: 'client_ddl', name: 'Client: DDL 字段操作', category: 0, x: 100, y: 650, symbolSize: 32, desc: '增加、删除、重命名、类型转换、压缩等' },
+  
+  // Table Layer
+  { id: 'TableReader.read', name: 'TableReader.read()', category: 1, x: 340, y: 100, symbolSize: 32, desc: '跨分区流式/整批读取' },
+  { id: 'TableReader.scan', name: 'TableReader.scan()', category: 1, x: 340, y: 180, symbolSize: 32, desc: '基于 time_range 分区裁剪与条件扫描' },
+  { id: 'TableScanner', name: 'TableScanner', category: 1, x: 460, y: 180, symbolSize: 26, desc: '跨分区惰性扫描迭代器' },
+  { id: 'TableWriter.write', name: 'TableWriter.write()', category: 1, x: 340, y: 360, symbolSize: 32, desc: '按时序键分发跨分区覆盖写' },
+  { id: 'TableWriter.update', name: 'TableWriter.update()', category: 1, x: 340, y: 440, symbolSize: 30, desc: '全量原子替换表数据' },
+  { id: 'TableWriter.create', name: 'TableWriter.create()', category: 1, x: 340, y: 520, symbolSize: 28, desc: '创建空表或根据现有分区建表' },
+  { id: 'TableWriter.ddl', name: 'TableWriter: DDL', category: 1, x: 340, y: 650, symbolSize: 30, desc: 'delete_field / rename_field / cast_field 等结构变动' },
+  { id: 'Table.schema', name: 'TableReader/Writer.schema()', category: 1, x: 340, y: 780, symbolSize: 26, desc: '获取逻辑 Schema' },
+  { id: 'Table.stats', name: 'TableReader/Writer.statistics()', category: 1, x: 340, y: 860, symbolSize: 26, desc: '聚合各分区行数与边界统计' },
 
-    <!-- 链路 B: fix -->
-    <div class="step">
-      <div class="fn fn-table">TableWriter.fix()</div>
-      <div class="comment">// 表存储完整性自愈入口</div>
-    </div>
+  // Dataset Layer
+  { id: 'DatasetReader.read', name: 'DatasetReader.read()', category: 2, x: 620, y: 100, symbolSize: 32, desc: '单分区多列零拷贝切片读取' },
+  { id: 'DatasetReader.scan', name: 'DatasetReader.scan()', category: 2, x: 620, y: 180, symbolSize: 32, desc: '单分区条件扫描：索引先行 + 字段求交' },
+  { id: 'DatasetWriter.write', name: 'DatasetWriter.write()', category: 2, x: 620, y: 360, symbolSize: 32, desc: '单分区字段分桶并行覆盖写' },
+  { id: 'DatasetWriter.update', name: 'DatasetWriter.update()', category: 2, x: 620, y: 440, symbolSize: 30, desc: '单分区全量数据原子替换' },
+  { id: 'DatasetWriter.ddl', name: 'DatasetWriter: DDL', category: 2, x: 620, y: 650, symbolSize: 30, desc: '单字段生命周期操作与文件更新' },
+  { id: 'Dataset.schema', name: 'Dataset.schema()', category: 2, x: 620, y: 780, symbolSize: 26, desc: '发现并加载当前分区字段 Schema' },
+  { id: 'Dataset.stats', name: 'Dataset.statistics()', category: 2, x: 620, y: 860, symbolSize: 26, desc: '读取 .meta 索引统计 memo' },
 
-    <div class="conn"><span class="conn-arrow">自底向上清理分区空目录后，扫描历史独有字段 (prior - latest)</span></div>
+  // Index (META) Layer
+  { id: 'IndexReader.scan', name: 'IndexReader.scan()', category: 3, x: 900, y: 220, symbolSize: 30, desc: '基于 sym / time 谓词快速下推二分' },
+  { id: 'IndexReader.locate', name: 'IndexReader.locate()', category: 3, x: 900, y: 320, symbolSize: 30, desc: '网格化二分定位 (sym, time) 物理行号' },
+  { id: 'IndexReader.read', name: 'IndexReader.read()', category: 3, x: 900, y: 100, symbolSize: 28, desc: '读取 sym/time 字典与 RepeatDict 投影' },
+  { id: 'IndexWriter.update', name: 'IndexWriter.update()', category: 3, x: 900, y: 440, symbolSize: 28, desc: '原子重构生成 .meta 索引文件' },
+  { id: 'Index.info', name: 'Index.info() / schema()', category: 3, x: 900, y: 820, symbolSize: 26, desc: '解析 64B Header 与基础元信息' },
 
-    <div class="branch">
-      <div class="branch-item">
-        <span class="cond">[发现缺失字段]</span>
-        <span style="color:#6b7280">&rarr;</span>
-        <span class="fn fn-field">FieldWriter.init_empty(latest_part_path, dt, latest_rows)</span>
-        <span class="comment">// 最新分区补齐全空骨架，恢复全表 Schema 一致</span>
-      </div>
-      <div class="branch-item">
-        <span class="cond">[字段已对齐]</span>
-        <span class="comment">// 刷新元数据，自愈完成</span>
-      </div>
-    </div>
-  </div>
-</div>
+  // Field Layer
+  { id: 'FieldReader.read', name: 'FieldReader.read()', category: 4, x: 1160, y: 100, symbolSize: 32, desc: 'mmap 零拷贝切片 / compressed working 切片' },
+  { id: 'FieldReader.scan', name: 'FieldReader.scan()', category: 4, x: 1160, y: 220, symbolSize: 32, desc: '连续类型化比较 + validity 掩码位运算' },
+  { id: 'FieldWriter.write', name: 'FieldWriter.write()', category: 4, x: 1160, y: 360, symbolSize: 32, desc: 'values memcpy + validity 位批量 RMW' },
+  { id: 'FieldWriter.update', name: 'FieldWriter.update()', category: 4, x: 1160, y: 440, symbolSize: 30, desc: '重写物理字段文件 (tmp -> rename)' },
+  { id: 'FieldWriter.ddl', name: 'FieldWriter: DDL 操作', category: 4, x: 1160, y: 650, symbolSize: 30, desc: 'create / rename / cast / compress / decompress' },
+  { id: 'Field.schema', name: 'Field.schema()', category: 4, x: 1160, y: 780, symbolSize: 26, desc: '64B 头部快速解析物理类型与属性' }
+];
 
-<!-- 4. 对偶接口统一矩阵 -->
-<div class="flow-box">
-  <div class="flow-title">4. 四层纯对象式读写对称接口一览</div>
-  <table style="width:100%; border-collapse:collapse; font-size:12px;">
-    <thead>
-      <tr style="border-bottom:1px solid #374151; color:#9ca3af; text-align:left;">
-        <th style="padding:8px;">层级</th>
-        <th style="padding:8px;">只读对象 (*Reader)</th>
-        <th style="padding:8px;">可写对象 (*Writer)</th>
-        <th style="padding:8px;">核心统一定义接口</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr style="border-bottom:1px solid #1f2937;">
-        <td style="padding:8px; color:var(--table); font-weight:bold;">Table</td>
-        <td style="padding:8px;">TableReader</td>
-        <td style="padding:8px;">TableWriter</td>
-        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .init_field() / .fix()</td>
-      </tr>
-      <tr style="border-bottom:1px solid #1f2937;">
-        <td style="padding:8px; color:var(--dataset); font-weight:bold;">Dataset</td>
-        <td style="padding:8px;">DatasetReader</td>
-        <td style="padding:8px;">DatasetWriter</td>
-        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .create_field() / .locate()</td>
-      </tr>
-      <tr style="border-bottom:1px solid #1f2937;">
-        <td style="padding:8px; color:var(--index); font-weight:bold;">Index</td>
-        <td style="padding:8px;">IndexReader</td>
-        <td style="padding:8px;">IndexWriter</td>
-        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .locate()</td>
-      </tr>
-      <tr>
-        <td style="padding:8px; color:var(--field); font-weight:bold;">Field</td>
-        <td style="padding:8px;">FieldReader</td>
-        <td style="padding:8px;">FieldWriter</td>
-        <td style="padding:8px;">.scan() / .read() / .write() / .update() / .init_empty()</td>
-      </tr>
-    </tbody>
-  </table>
-</div>
+const links = [
+  // --- 读取/扫描调用链 ---
+  { source: 'client_query', target: 'TableReader.read', label: { show: true, formatter: '流式切片' }, lineStyle: { color: colors.table, width: 2.5 } },
+  { source: 'client_query', target: 'TableReader.scan', label: { show: true, formatter: '条件扫描' }, lineStyle: { color: colors.table, width: 2.5 } },
+  
+  { source: 'TableReader.read', target: 'DatasetReader.read', label: { show: true, formatter: '按分区路由' }, lineStyle: { color: colors.dataset, width: 2.5 } },
+  { source: 'TableReader.scan', target: 'TableScanner', label: { show: true, formatter: '惰性构造' }, lineStyle: { color: colors.table } },
+  { source: 'TableScanner', target: 'DatasetReader.scan', label: { show: true, formatter: '逐分区迭代' }, lineStyle: { color: colors.dataset, width: 2.5 } },
 
+  // DatasetReader.scan 内部拆分
+  { source: 'DatasetReader.scan', target: 'IndexReader.scan', label: { show: true, formatter: '1. 索引先行(sym/time)' }, lineStyle: { color: colors.index, width: 2.5 } },
+  { source: 'DatasetReader.scan', target: 'FieldReader.scan', label: { show: true, formatter: '2. 字段并行扫描+求交' }, lineStyle: { color: colors.field, width: 2.5 } },
+
+  // DatasetReader.read 内部拆分
+  { source: 'DatasetReader.read', target: 'IndexReader.read', label: { show: true, formatter: '投影 sym/time' }, lineStyle: { color: colors.index } },
+  { source: 'DatasetReader.read', target: 'FieldReader.read', label: { show: true, formatter: '普通字段零拷贝切片' }, lineStyle: { color: colors.field, width: 2.5 } },
+
+  // --- 写入/更新调用链 ---
+  { source: 'client_write', target: 'TableWriter.write', label: { show: true, formatter: '覆盖写请求' }, lineStyle: { color: colors.table, width: 2.5 } },
+  { source: 'client_write', target: 'TableWriter.update', label: { show: true, formatter: '全表覆盖替换' }, lineStyle: { color: colors.table, width: 2.5 } },
+
+  // TableWriter.write 内部
+  { source: 'TableWriter.write', target: 'IndexReader.locate', label: { show: true, formatter: '二分定位物理行' }, lineStyle: { color: colors.index, width: 2 } },
+  { source: 'TableWriter.write', target: 'DatasetWriter.write', label: { show: true, formatter: '跨分区并发分发' }, lineStyle: { color: colors.dataset, width: 2.5 } },
+  
+  // TableWriter.update 内部
+  { source: 'TableWriter.update', target: 'DatasetWriter.update', label: { show: true, formatter: '逐分区原子替换' }, lineStyle: { color: colors.dataset, width: 2.5 } },
+
+  // DatasetWriter.write 内部
+  { source: 'DatasetWriter.write', target: 'FieldWriter.write', label: { show: true, formatter: '分桶并行写列' }, lineStyle: { color: colors.field, width: 2.5 } },
+  { source: 'DatasetWriter.write', target: 'DatasetWriter.ddl', label: { show: true, formatter: '缺失列自愈补建' }, lineStyle: { color: colors.dataset, type: 'dashed' } },
+
+  // DatasetWriter.update 内部
+  { source: 'DatasetWriter.update', target: 'IndexWriter.update', label: { show: true, formatter: '重构 .meta' }, lineStyle: { color: colors.index, width: 2 } },
+  { source: 'DatasetWriter.update', target: 'FieldWriter.update', label: { show: true, formatter: '批量重写数据' }, lineStyle: { color: colors.field, width: 2 } },
+
+  // --- DDL 结构调用链 ---
+  { source: 'client_ddl', target: 'TableWriter.ddl', label: { show: true, formatter: 'DDL 命令' }, lineStyle: { color: colors.table, width: 2 } },
+  { source: 'TableWriter.ddl', target: 'DatasetWriter.ddl', label: { show: true, formatter: '全分区广播' }, lineStyle: { color: colors.dataset, width: 2 } },
+  { source: 'DatasetWriter.ddl', target: 'FieldWriter.ddl', label: { show: true, formatter: '物理原子操作' }, lineStyle: { color: colors.field, width: 2 } },
+
+  // --- 元数据 / 统计调用链 ---
+  { source: 'Table.schema', target: 'Dataset.schema', label: { show: true, formatter: '读最后分区' }, lineStyle: { color: colors.dataset } },
+  { source: 'Dataset.schema', target: 'Field.schema', label: { show: true, formatter: 'DFS 遍历' }, lineStyle: { color: colors.field } },
+  { source: 'Table.stats', target: 'Dataset.stats', label: { show: true, formatter: '聚合 Partition' }, lineStyle: { color: colors.dataset } },
+  { source: 'Dataset.stats', target: 'Index.info', label: { show: true, formatter: '读取 .meta' }, lineStyle: { color: colors.index } }
+];
+
+const option = {
+  backgroundColor: '#0b0f19',
+  tooltip: {
+    formatter: function (x) {
+      if (x.dataType === 'node') {
+        return `<strong>${x.data.name}</strong><br/><span style="color:#94a3b8">${x.data.desc || ''}</span>`;
+      } else if (x.dataType === 'edge') {
+        return `<strong>${x.data.source}</strong> → <strong>${x.data.target}</strong><br/><span style="color:#60a5fa">${x.data.label ? x.data.label.formatter : ''}</span>`;
+      }
+    }
+  },
+  legend: [{
+    data: categories.map(c => c.name),
+    orient: 'horizontal',
+    left: 24,
+    bottom: 24,
+    textStyle: { color: '#cbd5e1', fontSize: 12 },
+    icon: 'circle'
+  }],
+  animationDuration: 1200,
+  animationEasingUpdate: 'quinticInOut',
+  series: [{
+    type: 'graph',
+    layout: 'none', // 使用自定义固定层次坐标布局，保持层次清晰
+    data: nodes,
+    links: links,
+    categories: categories,
+    roam: true,
+    label: {
+      show: true,
+      position: 'right',
+      formatter: '{b}',
+      fontSize: 12,
+      color: '#e2e8f0',
+      offset: [6, 0]
+    },
+    lineStyle: {
+      color: 'source',
+      curveness: 0.18,
+      opacity: 0.8
+    },
+    edgeSymbol: ['none', 'arrow'],
+    edgeSymbolSize: [4, 8],
+    edgeLabel: {
+      fontSize: 11,
+      color: '#cbd5e1'
+    },
+    emphasis: {
+      focus: 'adjacency',
+      lineStyle: {
+        width: 4
+      }
+    }
+  }]
+};
+
+myChart.setOption(option);
+
+window.addEventListener('resize', () => {
+  myChart.resize();
+});
+
+// 点击显示节点详情面板
+myChart.on('click', function (params) {
+  const panel = document.getElementById('detail-panel');
+  const title = document.getElementById('panel-title');
+  const body = document.getElementById('panel-body');
+  
+  if (params.dataType === 'node') {
+    panel.style.display = 'block';
+    title.innerText = params.data.name;
+    body.innerHTML = `
+      <div class="meta-item"><span class="meta-key">所属层级:</span> <span class="meta-val" style="color:${colors[Object.keys(colors)[params.data.category]]}">${categories[params.data.category].name}</span></div>
+      <div class="meta-item"><span class="meta-key">职责定义:</span> <span class="meta-val" style="text-align:right">${params.data.desc || '统一对象核心方法'}</span></div>
+      <div style="margin-top:8px;font-size:11px;color:#94a3b8;">* 提示: 滚动鼠标滑轮可自由缩放，按住左键可平移画布。高亮关联可查看上下游流转关系。</div>
+    `;
+  } else {
+    panel.style.display = 'none';
+  }
+});
+
+// 筛选模式控制
+function filterCategory(type) {
+  document.querySelectorAll('.btn').forEach(b => b.classList.remove('active'));
+  if (type === 'all') document.getElementById('btn-all').classList.add('active');
+  if (type === 'read') document.getElementById('btn-read').classList.add('active');
+  if (type === 'write') document.getElementById('btn-write').classList.add('active');
+  if (type === 'ddl') document.getElementById('btn-ddl').classList.add('active');
+
+  let activeNodeIds = new Set();
+  let activeLinks = [];
+
+  if (type === 'all') {
+    activeNodeIds = new Set(nodes.map(n => n.id));
+    activeLinks = links;
+  } else if (type === 'read') {
+    const readIds = ['client_query', 'TableReader.read', 'TableReader.scan', 'TableScanner', 'DatasetReader.read', 'DatasetReader.scan', 'IndexReader.scan', 'IndexReader.read', 'FieldReader.read', 'FieldReader.scan'];
+    activeNodeIds = new Set(readIds);
+    activeLinks = links.filter(l => readIds.includes(l.source) && readIds.includes(l.target));
+  } else if (type === 'write') {
+    const writeIds = ['client_write', 'TableWriter.write', 'TableWriter.update', 'IndexReader.locate', 'DatasetWriter.write', 'DatasetWriter.update', 'IndexWriter.update', 'FieldWriter.write', 'FieldWriter.update', 'DatasetWriter.ddl'];
+    activeNodeIds = new Set(writeIds);
+    activeLinks = links.filter(l => writeIds.includes(l.source) && writeIds.includes(l.target));
+  } else if (type === 'ddl') {
+    const ddlIds = ['client_ddl', 'TableWriter.ddl', 'DatasetWriter.ddl', 'FieldWriter.ddl', 'Table.schema', 'Dataset.schema', 'Field.schema'];
+    activeNodeIds = new Set(ddlIds);
+    activeLinks = links.filter(l => ddlIds.includes(l.source) && ddlIds.includes(l.target));
+  }
+
+  const updatedNodes = nodes.map(n => ({
+    ...n,
+    itemStyle: {
+      opacity: activeNodeIds.has(n.id) ? 1 : 0.12
+    },
+    label: {
+      color: activeNodeIds.has(n.id) ? '#e2e8f0' : '#475569'
+    }
+  }));
+
+  const updatedLinks = links.map(l => ({
+    ...l,
+    lineStyle: {
+      ...l.lineStyle,
+      opacity: (activeNodeIds.has(l.source) && activeNodeIds.has(l.target)) ? 0.85 : 0.05
+    }
+  }));
+
+  myChart.setOption({
+    series: [{
+      data: updatedNodes,
+      links: updatedLinks
+    }]
+  });
+}
+
+function resetZoom() {
+  myChart.dispatchAction({
+    type: 'restore'
+  });
+}
+</script>
 </body>
 </html>
