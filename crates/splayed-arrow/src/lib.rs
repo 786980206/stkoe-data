@@ -555,7 +555,7 @@ impl TableArrowWriter {
         options: Option<splayed_table::TableOptions>,
     ) -> Result<Self> {
         let data = record_batch_to_data(batch)?;
-        let inner = splayed_table::TableWriter::init(path, scheme, &data.as_view(), options)?;
+        let inner = splayed_table::TableWriter::init_data(path, scheme, data, options)?;
         Ok(Self { inner })
     }
 

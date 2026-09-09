@@ -1193,25 +1193,18 @@ pub fn create_dataset_from_view(
         }
     }
 
-    // ④ 临时目录保证最终原子发布
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .ok_or_else(|| CoreError::Invalid("invalid dataset path".into()))?;
-    let tmp = parent.join(format!(".{name}.tmp"));
-    fs::create_dir_all(&tmp).map_err(|e| map_io_path(&tmp, e))?;
+    // ④ 直接写目标目录，若目标已存在由开头的 exists 拦截
+    fs::create_dir_all(path).map_err(|e| map_io_path(path, e))?;
 
     let result = (|| {
-        // META 字节直写 + fsync
+        // META 字节直写
         {
             let mut f = File::options()
                 .write(true)
                 .create(true)
                 .truncate(true)
-                .open(&tmp.join(META_FILE_NAME))?;
+                .open(&path.join(META_FILE_NAME))?;
             f.write_all(&meta)?;
-            f.sync_all()?;
         }
         // Field 并行创建：桶内顺序、桶间并行；P = min(max_parallelism, 字段数)
         let p = options.max_parallelism.max(1).min(field_cols.len()).max(1);
@@ -1222,7 +1215,7 @@ pub fn create_dataset_from_view(
                 } else {
                     field_options.clone()
                 };
-                crate::field_file::create_field_file_from_view(&tmp.join(col_name), col_view, &fo)?;
+                crate::field_file::create_field_file_from_view(&path.join(col_name), col_view, &fo)?;
             }
         } else {
             let mut buckets: Vec<Vec<(&str, DataType, &ColumnView<'_>)>> = vec![Vec::new(); p];
@@ -1232,7 +1225,7 @@ pub fn create_dataset_from_view(
             std::thread::scope(|s| -> Result<(), CoreError> {
                 let mut handles = Vec::new();
                 for bucket in buckets {
-                    let tmp = &tmp;
+                    let path = &path;
                     let fo = &field_options;
                     handles.push(s.spawn(move || -> Result<(), CoreError> {
                         for (col_name, data_type, col_view) in bucket {
@@ -1241,7 +1234,7 @@ pub fn create_dataset_from_view(
                             } else {
                                 fo.clone()
                             };
-                            crate::field_file::create_field_file_from_view(&tmp.join(col_name), col_view, &fo)?;
+                            crate::field_file::create_field_file_from_view(&path.join(col_name), col_view, &fo)?;
                         }
                         Ok(())
                     }));
@@ -1256,10 +1249,9 @@ pub fn create_dataset_from_view(
         Ok(())
     })();
     if let Err(e) = result {
-        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_dir_all(path);
         return Err(e);
     }
-    fs::rename(&tmp, path).map_err(|e| map_io_path(path, e))?;
     Ok(())
 }
 

@@ -568,36 +568,41 @@ pub fn init_table_data(
     }
     // ① 主线程：一次线性扫描 → 每分区连续行片段（分区名仅换段时构造）
     let buckets = partition_spans(&data, scheme, tt)?;
-    // ② 并行创建分区：P_part × P_field ≤ max_parallelism 预算切分
-    let p_part = max_p.min(buckets.len());
+    // ② 按数据量降序排序，结合原子工作窃取实现完美动态负载均衡
+    let mut sorted_buckets = buckets;
+    sorted_buckets.sort_by_key(|(_, runs)| std::cmp::Reverse(runs.iter().map(|&(_, l)| l).sum::<usize>()));
+
+    let p_part = max_p.min(sorted_buckets.len());
     if p_part <= 1 {
-        // 单分区 / 并行度 1：串行创建，Field 级并行拿满预算
-        for (name, runs) in buckets {
+        for (name, runs) in sorted_buckets {
             let sub = gather_runs(&data, &runs)?;
             splayed_core::create_dataset_data(&table_path.join(&name), sub, ds_options.clone())?;
         }
         return Ok(());
     }
-    let p_field = (max_p / p_part).max(1);
-    let mut groups: Vec<Vec<(String, Vec<RowSpan>)>> = vec![Vec::new(); p_part];
-    for (i, bucket) in buckets.into_iter().enumerate() {
-        groups[i % p_part].push(bucket);
-    }
-    // 共享引用先行绑定：move 闭包只捕获 &Data，不移动本体
+
     let data_ref = &data;
     let ds_options_ref = &ds_options;
+    let buckets_ref = &sorted_buckets;
+    let task_idx = std::sync::atomic::AtomicUsize::new(0);
+    let num_tasks = sorted_buckets.len();
+
     std::thread::scope(|s| {
         let mut handles = Vec::new();
-        for group in groups {
-            handles.push(s.spawn(move || -> Result<(), CoreError> {
-                for (name, runs) in group {
-                    // 分区内 gather（批量拼接）+ create_dataset（Field 级并行 p_field）
-                    let sub = gather_runs(data_ref, &runs)?;
+        for _ in 0..p_part {
+            handles.push(s.spawn(|| -> Result<(), CoreError> {
+                loop {
+                    let i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= num_tasks {
+                        break;
+                    }
+                    let (name, runs) = &buckets_ref[i];
+                    let sub = gather_runs(data_ref, runs)?;
                     splayed_core::create_dataset_data(
-                        &table_path.join(&name),
+                        &table_path.join(name),
                         sub,
                         CreateDatasetOptions {
-                            max_parallelism: p_field,
+                            max_parallelism: 1,
                             ..ds_options_ref.clone()
                         },
                     )?;

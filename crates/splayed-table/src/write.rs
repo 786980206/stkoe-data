@@ -595,8 +595,29 @@ impl TableWriter {
         data: &DataView<'_>,
         options: Option<TableOptions>,
     ) -> Result<Self, CoreError> {
-        let inner = crate::table::init_table(path, scheme, data, options)?;
-        Ok(Self { inner })
+        let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
+        Self::init_data(path, scheme, owned, options)
+    }
+
+    pub fn init_data(
+        path: &Path,
+        scheme: PartitionScheme,
+        data: splayed_format::Data,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError> {
+        let opts = options.unwrap_or_default();
+        crate::table::init_table_data(path, data, scheme, opts.clone())?;
+        Ok(Self {
+            inner: TableHandle {
+                root: path.to_path_buf(),
+                scheme,
+                time_type: std::cell::RefCell::new(None),
+                mode: Mode::Write,
+                options: opts,
+                datasets: std::cell::RefCell::new(std::collections::HashMap::new()),
+                stats_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        })
     }
 
     pub fn open(path: &Path) -> Result<Self, CoreError> {
