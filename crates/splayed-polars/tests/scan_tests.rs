@@ -195,3 +195,40 @@ fn scan_polars_empty_table_refuses() {
     assert!(res.is_err());
     cleanup(&dir);
 }
+
+#[test]
+fn test_sink_splayed_roundtrip_auto_init_and_write() {
+    let dir = temp_dir("sink_roundtrip");
+    let root = dir.join("tbl");
+
+    // 1. 构造 Polars DataFrame
+    let df1 = polars::df!(
+        "sym" => &["AAPL", "AAPL", "MSFT", "MSFT"],
+        "time" => &[100i64, 200, 100, 200],
+        "price" => &[15.5f64, 16.5, 25.5, 26.5]
+    ).unwrap();
+
+    // 2. 写入不存在的表：应自动调用 init 建表并写入
+    splayed_polars::sink_splayed(&df1, &root, splayed_table::PartitionScheme::None, None).unwrap();
+    assert!(root.join(".meta").exists());
+
+    // 3. 使用 scan_splayed 读取验证
+    let lf = splayed_polars::scan_splayed(&root).unwrap();
+    let read_df = lf.collect().unwrap();
+    assert_eq!(read_df.height(), 4);
+    assert_eq!(read_df.width(), 3);
+
+    // 4. 追加/覆盖写（表已存在）：应自动调用 open + write
+    let df2 = polars::df!(
+        "sym" => &["AAPL", "MSFT"],
+        "time" => &[100i64, 100],
+        "price" => &[99.0f64, 88.0]
+    ).unwrap();
+    splayed_polars::sink_splayed(&df2, &root, splayed_table::PartitionScheme::None, None).unwrap();
+
+    let lf2 = splayed_polars::scan_splayed(&root).unwrap();
+    let read_df2 = lf2.filter(polars::prelude::col("price").gt(polars::prelude::lit(50.0))).collect().unwrap();
+    assert_eq!(read_df2.height(), 2);
+
+    cleanup(&dir);
+}

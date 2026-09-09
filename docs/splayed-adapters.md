@@ -1,25 +1,41 @@
-# 适配层设计（V2.0）：Polars / DuckDB / ADBC
+# 适配层设计（V2.1）：Polars / DuckDB / ADBC
 
 本文档定义三个引擎适配层的能力对齐方案，作为实现前置的权威设计。
 依赖方向：`format ← codec ← core ← table ← arrow ← {polars | duckdb | adbc}`。
 
-## 1. splayed-polars（AnonymousScan 惰性扫描）
+## 1. splayed-polars（Rust & Python 原生 Polars 深度适配）
 
-### API
+### 核心能力与 API 对齐
+同时支持 Rust 原生与 Python 两端生态：
 
-```rust
-pub struct SplayedTable { root: PathBuf }          // 扫描对象包装
-impl AnonymousScan for SplayedTable { ... }
-pub fn scan_polars(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>   // 入口
-```
+#### 1.1 惰性扫描（scan_splayed）
+- **Rust API**: `pub fn scan_splayed(path: impl AsRef<Path>) -> PolarsResult<LazyFrame>`（保留 `scan_polars` 别名）
+- **Python API**: `splayed.scan_splayed(path, allow_filter=True, batch_size=None)`，同时注入为 `polars.scan_splayed(path)`
+- **Lazy 下推优化**：
+  - **Projection Pushdown（列裁剪）**：仅读取并解码查询请求所需要的列（包含过滤谓词依赖列）；
+  - **Predicate Pushdown（谓词下推）**：自动将 Polars 过滤表达式下推并转换为 PyArrow 计算表达式，在内存流式切片批次层即时求值过滤；
+  - **Limit Pushdown（行数裁剪）**：自动下推 limit 参数，提前截断批次并及早终止跨分区扫描。
 
-### 能力对齐
+#### 1.2 导出与写入（sink_splayed）
+- **Rust API**: `pub fn sink_splayed(df: &DataFrame, path: impl AsRef<Path>, scheme: PartitionScheme, options: Option<TableOptions>) -> PolarsResult<()>`
+- **Python API**:
+  - `splayed.sink_splayed(df_or_lf, path, scheme="none", max_parallelism=None)`
+  - 原生链式方法：`df.sink_splayed(path, ...)` 与 `lf.sink_splayed(path, ...)`
+  - 扩展命名空间：`df.splayed.sink(path, ...)` 与 `lf.splayed.sink(path, ...)`
+- **智能自愈与双路径路由**：
+  - 若目标路径尚无表物理元数据（`.meta` 缺失）：自动调用 `TableWriter::init` 进行建表初始化与首批数据写入；
+  - 若目标表已存在：自动调用 `TableWriter::open` 并通过 `.write()` 执行覆盖写入。
 
-| 能力 | V2.0 |
+### 能力对齐表
+
+| 能力 | V2.1 实现 |
 | --- | --- |
-| AnonymousScan + 谓词/列裁剪 | 支持（via `AnonymousScanOptions`） |
-| 分区表惰性扫描（分区列过滤/常量列） | `scan_polars` 内部做分区发现 + time 条件 pruning |
-| arrowconv（arrow-rs ↔ polars-arrow） | 拷贝级转换（列→Series），零拷贝依赖 polars-arrow 桥（优化项） |
+| `scan_splayed` 惰性扫描 | 支持 Rust 与 Python，返回 Polars `LazyFrame` |
+| Projection 下推 | 支持：仅拉取所需列，通过 `splayed-arrow` 零拷贝转换 |
+| Predicate 下推 | 支持：通过 PyArrow/Arrow 表达式求值层实现 |
+| Limit 下推 | 支持：批次提前早停截断 |
+| `sink_splayed` 自动建表与写入 | 支持：自动判别不存在走 `init`，已存在走 `open` + `write` |
+| 跨分区与时序切分 | 支持：根据 `PartitionScheme` 自动切分并写入各分区 |
 
 ### 语义
 

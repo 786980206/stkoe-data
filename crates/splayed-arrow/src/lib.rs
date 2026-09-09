@@ -111,7 +111,8 @@ pub fn from_arrow_type(dt: &ArrowDt) -> Result<DataType> {
         ArrowDt::Date32 => DataType::Date32,
         ArrowDt::Timestamp(TimeUnit::Microsecond, _) => DataType::TimestampUs,
         ArrowDt::Date64 => DataType::Date64,
-        ArrowDt::Dictionary(_, v) if **v == ArrowDt::Utf8 => DataType::Utf8,
+        ArrowDt::Utf8 | ArrowDt::LargeUtf8 => DataType::Utf8,
+        ArrowDt::Dictionary(_, v) if **v == ArrowDt::Utf8 || **v == ArrowDt::LargeUtf8 => DataType::Utf8,
         other => {
             return Err(ArrowConvError::Unsupported(format!(
                 "arrow type {other:?} has no V2.0 mapping"
@@ -715,33 +716,86 @@ pub fn record_batch_to_data(batch: &RecordBatch) -> Result<Data> {
 }
 
 
-/// Dictionary(Int32, Utf8) → V2 Utf8 字典列。
+/// Dictionary(Int32, Utf8) 或纯 StringArray/LargeStringArray → V2 Utf8 字典列。
 fn utf8_dict_to_column(
     array: &ArrayRef,
     validity: Option<Bitmap>,
 ) -> Result<(Buffer, Option<Bitmap>, Option<DictBuffers>)> {
-    let dict = array
-        .as_any()
-        .downcast_ref::<DictionaryArray<Int32Type>>()
-        .ok_or_else(|| ArrowConvError::Unsupported("Utf8 column requires DictionaryArray".into()))?;
-    let values = dict
-        .values()
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ArrowConvError::Unsupported("dict values not utf8".into()))?;
+    if let Some(dict) = array.as_any().downcast_ref::<DictionaryArray<Int32Type>>() {
+        let values = dict
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| ArrowConvError::Unsupported("dict values not utf8".into()))?;
+        let mut offsets: Vec<u64> = vec![0u64];
+        let mut strings: Vec<u8> = Vec::new();
+        for i in 0..values.len() {
+            strings.extend_from_slice(values.value(i).as_bytes());
+            offsets.push(strings.len() as u64);
+        }
+        let keys: Vec<u32> = dict
+            .keys()
+            .iter()
+            .map(|k| k.unwrap_or(0) as u32)
+            .collect();
+        return Ok((
+            Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
+            validity,
+            Some(DictBuffers {
+                offsets: Buffer::from_vec(offsets.iter().flat_map(|o| o.to_le_bytes()).collect()),
+                strings: Buffer::from_vec(strings),
+            }),
+        ));
+    }
+
+    // 处理普通的 StringArray / LargeStringArray：现场构建字典
+    let rows = array.len();
+    let mut unique_map: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    let mut str_vals: Vec<Option<&str>> = Vec::with_capacity(rows);
+
+    if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        for i in 0..rows {
+            if arr.is_null(i) {
+                str_vals.push(None);
+            } else {
+                let s = arr.value(i);
+                str_vals.push(Some(s));
+                unique_map.entry(s).or_insert(0);
+            }
+        }
+    } else if let Some(arr) = array.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
+        for i in 0..rows {
+            if arr.is_null(i) {
+                str_vals.push(None);
+            } else {
+                let s = arr.value(i);
+                str_vals.push(Some(s));
+                unique_map.entry(s).or_insert(0);
+            }
+        }
+    } else {
+        return Err(ArrowConvError::Unsupported(format!(
+            "expected DictionaryArray or StringArray for Utf8, found {:?}",
+            array.data_type()
+        )));
+    }
+
     let mut offsets: Vec<u64> = vec![0u64];
     let mut strings: Vec<u8> = Vec::new();
-    for i in 0..values.len() {
-        strings.extend_from_slice(values.value(i).as_bytes());
+    for (id, (s, entry)) in unique_map.iter_mut().enumerate() {
+        *entry = id as u32;
+        strings.extend_from_slice(s.as_bytes());
         offsets.push(strings.len() as u64);
     }
-    // V2 字典 keys 非空：行级 NULL 由 validity 位图表达；Arrow 端 null key 槽位
-    // 以 0 填充（payload 被 validity 掩蔽），不 panic
-    let keys: Vec<u32> = dict
-        .keys()
-        .iter()
-        .map(|k| k.unwrap_or(0) as u32)
-        .collect();
+
+    let mut keys = Vec::with_capacity(rows);
+    for opt in str_vals {
+        match opt {
+            Some(s) => keys.push(*unique_map.get(s).unwrap()),
+            None => keys.push(0),
+        }
+    }
+
     Ok((
         Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
         validity,
