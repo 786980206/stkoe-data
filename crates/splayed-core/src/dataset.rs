@@ -571,6 +571,62 @@ impl DatasetHandle {
         Ok(())
     }
 
+    /// 全量替换更新数据集（原子更新 .meta 及所有数据列）。
+    pub fn update_dataset(&mut self, data: &DataView<'_>) -> Result<(), CoreError> {
+        self.mode.require_write("update_dataset")?;
+        if data.column("sym").is_none() || data.column("time").is_none() {
+            return Err(CoreError::Invalid("update data requires sym and time columns".into()));
+        }
+        // 1. 原子更新 .meta
+        self.meta.update_index(data)?;
+        // 2. 清空并关闭已有的字段句柄缓存（避免 Windows 共享冲突）
+        self.fields.borrow_mut().clear();
+        // 3. 逐列写入/替换新字段
+        for (field, col) in data.schema.fields.iter().zip(&data.columns) {
+            let name = field.name.as_ref();
+            if name == "sym" || name == "time" {
+                continue;
+            }
+            let field_path = self.field_path(name);
+            if field_path.exists() {
+                let mut fh = crate::field_file::open_field(&field_path, Mode::Write)?;
+                fh.update_field(col)?;
+                fh.close_field()?;
+            } else {
+                if let Some(p) = field_path.parent() {
+                    fs::create_dir_all(p).map_err(CoreError::Io)?;
+                }
+                crate::field_file::init_field(&field_path, col, None)?;
+            }
+        }
+        // 4. 清理旧数据中存在但在新数据中不存在的列（避免残留行数不匹配的旧字段）
+        let old_schema = self.schema.clone();
+        for f in &old_schema.fields {
+            if f.name.as_ref() != "sym" && f.name.as_ref() != "time" && data.column(f.name.as_ref()).is_none() {
+                let _ = crate::field_file::delete_field_file(&self.field_path(f.name.as_ref()));
+            }
+        }
+        // 5. 重新加载 Schema
+        self.reload_schema();
+        Ok(())
+    }
+
+    /// 修改指定 Field 的 header（与 update_table_field 对齐）。
+    #[inline]
+    pub fn update_dataset_field(
+        &self,
+        name: &str,
+        header: &splayed_format::FieldHeader,
+    ) -> Result<(), CoreError> {
+        self.update_dataset_field_header(name, *header)
+    }
+
+    /// 销毁并删除 Dataset 目录。
+    #[inline]
+    pub fn drop_dataset(self) -> Result<(), CoreError> {
+        drop_dataset(self)
+    }
+
     /// 修改指定 Field 的 header（不改 data；data_type / row_count 由 core 强制为现值）。
     /// 为 Table 层 `update_table_field` 的下沉通道。
     pub fn update_dataset_field_header(
@@ -1197,4 +1253,33 @@ pub fn drop_dataset(handle: DatasetHandle) -> Result<(), CoreError> {
 /// 删除完整 Dataset 根目录（META + 全部 Field）。
 pub fn delete_dataset(path: &Path) -> Result<(), CoreError> {
     fs::remove_dir_all(path).map_err(|e| map_io_path(path, e))
+}
+
+/// 全量替换更新 Dataset 数据。
+#[inline]
+pub fn update_dataset(handle: &mut DatasetHandle, data: &DataView<'_>) -> Result<(), CoreError> {
+    handle.update_dataset(data)
+}
+
+/// 重命名 Dataset 目录。
+pub fn rename_dataset(dataset_path: &Path, new_name: &str) -> Result<(), CoreError> {
+    if new_name.is_empty() || new_name.starts_with('.') || new_name.contains(['/', '\\', '=']) {
+        return Err(CoreError::Invalid(format!("invalid dataset name '{new_name}'")));
+    }
+    if !dataset_path.is_dir() {
+        return Err(CoreError::NotFound(dataset_path.to_path_buf()));
+    }
+    let parent = dataset_path.parent().unwrap_or_else(|| Path::new("."));
+    let target = parent.join(new_name);
+    if target.exists() {
+        return Err(CoreError::AlreadyExists(target));
+    }
+    fs::rename(dataset_path, &target).map_err(|e| map_io_path(dataset_path, e))?;
+    Ok(())
+}
+
+/// 读取 Dataset 的完整 Schema。
+pub fn read_dataset_schema(path: &Path) -> Result<Schema, CoreError> {
+    let meta = MetaHandle::open(&path.join(META_FILE_NAME))?;
+    build_schema(path, meta.time_type())
 }

@@ -1411,3 +1411,41 @@ fn table_partition_delete_and_rescan() {
     drop(table);
     cleanup(&dir);
 }
+
+#[test]
+fn update_table_and_delete_partition() {
+    let dir = temp_dir("tbl_update_del");
+    let root = dir.join("tbl");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let initial = make_data(&[
+        ("AAPL", d(8, 1), 10.0),
+        ("AAPL", d(8, 2), 11.0),
+        ("MSFT", d(9, 1), 20.0),
+    ]);
+    splayed_table::init_table(&root, PartitionScheme::Month, &initial.as_view(), None).unwrap();
+    let table = splayed_table::open_table(&root, Mode::Write, TableOptions::default()).unwrap();
+    assert_eq!(table.read_table_statistics().unwrap().row_count, 3);
+    assert_eq!(splayed_table::read_table_schema(&table).unwrap().len(), 3);
+
+    // 1. 全量更新表数据（8 月更新为 1 行，9 月更新为 1 行，并自动创建 10 月新分区 1 行）
+    let update_data = make_data(&[
+        ("AAPL", d(8, 1), 99.0),
+        ("MSFT", d(9, 1), 88.0),
+        ("GOOG", d(10, 1), 77.0),
+    ]);
+    splayed_table::update_table(&table, &update_data.as_view()).unwrap();
+    assert_eq!(table.read_table_statistics().unwrap().row_count, 3);
+
+    // 2. 验证 10 月分区已自动建立
+    let meta = table.read_table_metadata().unwrap();
+    assert_eq!(meta.partitions.len(), 3);
+    assert_eq!(meta.partitions[2].name, "month=2026-10");
+
+    // 3. 删除指定分区
+    table.delete_partition("month=2026-08").unwrap();
+    assert_eq!(table.read_table_metadata().unwrap().partitions.len(), 2);
+    assert_eq!(table.read_table_statistics().unwrap().row_count, 2);
+
+    table.close_table().unwrap();
+    cleanup(&dir);
+}

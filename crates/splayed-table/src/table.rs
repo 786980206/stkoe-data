@@ -44,7 +44,7 @@ pub struct TableHandle {
     /// 逐分区统计**不可变**——META immutable + positional overwrite 不改 row_count /
     /// TIME AXIS / sym 字典——按名字 memo 后永不失效；分区集合本身不缓存（read_dir
     /// 微秒级且保证外部 create / delete 的正确性），新建分区在下一次统计时自动纳入。
-    stats_cache: RefCell<HashMap<String, DatasetStatistics>>,
+    pub(crate) stats_cache: RefCell<HashMap<String, DatasetStatistics>>,
 }
 
 /// Table 级字段初始化方式（对标 core `DatasetFieldInit` + 跨分区分发语义）。
@@ -129,8 +129,8 @@ impl TableHandle {
         }
     }
 
-    /// 打开（或取缓存）Partition 对应的 Dataset。`none` 模式 name 为空 → 根目录 Dataset。
-    pub(crate) fn dataset_for(&self, partition: &str) -> Result<&DatasetHandle, CoreError> {
+    /// 确保目标分区的 DatasetHandle 已打开并缓存。
+    pub(crate) fn ensure_dataset(&self, partition: &str) -> Result<(), CoreError> {
         if !self.datasets.borrow().contains_key(partition) {
             let dir = if self.scheme == PartitionScheme::None {
                 self.root.clone()
@@ -141,10 +141,16 @@ impl TableHandle {
             ds.set_max_parallelism(self.max_parallelism());
             self.datasets.borrow_mut().insert(partition.to_string(), Box::new(ds));
         }
+        Ok(())
+    }
+
+    /// 打开（或取缓存）Partition 对应的 Dataset。`none` 模式 name 为空 → 根目录 Dataset。
+    pub(crate) fn dataset_for(&self, partition: &str) -> Result<&DatasetHandle, CoreError> {
+        self.ensure_dataset(partition)?;
         let borrow = self.datasets.borrow();
         let ptr: *const DatasetHandle = match borrow.get(partition) {
             Some(b) => &**b as *const DatasetHandle,
-            None => unreachable!("just inserted"),
+            None => unreachable!("just ensured"),
         };
         // 安全性：Box 地址稳定；条目只增不删
         Ok(unsafe { &*ptr })
@@ -844,6 +850,12 @@ pub fn open_table(
     })
 }
 
+/// 读取 Table 的统合 Schema。
+#[inline]
+pub fn read_table_schema(table: &TableHandle) -> Result<Schema, CoreError> {
+    table.read_table_schema()
+}
+
 /// 关闭 TableHandle（方法形式的别名保持命名一致）。
 pub fn close_table(handle: TableHandle) -> Result<(), CoreError> {
     handle.close()
@@ -857,6 +869,12 @@ impl TableHandle {
             ds.close_dataset()?;
         }
         Ok(())
+    }
+
+    /// 显式关闭 TableHandle（与 close() 等价）。
+    #[inline]
+    pub fn close_table(self) -> Result<(), CoreError> {
+        self.close()
     }
     /// Table Schema：最后一个 Partition 的 Dataset Schema（不做多 Partition merge）。
     /// 逐分区统计（统一缓存模型）：命中 `stats_cache` 直接返回（零 I/O）；
@@ -1336,11 +1354,17 @@ impl TableHandle {
     }
 
     /// 删除指定 Partition（释放句柄并删除物理分区目录）。
-    pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError> {
+    pub fn delete_partition(&self, partition_name: &str) -> Result<(), CoreError> {
         delete_table_partition(&self.root, partition_name)?;
         self.datasets.borrow_mut().remove(partition_name);
         self.stats_cache.borrow_mut().remove(partition_name);
         Ok(())
+    }
+
+    /// 删除指定 Partition（方法别名，保持与 delete_table_partition 契约一致）。
+    #[inline]
+    pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError> {
+        self.delete_partition(partition_name)
     }
 
     /// 流式创建并注册新 Partition（基于 &DataView 零拷贝视图）。

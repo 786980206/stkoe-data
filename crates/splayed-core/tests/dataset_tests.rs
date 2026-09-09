@@ -817,3 +817,44 @@ fn dataset_skeleton_create_and_schema_read() {
     ds.close_dataset().unwrap();
     cleanup(&dir);
 }
+
+#[test]
+fn dataset_update_and_rename_and_read_schema() {
+    let dir = temp_dir("ds_update_rename");
+    let root = dir.join("ds");
+    let data1 = sample_data(); // 8 rows
+    splayed_core::init_dataset(&root, &data1.as_view(), None).unwrap();
+    let mut ds = splayed_core::open_dataset(&root, Mode::Write).unwrap();
+    assert_eq!(ds.read_dataset_schema().len(), 3); // sym, time, price
+
+    // 1. read_dataset_schema free function from path
+    let schema_from_path = splayed_core::read_dataset_schema(&root).unwrap();
+    assert_eq!(schema_from_path.len(), 3);
+
+    // 2. update_dataset 全量原子替换（更新为 2 行，包含新列 volume）
+    let data2 = make_data(&["AAPL", "GOOG"], &[100, 200], &[10.5, 20.5]);
+    ds.update_dataset(&data2.as_view()).unwrap();
+    assert_eq!(ds.read_dataset_statistics().unwrap().row_count, 2);
+
+    let read_back = ds.read_dataset(0, 2, None).unwrap();
+    assert_eq!(read_back.length(), 2);
+
+    ds.close_dataset().unwrap();
+
+    // 3. rename_dataset
+    let new_root = dir.join("ds_renamed");
+    splayed_core::rename_dataset(&root, "ds_renamed").unwrap();
+    assert!(!root.exists());
+    assert!(new_root.exists());
+
+    let reopened = splayed_core::open_dataset(&new_root, Mode::Read).unwrap();
+    assert_eq!(reopened.read_dataset_statistics().unwrap().row_count, 2);
+    reopened.close_dataset().unwrap();
+
+    // 4. drop_dataset
+    let to_drop = splayed_core::open_dataset(&new_root, Mode::Write).unwrap();
+    splayed_core::drop_dataset(to_drop).unwrap();
+    assert!(!new_root.exists());
+
+    cleanup(&dir);
+}

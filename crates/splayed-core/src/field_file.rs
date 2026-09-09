@@ -504,9 +504,10 @@ pub fn close_field(handle: FieldHandle) -> Result<(), CoreError> {
     close_field_handle(handle)
 }
 
-/// 销毁删除字段（基于物理路径，调用方保证无打开句柄持有 Mmap 产生共享锁定冲突）。
-pub fn drop_field(path: &Path) -> Result<(), CoreError> {
-    delete_field_file(path)
+/// 销毁删除字段（安全释放句柄并删除物理文件）。
+#[inline]
+pub fn drop_field(handle: FieldHandle) -> Result<(), CoreError> {
+    drop_field_handle(handle)
 }
 
 #[inline]
@@ -1188,6 +1189,18 @@ impl FieldHandle {
                 .transpose()?;
             Ok((values, validity))
         }
+    }
+
+    /// 关闭 FieldHandle 并安全刷盘。
+    #[inline]
+    pub fn close_field(self) -> Result<(), CoreError> {
+        close_field_handle(self)
+    }
+
+    /// 销毁并物理删除字段文件。
+    #[inline]
+    pub fn drop_field(self) -> Result<(), CoreError> {
+        drop_field_handle(self)
     }
 }
 

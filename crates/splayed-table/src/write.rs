@@ -547,3 +547,40 @@ impl TableStreamWriter {
         crate::table::open_table(&self.root, Mode::Read, self.options.clone())
     }
 }
+
+/// 全量替换更新表数据（.lock 互斥，支持按分区原子替换，或自动追加新分区）。
+pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError> {
+    table.mode.require_write("update_table")?;
+    let _lock = LockGuard::acquire(&table.root)?;
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid("table input requires sym and time columns".into()));
+    }
+    let tt = infer_tt(data.column("time").unwrap().data_type())?;
+    if table.scheme == PartitionScheme::None {
+        table.ensure_dataset("")?;
+        let mut guard = table.datasets.borrow_mut();
+        let ds = guard.get_mut("").expect("just ensured");
+        ds.update_dataset(data)?;
+        table.stats_cache.borrow_mut().clear();
+        return Ok(());
+    }
+
+    let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
+    let buckets = partition_spans(&owned, table.scheme, tt)?;
+
+    for (name, runs) in buckets {
+        let sub = crate::table::gather_runs(&owned, &runs)?;
+        let sub_view = sub.as_view();
+        let part_path = table.root.join(&name);
+        if part_path.exists() {
+            table.ensure_dataset(&name)?;
+            let mut guard = table.datasets.borrow_mut();
+            let ds = guard.get_mut(&name).expect("just ensured");
+            ds.update_dataset(&sub_view)?;
+        } else {
+            table.create_partition(&name, &sub_view, None)?;
+        }
+    }
+    table.stats_cache.borrow_mut().clear();
+    Ok(())
+}

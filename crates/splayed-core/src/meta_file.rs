@@ -290,6 +290,12 @@ pub fn drop_index(handle: IndexHandle) -> Result<(), CoreError> {
     delete_meta_file(&path)
 }
 
+/// 读取 Index 元数据结构（只读头部，返回 [sym, time] 两列 Schema）。
+pub fn read_index_schema(path: &Path) -> Result<Schema, CoreError> {
+    let handle = open_index(path)?;
+    Ok(handle.read_index_schema())
+}
+
 /// 根据排序后的 `(sym, time)` 两列创建 META 文件（`path` 为 META 文件完整路径）。
 pub fn create_meta_file(path: &Path, data: &DataView<'_>) -> Result<(), CoreError> {
     let bytes = MetaBuilder::build(data)?;
@@ -497,7 +503,7 @@ impl MetaHandle {
         let new_mmap = unsafe { Mmap::map(&File::open(&tmp)?)? };
         let new_header = MetaHeader::from_bytes(&new_mmap[..META_HEADER_SIZE])?;
         // Drop existing mmap before rename on Windows
-        self.mmap = memmap2::MmapOptions::new().map_anon()?.make_read_only()?;
+        self.mmap = memmap2::MmapOptions::new().len(1).map_anon()?.make_read_only()?;
         fs::rename(&tmp, &self.path)?;
         self.mmap = new_mmap;
         self.header = new_header;
@@ -776,6 +782,18 @@ impl MetaHandle {
     /// 关闭 Handle（META 无任何写回）。
     pub fn close(self) -> Result<(), CoreError> {
         Ok(())
+    }
+
+    /// 显式关闭 IndexHandle 并释放资源。
+    #[inline]
+    pub fn close_index(self) -> Result<(), CoreError> {
+        self.close()
+    }
+
+    /// 销毁并删除主索引文件。
+    #[inline]
+    pub fn drop_index(self) -> Result<(), CoreError> {
+        drop_index(self)
     }
 
     // ------------------------------------------------- predicate 编译

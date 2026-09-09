@@ -40,18 +40,18 @@
 | **打开句柄** | `open_table(path, mode, options)` | `open_dataset(path, mode)` | `open_index(path)` | `open_field(path, mode)` |
 | **关闭句柄** | `close_table(handle)` | `close_dataset(handle)` | `close_index(handle)` | `close_field(handle)` |
 | **销毁删除** | `drop_table(handle)` | `drop_dataset(handle)` | `drop_index(handle)` | `drop_field(handle)` |
-| **结构查询** | `read_table_schema(tablehandle)` | `read_dataset_schema(path / handle)` | `read_index_schema(indexhandle)` | `read_field_schema(fieldhandle)` |
+| **结构查询** | `read_table_schema(table)` | `read_dataset_schema(path / handle)` | `read_index_schema(path / handle)` | `read_field_schema(path / handle)` |
 | **新增字段** | `create_table_field(table, name, type)` | `create_dataset_field(ds, name, type)`| — | — |
-| **删除字段** | `delete_table_field(table, name)` | `delete_dataset_field(ds, name)` | — | `delete_field_file(handle / path)` |
+| **删除字段** | `delete_table_field(table, name)` | `delete_dataset_field(ds, name)` | — | `delete_field_file(path)` |
 | **重命名字段**| `rename_table_field(table, old, new)` | `rename_dataset_field(ds, old, new)`| — | `rename_field(path, new_name)` |
-| **类型转换** | `cast_table_field(table, name, type)` | `cast_dataset_field(ds, name, type)` | — | `cast_field(handle, type)` |
+| **类型转换** | `cast_table_field(table, name, type)` | `cast_dataset_field(ds, name, type)` | — | `cast_field(path, type)` |
 | **压缩管理** | `compress_table_field` / `decompress` | `compress_dataset_field` / `decompress` | — | `compress_field` / `decompress` |
 | **条件扫描** | `scan_table(table, request)` | `scan_dataset(ds, request)` | `scan_index(index, request)` | `scan_field(field, request)` |
 | **范围读取** | `read_table(table, scanner, batch_size)`| `read_dataset(ds, offset, len, cols)`| `read_index(index, offset, len)` | `read_field(field, offset, len)` |
 | **位置覆盖写**| `write_table(table, dataview)` | `write_dataset(ds, offset, dataview)`| — | `write_field(field, offset, colview)` |
 | **全量替换更新**| `update_table(table, dataview)` | `update_dataset(ds, dataview)` | `update_index(index, dataview)` | `update_field(field, columnview)` |
-| **分区数据删除**| `delete_table(table, partition)` | — | — | — |
-| **重命名对象**| `rename_table(path/handle, new_name)` | `rename_dataset(path/handle, new_name)`| — | — |
+| **分区数据删除**| `delete_partition(table, partition)` | — | — | — |
+| **重命名对象**| `rename_table(path, new_name)` | `rename_dataset(path, new_name)`| — | — |
 
 ---
 

@@ -12,9 +12,9 @@ pub mod scan;
 
 pub use dataset::{
     close_dataset, create_dataset, create_dataset_data, create_dataset_from_view, create_dataset_index,
-    delete_dataset, drop_dataset, init_dataset, open_dataset, CreateDatasetOptions,
-    DatasetFieldInit, DatasetHandle, DatasetScanner, DatasetStatistics, CHUNK_ROW_CAP,
-    RESERVED_FIELD_NAMES,
+    delete_dataset, drop_dataset, init_dataset, open_dataset, read_dataset_schema, rename_dataset,
+    update_dataset, CreateDatasetOptions, DatasetFieldInit, DatasetHandle, DatasetScanner,
+    DatasetStatistics, CHUNK_ROW_CAP, RESERVED_FIELD_NAMES,
 };
 pub use error::{CoreError, Mode};
 pub use field_file::{
@@ -27,7 +27,7 @@ pub use field_file::{
 };
 pub use meta_file::{
     close_index, create_index, create_meta_file, delete_meta_file, drop_index, init_index,
-    open_index, IndexHandle, MetaBuilder, MetaHandle, MetaInfo,
+    open_index, read_index_schema, IndexHandle, MetaBuilder, MetaHandle, MetaInfo,
 };
 pub use scan::{merge_ranges, CmpOp, Predicate, RowRange, Scalar, ScanRequest};
 
