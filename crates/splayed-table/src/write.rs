@@ -554,20 +554,67 @@ pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), Core
 
     let owned = splayed_core::dataset::data_view_to_owned_data(data)?;
     let buckets = partition_spans(&owned, table.scheme, tt)?;
+    let mut sorted_buckets = buckets;
+    sorted_buckets.sort_by_key(|(_, runs)| std::cmp::Reverse(runs.iter().map(|&(_, l)| l).sum::<usize>()));
 
-    for (name, runs) in buckets {
-        let sub = crate::table::gather_runs(&owned, &runs)?;
-        let sub_view = sub.as_view();
-        let part_path = table.root.join(&name);
-        if part_path.exists() {
-            table.ensure_dataset(&name)?;
-            let mut guard = table.datasets.borrow_mut();
-            let ds = guard.get_mut(&name).expect("just ensured");
-            ds.update_dataset(&sub_view)?;
-        } else {
-            table.create_partition(&name, &sub_view, None)?;
+    // 先清空已有句柄缓存，释放 Windows 文件映射与锁
+    table.datasets.borrow_mut().clear();
+
+    let max_p = table.max_parallelism();
+    let p_part = max_p.min(sorted_buckets.len());
+
+    let ds_options = splayed_core::CreateDatasetOptions {
+        max_parallelism: 1,
+        compression: table.options.compression.unwrap_or(splayed_format::Compression::None),
+        chunk_target_rows: table.options.chunk_target_rows.unwrap_or(8192),
+    };
+
+    let root_path = &table.root;
+    let data_ref = &owned;
+    let ds_options_ref = &ds_options;
+    let buckets_ref = &sorted_buckets;
+    let task_idx = std::sync::atomic::AtomicUsize::new(0);
+    let num_tasks = sorted_buckets.len();
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..p_part {
+            handles.push(s.spawn(|| -> Result<(), CoreError> {
+                loop {
+                    let i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= num_tasks {
+                        break;
+                    }
+                    let (name, runs) = &buckets_ref[i];
+                    let sub = crate::table::gather_runs(data_ref, runs)?;
+                    let part_path = root_path.join(name);
+                    if part_path.exists() {
+                        let _ = std::fs::remove_dir_all(&part_path);
+                    }
+                    splayed_core::create_dataset_data(
+                        &part_path,
+                        sub,
+                        ds_options_ref.clone(),
+                    )?;
+                }
+                Ok(())
+            }));
         }
-    }
+        let mut first_err: Option<CoreError> = None;
+        for h in handles {
+            match h.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Err(_) => {
+                    first_err.get_or_insert(CoreError::Invalid("partition thread panicked".into()));
+                }
+            }
+        }
+        first_err.map_or(Ok(()), Err)
+    })?;
+
     table.stats_cache.borrow_mut().clear();
     Ok(())
 }

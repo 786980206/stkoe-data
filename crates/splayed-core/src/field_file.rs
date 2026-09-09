@@ -1197,7 +1197,7 @@ impl FieldHandle {
                 let rows = seg.rows();
                 // values：每段一次连续 memcpy
                 values[row * width..(row + rows) * width]
-                    .copy_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
+                    .copy_from_slice(seg.raw_values_bytes().expect("field values or keys"));
                 match seg.validity() {
                     Some(src) if has_validity => {
                         // validity：按字节批量位复制；返回覆盖前后 1 位数做增量
@@ -1247,7 +1247,7 @@ impl FieldHandle {
             let rows = seg.rows();
             // values：每段一次连续 memcpy
             work.values.as_mut_slice()[row * width..(row + rows) * width]
-                .copy_from_slice(seg.fixed_bytes().expect("field files are fixed-width"));
+                .copy_from_slice(seg.raw_values_bytes().expect("field values or keys"));
             match seg.validity() {
                 Some(src) => {
                     if let Some(full) = work.validity.as_mut() {

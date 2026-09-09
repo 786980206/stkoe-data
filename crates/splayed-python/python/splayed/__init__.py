@@ -176,10 +176,10 @@ def sink_splayed(
             writer.write(b)
         writer.close()
     else:
-        # 已存在表：打开并覆盖写
+        # 已存在表：打开并全量替换更新数据
         writer = TableWriter.open(path_str, max_parallelism=max_parallelism)
         for b in batches:
-            writer.write(b)
+            writer.update(b)
         writer.close()
 
 

@@ -108,6 +108,15 @@ impl<'a> ColumnSegment<'a> {
         }
     }
 
+    /// 连续值/键字节切片（定宽列或 Utf8 字典列的 keys 切片）。
+    pub fn raw_values_bytes(&self) -> Option<&'a [u8]> {
+        match &self.values {
+            ColumnValues::Fixed(v) => Some(v.as_slice()),
+            ColumnValues::Dict { keys, .. } => Some(keys.as_slice()),
+            ColumnValues::RepeatDict { .. } => None,
+        }
+    }
+
     pub fn validity(&self) -> Option<BitmapView<'a>> {
         self.validity
     }
