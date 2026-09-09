@@ -11,6 +11,7 @@ description = "Splayed vs Parquet benchmark suite (docs/benchmark.md)"
 splayed-core = { path = "../splayed-core" }
 splayed-table = { path = "../splayed-table" }
 splayed-format = { path = "../splayed-format" }
+splayed-arrow = { path = "../splayed-arrow" }
 arrow-array = "56"
 arrow-buffer = "56"
 arrow-schema = "56"

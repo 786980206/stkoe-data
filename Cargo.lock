@@ -2293,6 +2293,7 @@ dependencies = [
  "arrow-select",
  "bytemuck",
  "parquet",
+ "splayed-arrow",
  "splayed-core",
  "splayed-format",
  "splayed-table",

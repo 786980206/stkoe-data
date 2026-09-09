@@ -384,10 +384,12 @@ pub fn column_view_to_array(view: &splayed_format::ColumnView<'_>) -> Result<Arr
         if !first_offsets.is_empty() {
             let same_dict = view.segments().iter().all(|s| match s.values() {
                 splayed_format::ColumnValues::RepeatDict { dict_offsets, dict_strings, .. } => {
-                    dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings
+                    (std::ptr::eq(dict_offsets.as_slice().as_ptr(), first_offsets.as_ptr()) && dict_offsets.len() == first_offsets.len())
+                    || (dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings)
                 }
                 splayed_format::ColumnValues::Dict { dict_offsets, dict_strings, .. } => {
-                    dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings
+                    (std::ptr::eq(dict_offsets.as_slice().as_ptr(), first_offsets.as_ptr()) && dict_offsets.len() == first_offsets.len())
+                    || (dict_offsets.as_slice() == first_offsets && dict_strings.as_slice() == first_strings)
                 }
                 _ => false,
             });
@@ -616,6 +618,68 @@ pub fn data_view_to_record_batch<'a>(view: &DataView<'a>) -> Result<RecordBatch>
     data_view_to_record_batch_projected(view, None)
 }
 
+/// 支持列级多线程并发转换的 DataView → RecordBatch（尤其针对单宽表多列）
+pub fn data_view_to_record_batch_projected_parallel<'a>(
+    view: &DataView<'a>,
+    projection: Option<&[&str]>,
+    max_p: usize,
+) -> Result<RecordBatch> {
+    let col_names: Vec<&str> = match projection {
+        Some(wanted) if !wanted.is_empty() => wanted.iter().copied().filter(|&c| view.column(c).is_some()).collect(),
+        _ => view.schema.fields.iter().map(|f| f.name.as_ref()).collect(),
+    };
+
+    if col_names.len() <= 2 || max_p <= 1 {
+        return data_view_to_record_batch_projected(view, projection);
+    }
+
+    let mut fields = Vec::with_capacity(col_names.len());
+    let mut cols = Vec::with_capacity(col_names.len());
+    for &name in &col_names {
+        let col = view.column(name).expect("column exists");
+        let pos = view.schema.position(name).expect("field in schema");
+        let field = &view.schema.fields[pos];
+        fields.push(ArrowField::new(name, to_arrow_type(field.data_type), true));
+        cols.push(col);
+    }
+
+    let num_cols = cols.len();
+    let num_threads = max_p.min(num_cols);
+    let arrays: Vec<std::sync::Mutex<Option<ArrayRef>>> = (0..num_cols).map(|_| std::sync::Mutex::new(None)).collect();
+    let task_idx = std::sync::atomic::AtomicUsize::new(0);
+    let cols_ref = &cols;
+    let arrays_ref = &arrays;
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_threads);
+        for _ in 0..num_threads {
+            handles.push(s.spawn(|| -> Result<()> {
+                loop {
+                    let i = task_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= num_cols {
+                        break;
+                    }
+                    let arr = column_view_to_array(cols_ref[i])?;
+                    *arrays_ref[i].lock().unwrap() = Some(arr);
+                }
+                Ok(())
+            }));
+        }
+        for h in handles {
+            h.join().unwrap()?;
+        }
+        Ok::<(), ArrowConvError>(())
+    })?;
+
+    let final_arrays: Vec<ArrayRef> = arrays
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().expect("column array computed"))
+        .collect();
+
+    let arrow_schema = Arc::new(ArrowSchema::new(fields));
+    Ok(RecordBatch::try_new(arrow_schema, final_arrays)?)
+}
+
 /// 支持精准投影裁剪的 DataView → RecordBatch（仅转换请求的列，跳过不相关的列）。
 pub fn data_view_to_record_batch_projected<'a>(
     view: &DataView<'a>,
@@ -761,39 +825,38 @@ impl TableArrowReader {
         let max_p = scanner
             .max_parallelism()
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-            .min(partitions.len())
             .max(1);
 
-        if max_p <= 1 || partitions.len() <= 1 {
-            let mut results = Vec::new();
-            for part_name in &partitions {
-                let part_path = if scheme == splayed_table::PartitionScheme::None {
-                    root.to_path_buf()
-                } else {
-                    root.join(part_name)
-                };
-                let ds = splayed_core::open_dataset_with_schema(&part_path, splayed_core::Mode::Read, splayed_schema.clone())?;
-                if predicate.is_none() {
-                    let len = ds.logical_length();
-                    if len > 0 {
-                        let view = ds.read(0, len, Some(&field_proj_strs))?;
-                        results.push(data_view_to_record_batch_projected(&view, wanted_cols.as_deref())?);
-                    }
-                } else {
-                    let core_req = splayed_core::ScanRequest {
-                        ranges: vec![],
-                        projection: field_proj_arc.clone(),
-                        predicate: predicate.clone(),
-                        limit: None,
-                    };
-                    let mut ds_scanner = ds.scan(&core_req)?;
-                    while let Some(r) = ds_scanner.next()? {
-                        let view = ds.read(r.offset, r.length, Some(&field_proj_strs))?;
-                        results.push(data_view_to_record_batch_projected(&view, wanted_cols.as_deref())?);
-                    }
+        if partitions.len() == 1 {
+            let part_name = &partitions[0];
+            let part_path = if scheme == splayed_table::PartitionScheme::None {
+                root.to_path_buf()
+            } else {
+                root.join(part_name)
+            };
+            let ds = splayed_core::open_dataset_with_schema(&part_path, splayed_core::Mode::Read, splayed_schema.clone())?;
+            if predicate.is_none() {
+                let len = ds.logical_length();
+                if len > 0 {
+                    let view = ds.read(0, len, Some(&field_proj_strs))?;
+                    let batch = data_view_to_record_batch_projected_parallel(&view, wanted_cols.as_deref(), max_p)?;
+                    return Ok(vec![batch]);
                 }
+            } else {
+                let core_req = splayed_core::ScanRequest {
+                    ranges: vec![],
+                    projection: field_proj_arc.clone(),
+                    predicate: predicate.clone(),
+                    limit: None,
+                };
+                let mut ds_scanner = ds.scan(&core_req)?;
+                let mut results = Vec::new();
+                while let Some(r) = ds_scanner.next()? {
+                    let view = ds.read(r.offset, r.length, Some(&field_proj_strs))?;
+                    results.push(data_view_to_record_batch_projected_parallel(&view, wanted_cols.as_deref(), max_p)?);
+                }
+                return Ok(results);
             }
-            return Ok(results);
         }
 
         // 多线程并发分区分文件读取（LPT 动态原子工作窃取，保持有序）
