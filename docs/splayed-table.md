@@ -117,6 +117,8 @@ impl TableHandle {
 |  | `TableHandle::compress_table_field` | 压缩所有分区中的同名字段 |
 |  | `TableHandle::decompress_table_field`| 解压所有分区中的同名字段 |
 | Metadata | `TableHandle::read_table_schema` | 读取全表统合 Schema |
+| 流式写入与追加 | `TableStreamWriter` | 超大数据冷启动 Out-of-Core 逐分区流式落盘构建 |
+|  | `TableHandle::create_partition` | 运行时向打开的表流式追加新分区 |
 | Query | `scan_table` | 惰性定位跨 Partition 的 `PartitionRowRange` |
 |  | `read_table` | 跨分区流式批量读取（缺失列自动补齐虚拟 NULL） |
 | Write | `write_table` | 逐分区覆盖写入（自动补建缺失列，自愈） |
@@ -548,4 +550,41 @@ pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), Core
 ```
 
 #### 其他说明
-- 全量表数据滚动更新替换，具备崩溃安全性。
+- 全量表数据滚动更新替换，具备崩溃安全性；局部行情打补丁/修改推荐使用微秒级覆盖写接口 `write_table`。
+
+---
+
+### 4.15 流式写入与追加（TableStreamWriter / create_partition）
+
+#### 函数签名
+```rust
+pub struct TableStreamWriter { ... }
+
+impl TableStreamWriter {
+    pub fn new(table_path: &Path, scheme: PartitionScheme, options: Option<TableOptions>) -> Result<Self, CoreError>;
+    pub fn write_partition(&mut self, partition_name: &str, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn write_batch(&mut self, batch: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn finish(self) -> Result<TableHandle, CoreError>;
+}
+
+impl TableHandle {
+    pub fn create_partition(&self, partition_name: &str, data: &DataView<'_>, options: Option<CreateDatasetOptions>) -> Result<(), CoreError>;
+}
+```
+
+#### 参数与返回
+| 参数 | 类型 | 方向 | 说明 |
+| --- | --- | --- | --- |
+| `table_path` | `&Path` | 输入 | 表根目录路径 |
+| `scheme` | `PartitionScheme` | 输入 | 表分区方案（None / Year / Month / Date） |
+| `data` | `&DataView<'_>` | 输入 | 流式批次或单分区数据切片（零拷贝入参） |
+| 返回（`finish`） | `Result<TableHandle, CoreError>` | 输出 | 构建完毕并打开的 TableHandle |
+
+#### 内部实现流程
+```
+1. TableStreamWriter 初始化时获取 .lock 独占写锁；
+2. write_partition 接收单分区切片，直接调用底层 create_dataset_from_view 落盘；
+3. write_batch 自动根据时间键划分为分区连续片段，逐分区流式落盘；
+4. 内存开销仅恒定在 O(单批次 / 单分区)，完备支持数百 GB 历史数据的 Out-of-Core 冷启动大灌库；
+5. finish() 刷盘收尾并释放写锁，返回只读 TableHandle。
+```

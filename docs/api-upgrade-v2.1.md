@@ -74,18 +74,19 @@ pub fn init_field(
 // 2. 生命周期与句柄操作
 pub fn open_field(path: &Path, mode: Mode) -> Result<FieldHandle, CoreError>;
 pub fn close_field(handle: FieldHandle) -> Result<(), CoreError>;
-pub fn drop_field(handle: FieldHandle) -> Result<(), CoreError>;
-pub fn drop_field_path(path: &Path) -> Result<(), CoreError>;
+pub fn drop_field(path: &Path) -> Result<(), CoreError>;
+pub fn drop_field_handle(handle: FieldHandle) -> Result<(), CoreError>;
 
-// 3. 元数据与物理转换
-pub fn read_field_schema(handle: &FieldHandle) -> Result<FieldSchema, CoreError>;
+// 3. 元数据与物理转换（基于物理路径，规避 Mmap 共享冲突与陈旧句柄）
+pub fn read_field_schema(path: &Path) -> Result<FieldSchema, CoreError>;
 pub fn rename_field(path: &Path, new_name: &str) -> Result<(), CoreError>;
-pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(), CoreError>;
-pub fn compress_field(handle: &mut FieldHandle, offsets: Option<Vec<u64>>) -> Result<(), CoreError>;
-pub fn decompress_field(handle: &mut FieldHandle) -> Result<(), CoreError>;
+pub fn cast_field(path: &Path, target_type: DataType) -> Result<(), CoreError>;
+pub fn compress_field(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError>;
+pub fn decompress_field(path: &Path) -> Result<(), CoreError>;
 
 // 4. FieldHandle 方法
 impl FieldHandle {
+    pub fn read_field_schema(&self) -> FieldSchema;
     pub fn read_field(&self, offset: u64, length: u64) -> Result<ColumnView<'_>, CoreError>;
     pub fn write_field(&mut self, offset: u64, data: &ColumnView<'_>) -> Result<(), CoreError>;
     pub fn update_field(&mut self, data: &ColumnView<'_>) -> Result<(), CoreError>;
@@ -201,9 +202,19 @@ pub fn read_table<'t>(
 pub fn write_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>;
 pub fn update_table(table: &TableHandle, data: &DataView<'_>) -> Result<(), CoreError>;
 
-// 2. TableHandle 方法
+// 2. 流式表写入器（Out-of-Core Streaming Ingestion）
+pub struct TableStreamWriter { ... }
+impl TableStreamWriter {
+    pub fn new(path: &Path, scheme: PartitionScheme, options: Option<TableOptions>) -> Result<Self, CoreError>;
+    pub fn write_partition(&mut self, partition_name: &str, data: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn write_batch(&mut self, batch: &DataView<'_>) -> Result<(), CoreError>;
+    pub fn finish(self) -> Result<TableHandle, CoreError>;
+}
+
+// 3. TableHandle 方法
 impl TableHandle {
     pub fn read_table_schema(&self) -> Result<Schema, CoreError>;
+    pub fn create_partition(&self, partition_name: &str, data: &DataView<'_>, options: Option<CreateDatasetOptions>) -> Result<(), CoreError>;
     pub fn create_table_field(&self, name: &str, field_type: DataType) -> Result<(), CoreError>;
     pub fn delete_table_field(&self, name: &str) -> Result<(), CoreError>;
     pub fn rename_table_field(&self, old_name: &str, new_name: &str) -> Result<(), CoreError>;

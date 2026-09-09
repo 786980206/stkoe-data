@@ -14,10 +14,10 @@ pub use query::{
     TableScanner,
 };
 pub use table::{
-    close_table, create_table, create_table_partition, create_table_skeleton, delete_table,
-    delete_table_partition, drop_table, init_table, open_table, rename_table, Capabilities,
-    PartitionInfo, Partitioning, TableFieldInit, TableHandle, TableMetadata, TableOptions,
-    TableStatistics,
+    close_table, create_table, create_table_partition, create_table_partition_from_view,
+    create_table_skeleton, delete_table, delete_table_partition, drop_table, init_table, open_table,
+    rename_table, Capabilities, PartitionInfo, Partitioning, TableFieldInit, TableHandle,
+    TableMetadata, TableOptions, TableStatistics,
 };
 
-pub use write::{create_table_columns, write_table};
+pub use write::{create_table_columns, write_table, TableStreamWriter};

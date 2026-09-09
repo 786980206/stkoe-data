@@ -966,6 +966,52 @@ fn table_parallelism_control_and_scan_request() {
     cleanup(&dir);
 }
 
+#[test]
+fn table_streaming_writer_and_create_partition() {
+    let dir = temp_dir("tbl_stream_write");
+    let d = |m: u32, dd: u32| splayed_table::days_from_civil(2026, m, dd) as i32;
+    let root = dir.join("tbl");
+
+    // 1. 使用 TableStreamWriter 流式逐分区写入两批数据
+    let mut writer = splayed_table::TableStreamWriter::new(
+        &root,
+        PartitionScheme::Month,
+        None,
+    ).unwrap();
+
+    let batch1 = make_data(&[("AAPL", d(7, 1), 10.0), ("AAPL", d(7, 2), 11.0)]);
+    let batch2 = make_data(&[("MSFT", d(8, 1), 20.0), ("MSFT", d(8, 2), 21.0)]);
+    writer.write_partition("month=2026-07", &batch1.as_view()).unwrap();
+    writer.write_batch(&batch2.as_view()).unwrap();
+
+    let table = writer.finish().unwrap();
+
+    // 验证流式构建成功
+    let req = TableScanRequest::default();
+    let mut reader = query_table(&table, req, None).unwrap();
+    let mut got = Vec::new();
+    while let Some(view) = reader.next().unwrap() {
+        got.extend(f64s(view.column("price").unwrap()));
+    }
+    reader.close().unwrap();
+    assert_eq!(got, vec![10.0, 11.0, 20.0, 21.0]);
+
+    // 2. 使用 table.create_partition 动态追加新月份分区
+    let batch3 = make_data(&[("GOOG", d(9, 1), 30.0)]);
+    table.create_partition("month=2026-09", &batch3.as_view(), None).unwrap();
+
+    let mut reader2 = query_table(&table, TableScanRequest::default(), None).unwrap();
+    let mut got2 = Vec::new();
+    while let Some(view) = reader2.next().unwrap() {
+        got2.extend(f64s(view.column("price").unwrap()));
+    }
+    reader2.close().unwrap();
+    assert_eq!(got2, vec![10.0, 11.0, 20.0, 21.0, 30.0]);
+
+    table.close().unwrap();
+    cleanup(&dir);
+}
+
 /// 任何写入前完成全部定位与校验：后续分区的 key 缺失 → 整体报错且
 /// 前面分区**不产生部分写入**（无事务契约下的最强前置语义）。
 #[test]

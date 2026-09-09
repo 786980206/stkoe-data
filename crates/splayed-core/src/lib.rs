@@ -11,7 +11,7 @@ pub mod meta_file;
 pub mod scan;
 
 pub use dataset::{
-    close_dataset, create_dataset, create_dataset_index, delete_dataset, drop_dataset,
+    close_dataset, create_dataset, create_dataset_from_view, create_dataset_index, delete_dataset, drop_dataset,
     init_dataset, open_dataset, CreateDatasetOptions, DatasetFieldInit, DatasetHandle,
     DatasetScanner, DatasetStatistics, CHUNK_ROW_CAP, RESERVED_FIELD_NAMES,
 };

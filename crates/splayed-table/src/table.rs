@@ -269,7 +269,7 @@ pub struct TableStatistics {
     pub time_max: i64,
 }
 
-fn infer_tt(dt: DataType) -> Result<TimeType, CoreError> {
+pub(crate) fn infer_tt(dt: DataType) -> Result<TimeType, CoreError> {
     match dt {
         DataType::Date32 | DataType::Int32 => Ok(TimeType::Date32),
         DataType::TimestampUs | DataType::Date64 | DataType::Int64 => Ok(TimeType::TimestampUs),
@@ -460,7 +460,7 @@ pub(crate) fn partition_key(scheme: PartitionScheme, value: i64, tt: TimeType) -
 /// 输入按 (sym ASC, time ASC) 契约有序 → sym run 内 time 单调 → 同名分区的行
 /// 在输入中连续成段（片段可跨 sym 边界，拼接后分区内仍保持 (sym, time) 序）；
 /// 分区名字符串只在换段时构造（段内用整数粗键判别，无逐行分配）。
-fn partition_spans(
+pub(crate) fn partition_spans(
     data: &Data,
     scheme: PartitionScheme,
     tt: TimeType,
@@ -641,6 +641,43 @@ pub fn create_table_partition(
     //    分区的创建即压缩策略（可与既有分区差异化——冷热分层）；
     //    失败语义与 create_table 一致——不回滚，已写入文件保留
     create_dataset(&partition_path, data, options)
+}
+
+/// 基于 `&DataView` 零拷贝视图新增单个 Partition / Dataset。
+pub fn create_table_partition_from_view(
+    table_path: &Path,
+    partition_name: &str,
+    data: &DataView<'_>,
+    options: CreateDatasetOptions,
+) -> Result<(), CoreError> {
+    if !table_path.is_dir() {
+        return Err(CoreError::NotFound(table_path.to_path_buf()));
+    }
+    let scheme = PartitionScheme::from_partition_name(partition_name).ok_or_else(|| {
+        CoreError::Invalid(format!(
+            "partition name '{partition_name}' does not match any scheme"
+        ))
+    })?;
+    let existing = existing_scheme(table_path)?;
+    match existing {
+        Some(prev) if prev != scheme => {
+            return Err(CoreError::Invalid(
+                "existing partitions use a different partition scheme".into(),
+            ))
+        }
+        _ => {}
+    }
+    let partition_path = table_path.join(partition_name);
+    if partition_path.exists() {
+        return Err(CoreError::AlreadyExists(partition_path));
+    }
+    if data.column("sym").is_none() || data.column("time").is_none() {
+        return Err(CoreError::Invalid("partition data requires sym and time columns".into()));
+    }
+    if data.length() == 0 {
+        return Err(CoreError::Invalid("partition data must not be empty".into()));
+    }
+    splayed_core::create_dataset_from_view(&partition_path, data, options)
 }
 
 /// 连带数据直接初始化创建完整 Table 并返回 TableHandle（零拷贝入参）。
@@ -1296,6 +1333,24 @@ impl TableHandle {
     pub fn delete_table(&self, partition_name: &str) -> Result<(), CoreError> {
         delete_table_partition(&self.root, partition_name)?;
         self.datasets.borrow_mut().remove(partition_name);
+        self.stats_cache.borrow_mut().remove(partition_name);
+        Ok(())
+    }
+
+    /// 流式创建并注册新 Partition（基于 &DataView 零拷贝视图）。
+    pub fn create_partition(
+        &self,
+        partition_name: &str,
+        data: &DataView<'_>,
+        options: Option<CreateDatasetOptions>,
+    ) -> Result<(), CoreError> {
+        let opts = options.unwrap_or_else(|| CreateDatasetOptions {
+            max_parallelism: self.max_parallelism(),
+            compression: self.options.compression.unwrap_or(splayed_format::Compression::None),
+            chunk_target_rows: self.options.chunk_target_rows.unwrap_or(8192),
+        });
+        create_table_partition_from_view(&self.root, partition_name, data, opts)?;
+        self.dataset_for(partition_name)?;
         self.stats_cache.borrow_mut().remove(partition_name);
         Ok(())
     }

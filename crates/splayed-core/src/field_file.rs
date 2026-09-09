@@ -504,11 +504,16 @@ pub fn close_field(handle: FieldHandle) -> Result<(), CoreError> {
     close_field_handle(handle)
 }
 
-/// 销毁删除字段（自动释放句柄并删除物理文件）。
-pub fn drop_field(handle: FieldHandle) -> Result<(), CoreError> {
+/// 销毁删除字段（基于物理路径，调用方保证无打开句柄持有 Mmap 产生共享锁定冲突）。
+pub fn drop_field(path: &Path) -> Result<(), CoreError> {
+    delete_field_file(path)
+}
+
+#[inline]
+pub fn drop_field_handle(handle: FieldHandle) -> Result<(), CoreError> {
     let path = handle.path.clone();
     close_field(handle)?;
-    fs::remove_file(&path).map_err(|e| map_io(&path, e))
+    delete_field_file(&path)
 }
 
 /// 路径删除物理文件。
@@ -517,10 +522,14 @@ pub fn drop_field_path(path: &Path) -> Result<(), CoreError> {
     delete_field_file(path)
 }
 
-/// 读取字段元数据结构。
-pub fn read_field_schema(handle: &FieldHandle) -> Result<FieldSchema, CoreError> {
-    let name = handle.path.file_name().unwrap_or_default().to_string_lossy().to_string();
-    Ok(FieldSchema::new(name, handle.data_type()))
+/// 读取字段元数据结构（只读 64B Header，不建立 Mmap 映射）。
+pub fn read_field_schema(path: &Path) -> Result<FieldSchema, CoreError> {
+    let mut f = File::open(path).map_err(|e| map_io(path, e))?;
+    let mut buf = [0u8; HEADER_SIZE];
+    f.read_exact(&mut buf).map_err(|e| map_io(path, e))?;
+    let header = FieldHeader::from_bytes(&buf)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    Ok(FieldSchema::new(name, header.data_type()?))
 }
 
 /// 同目录内重命名 Field 文件。
@@ -529,13 +538,9 @@ pub fn rename_field(path: &Path, new_name: &str) -> Result<(), CoreError> {
     rename_field_file(path, new_name)
 }
 
-/// 字段类型就地转换（流式批次转换）。
-pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(), CoreError> {
-    let path = handle.path.clone();
-    let mode = handle.mode;
-    cast_field_file(&path, target_type)?;
-    *handle = open_field(&path, mode)?;
-    Ok(())
+/// 字段类型就地转换（基于物理路径执行流式批次转换，避免 Mmap 占用产生 Windows 文件锁冲突与陈旧句柄）。
+pub fn cast_field(path: &Path, target_type: DataType) -> Result<(), CoreError> {
+    cast_field_file(path, target_type)
 }
 
 #[inline]
@@ -543,13 +548,9 @@ pub fn cast_field_path(path: &Path, target_type: DataType) -> Result<(), CoreErr
     cast_field_file(path, target_type)
 }
 
-/// 字段压缩。
-pub fn compress_field(handle: &mut FieldHandle, offsets: Option<Vec<u64>>) -> Result<(), CoreError> {
-    let path = handle.path.clone();
-    let mode = handle.mode;
-    compress_field_file(&path, offsets)?;
-    *handle = open_field(&path, mode)?;
-    Ok(())
+/// 字段压缩（基于物理路径）。
+pub fn compress_field(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError> {
+    compress_field_file(path, offsets)
 }
 
 #[inline]
@@ -557,13 +558,9 @@ pub fn compress_field_path(path: &Path, offsets: Option<Vec<u64>>) -> Result<(),
     compress_field_file(path, offsets)
 }
 
-/// 字段解压。
-pub fn decompress_field(handle: &mut FieldHandle) -> Result<(), CoreError> {
-    let path = handle.path.clone();
-    let mode = handle.mode;
-    decompress_field_file(&path)?;
-    *handle = open_field(&path, mode)?;
-    Ok(())
+/// 字段解压（基于物理路径）。
+pub fn decompress_field(path: &Path) -> Result<(), CoreError> {
+    decompress_field_file(path)
 }
 
 #[inline]
@@ -753,6 +750,11 @@ impl FieldHandle {
 
     pub fn is_chunked(&self) -> bool {
         self.header.is_chunked()
+    }
+
+    pub fn read_field_schema(&self) -> FieldSchema {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        FieldSchema::new(name, self.data_type())
     }
 
     fn uncompressed_slices(&self) -> Result<(&[u8], Option<&[u8]>), CoreError> {

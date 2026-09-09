@@ -3,13 +3,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use splayed_core::{CoreError, DatasetFieldInit, DatasetHandle, RowRange};
+use splayed_core::{CoreError, DatasetFieldInit, DatasetHandle, Mode, RowRange};
 use splayed_format::{Bitmap, Buffer, Column, DataType, DataView, Schema};
 
 use crate::partition::PartitionScheme;
-use crate::table::{field_options, partition_key, TableHandle};
+use crate::table::{field_options, infer_tt, partition_key, partition_spans, TableHandle, TableOptions};
 
 /// `.lock` 守卫：Drop 时释放（删除锁文件）。进程崩溃会留下残留锁，需人工删除。
 struct LockGuard {
@@ -465,4 +465,85 @@ fn build_aligned_column(
         validity: Some(validity),
         dict: None,
     })
+}
+
+/// 流式表构建器（Out-of-Core Streaming Ingestion）：
+///
+/// 专为海量时序数据（数百 GB）冷启动大灌库设计。逐批接收 `DataView`，
+/// 逐分区流式落盘，内存开销仅为 O(当前批次 / 单分区大小)，不随全表总数据量累积。
+pub struct TableStreamWriter {
+    root: PathBuf,
+    scheme: PartitionScheme,
+    options: TableOptions,
+    _lock: LockGuard,
+    written_partitions: Vec<String>,
+}
+
+impl TableStreamWriter {
+    /// 创建流式写入器（初始化表根目录并获取独占写锁）。
+    pub fn new(
+        table_path: &Path,
+        scheme: PartitionScheme,
+        options: Option<TableOptions>,
+    ) -> Result<Self, CoreError> {
+        if table_path.exists() && table_path.read_dir().map_err(CoreError::Io)?.next().is_some() {
+            return Err(CoreError::AlreadyExists(table_path.to_path_buf()));
+        }
+        std::fs::create_dir_all(table_path).map_err(CoreError::Io)?;
+        let lock = LockGuard::acquire(table_path)?;
+        Ok(Self {
+            root: table_path.to_path_buf(),
+            scheme,
+            options: options.unwrap_or_default(),
+            _lock: lock,
+            written_partitions: Vec::new(),
+        })
+    }
+
+    /// 流式写入一个完整分区的数据（零拷贝直接落盘，0 中间堆内存复制）。
+    pub fn write_partition(
+        &mut self,
+        partition_name: &str,
+        data: &DataView<'_>,
+    ) -> Result<(), CoreError> {
+        let max_p = self
+            .options
+            .max_parallelism
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+            .max(1);
+        let ds_opts = splayed_core::CreateDatasetOptions {
+            max_parallelism: max_p,
+            compression: self.options.compression.unwrap_or(splayed_format::Compression::None),
+            chunk_target_rows: self.options.chunk_target_rows.unwrap_or(8192),
+        };
+        if self.scheme == PartitionScheme::None {
+            splayed_core::create_dataset_from_view(&self.root, data, ds_opts)?;
+        } else {
+            crate::table::create_table_partition_from_view(&self.root, partition_name, data, ds_opts)?;
+        }
+        self.written_partitions.push(partition_name.to_string());
+        Ok(())
+    }
+
+    /// 接收流式批次数据：自动按 PartitionScheme 切分并逐分区落盘。
+    pub fn write_batch(&mut self, batch: &DataView<'_>) -> Result<(), CoreError> {
+        if self.scheme == PartitionScheme::None {
+            return self.write_partition("", batch);
+        }
+        let owned = splayed_core::dataset::data_view_to_owned_data(batch)?;
+        let tt = infer_tt(batch.column("time").unwrap().data_type())?;
+        let buckets = partition_spans(&owned, self.scheme, tt)?;
+        for (name, runs) in buckets {
+            let sub = crate::table::gather_runs(&owned, &runs)?;
+            let sub_view = sub.as_view();
+            self.write_partition(&name, &sub_view)?;
+        }
+        Ok(())
+    }
+
+    /// 完成流式写入，释放写锁并返回 TableHandle。
+    pub fn finish(self) -> Result<TableHandle, CoreError> {
+        drop(self._lock);
+        crate::table::open_table(&self.root, Mode::Read, self.options.clone())
+    }
 }

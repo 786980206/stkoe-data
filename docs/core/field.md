@@ -198,27 +198,27 @@ pub fn close_field(handle: FieldHandle) -> Result<(), CoreError>;
 ---
 
 ### 5.6 drop_field / drop_field_path
-
+ 
 #### 函数签名
 ```rust
-pub fn drop_field(handle: FieldHandle) -> Result<(), CoreError>;
-pub fn drop_field_path(path: &Path) -> Result<(), CoreError>;
+pub fn drop_field(path: &Path) -> Result<(), CoreError>;
+pub fn drop_field_handle(handle: FieldHandle) -> Result<(), CoreError>;
 ```
 
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `handle` / `path` | `FieldHandle` / `&Path` | 输入 | 待销毁的字段句柄或文件路径 |
+| `path` | `&Path` | 输入 | 待销毁的字段物理路径（调用方确保无打开句柄占用） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 物理文件已被删除 |
 
 #### 内部实现流程
 ```
-1. 对于 drop_field(handle)：提取 path，显式 drop 内部的 Mmap/MmapMut 和 File 句柄；
-2. 调用 fs::remove_file(path) 彻底删除物理文件。
+1. 对于 drop_field(path)：直接调用 fs::remove_file(path) 删除物理文件；
+2. 对于 drop_field_handle(handle)：先显式 close_field 关闭并释放底层 Mmap，再彻底删除物理文件。
 ```
 
 #### 其他说明
-- 先释放 mmap 再 unlink，避免在 Windows 下遭遇文件被占用报错（Sharing Violation）。
+- 基于物理路径操作，严格避免 Windows 平台下的句柄占用冲突（Sharing Violation）。
 
 ---
 
@@ -226,22 +226,26 @@ pub fn drop_field_path(path: &Path) -> Result<(), CoreError>;
 
 #### 函数签名
 ```rust
-pub fn read_field_schema(handle: &FieldHandle) -> Result<FieldSchema, CoreError>;
+pub fn read_field_schema(path: &Path) -> Result<FieldSchema, CoreError>;
+impl FieldHandle {
+    pub fn read_field_schema(&self) -> FieldSchema;
+}
 ```
 
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `handle` | `&FieldHandle` | 输入 | 字段句柄 |
+| `path` / `&self` | `&Path` / `&FieldHandle` | 输入 | 字段路径或字段句柄 |
 | 返回 | `Result<FieldSchema, CoreError>` | 输出 | 该字段的名称与数据类型 |
 
 #### 内部实现流程
 ```
-从 handle.path() 提取文件名作为字段名，结合 handle.data_type() 构建 FieldSchema。
+1. 路径读取：仅读取文件前 64 字节 HEADER，解析提取 data_type 与文件名，无需建立任何 Mmap 映射（0 句柄占用）；
+2. 句柄读取：直接自 FieldHandle 内存缓存提取，耗时 < 10ns。
 ```
 
 #### 其他说明
-- 纯内存读取，不产生 I/O 开销。
+- 纯元数据读取，不产生实际数据 I/O 开销。
 
 ---
 
@@ -276,15 +280,15 @@ pub fn rename_field(path: &Path, new_name: &str) -> Result<(), CoreError>;
 
 #### 函数签名
 ```rust
-pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(), CoreError>;
+pub fn cast_field(path: &Path, target_type: DataType) -> Result<(), CoreError>;
 ```
 
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `handle` | `&mut FieldHandle` | 输入 | 字段句柄（需具备写权限） |
+| `path` | `&Path` | 输入 | 待转换字段的文件路径 |
 | `target_type` | `DataType` | 输入 | 目标转换类型 |
-| 返回 | `Result<(), CoreError>` | 输出 | Ok = 类型转换成功并更新 Handle |
+| 返回 | `Result<(), CoreError>` | 输出 | Ok = 类型转换成功并原子替换磁盘物理文件 |
 
 #### 内部实现流程
 ```
@@ -294,10 +298,11 @@ pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(),
    → 逐批流式读取 values（每批 8192 行）执行 as 类型转换；
    → validity 位流原样保留；
    → 写入临时文件 <path>.cast.<pid>.tmp 并 fsync；
-   → 释放原句柄 mmap，fs::rename 替换，重新打开并建立映射。
+   → fs::rename 原子覆盖替换原路径。
 ```
 
 #### 其他说明
+- 基于物理路径执行，避免持有 Mmap 时发生 Windows 共享锁冲突与陈旧句柄（Stale Handles）。
 - 流式转换，内存恒定在 $O(\text{batch})$；NULL 值保持不变。
 
 ---
@@ -306,14 +311,14 @@ pub fn cast_field(handle: &mut FieldHandle, target_type: DataType) -> Result<(),
 
 #### 函数签名
 ```rust
-pub fn compress_field(handle: &mut FieldHandle, offsets: Option<Vec<u64>>) -> Result<(), CoreError>;
-pub fn decompress_field(handle: &mut FieldHandle) -> Result<(), CoreError>;
+pub fn compress_field(path: &Path, offsets: Option<Vec<u64>>) -> Result<(), CoreError>;
+pub fn decompress_field(path: &Path) -> Result<(), CoreError>;
 ```
 
 #### 参数与返回
 | 参数 | 类型 | 方向 | 说明 |
 | --- | --- | --- | --- |
-| `handle` | `&mut FieldHandle` | 输入 | 字段句柄 |
+| `path` | `&Path` | 输入 | 待压缩/解压字段的文件路径 |
 | `offsets`（compress） | `Option<Vec<u64>>` | 输入 | chunk 起始行（None 默认 8192 行） |
 | 返回 | `Result<(), CoreError>` | 输出 | Ok = 物理压缩/解压转换完成 |
 
