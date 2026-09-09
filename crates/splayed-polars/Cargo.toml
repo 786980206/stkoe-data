@@ -14,4 +14,5 @@ splayed-table = { path = "../splayed-table" }
 splayed-arrow = { path = "../splayed-arrow" }
 arrow = { version = "56", default-features = false }
 bytemuck = "1"
+ahash = "0.8"
 polars = { version = "0.45", default-features = false, features = ["lazy", "strings", "dtype-i8", "dtype-i16", "dtype-u8", "dtype-u16"] }

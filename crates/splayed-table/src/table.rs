@@ -354,17 +354,15 @@ pub(crate) fn gather_runs(data: &Data, runs: &[RowSpan]) -> Result<Data, CoreErr
                         new_keys.push(id);
                     }
                 }
+                let new_keys_raw = bytemuck::cast_slice::<u32, u8>(&new_keys).to_vec();
+                let new_offs_raw = bytemuck::cast_slice::<u64, u8>(&new_offsets).to_vec();
                 let validity = gather_validity(&col.validity, runs, total)?;
                 Column {
                     data_type: DataType::Utf8,
-                    values: Buffer::from_vec(
-                        new_keys.iter().flat_map(|k| k.to_le_bytes()).collect::<Vec<u8>>(),
-                    ),
+                    values: Buffer::from_vec(new_keys_raw),
                     validity,
                     dict: Some(DictBuffers {
-                        offsets: Buffer::from_vec(
-                            new_offsets.iter().flat_map(|o| o.to_le_bytes()).collect::<Vec<u8>>(),
-                        ),
+                        offsets: Buffer::from_vec(new_offs_raw),
                         strings: Buffer::from_vec(new_strings),
                     }),
                 }

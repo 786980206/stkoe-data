@@ -739,10 +739,10 @@ fn utf8_dict_to_column(
             .map(|k| k.unwrap_or(0) as u32)
             .collect();
         return Ok((
-            Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
+            Buffer::from_vec(bytemuck::cast_slice::<u32, u8>(&keys).to_vec()),
             validity,
             Some(DictBuffers {
-                offsets: Buffer::from_vec(offsets.iter().flat_map(|o| o.to_le_bytes()).collect()),
+                offsets: Buffer::from_vec(bytemuck::cast_slice::<u64, u8>(&offsets).to_vec()),
                 strings: Buffer::from_vec(strings),
             }),
         ));
@@ -750,27 +750,69 @@ fn utf8_dict_to_column(
 
     // 处理普通的 StringArray / LargeStringArray：现场构建字典
     let rows = array.len();
-    let mut unique_map: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
-    let mut str_vals: Vec<Option<&str>> = Vec::with_capacity(rows);
+    let mut map: ahash::AHashMap<String, u32> = ahash::AHashMap::new();
+    let mut offsets: Vec<u64> = vec![0u64];
+    let mut strings: Vec<u8> = Vec::new();
+    let mut keys: Vec<u32> = Vec::with_capacity(rows);
+
+    let mut last_str = String::new();
+    let mut has_last = false;
+    let mut last_id: u32 = 0;
 
     if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
         for i in 0..rows {
             if arr.is_null(i) {
-                str_vals.push(None);
+                keys.push(0);
+                has_last = false;
             } else {
                 let s = arr.value(i);
-                str_vals.push(Some(s));
-                unique_map.entry(s).or_insert(0);
+                if has_last && last_str == s {
+                    keys.push(last_id);
+                    continue;
+                }
+                let id = match map.get(s) {
+                    Some(&id) => id,
+                    None => {
+                        let id = map.len() as u32;
+                        strings.extend_from_slice(s.as_bytes());
+                        offsets.push(strings.len() as u64);
+                        map.insert(s.to_string(), id);
+                        id
+                    }
+                };
+                last_str.clear();
+                last_str.push_str(s);
+                has_last = true;
+                last_id = id;
+                keys.push(id);
             }
         }
     } else if let Some(arr) = array.as_any().downcast_ref::<arrow_array::LargeStringArray>() {
         for i in 0..rows {
             if arr.is_null(i) {
-                str_vals.push(None);
+                keys.push(0);
+                has_last = false;
             } else {
                 let s = arr.value(i);
-                str_vals.push(Some(s));
-                unique_map.entry(s).or_insert(0);
+                if has_last && last_str == s {
+                    keys.push(last_id);
+                    continue;
+                }
+                let id = match map.get(s) {
+                    Some(&id) => id,
+                    None => {
+                        let id = map.len() as u32;
+                        strings.extend_from_slice(s.as_bytes());
+                        offsets.push(strings.len() as u64);
+                        map.insert(s.to_string(), id);
+                        id
+                    }
+                };
+                last_str.clear();
+                last_str.push_str(s);
+                has_last = true;
+                last_id = id;
+                keys.push(id);
             }
         }
     } else {
@@ -780,27 +822,11 @@ fn utf8_dict_to_column(
         )));
     }
 
-    let mut offsets: Vec<u64> = vec![0u64];
-    let mut strings: Vec<u8> = Vec::new();
-    for (id, (s, entry)) in unique_map.iter_mut().enumerate() {
-        *entry = id as u32;
-        strings.extend_from_slice(s.as_bytes());
-        offsets.push(strings.len() as u64);
-    }
-
-    let mut keys = Vec::with_capacity(rows);
-    for opt in str_vals {
-        match opt {
-            Some(s) => keys.push(*unique_map.get(s).unwrap()),
-            None => keys.push(0),
-        }
-    }
-
     Ok((
-        Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
+        Buffer::from_vec(bytemuck::cast_slice::<u32, u8>(&keys).to_vec()),
         validity,
         Some(DictBuffers {
-            offsets: Buffer::from_vec(offsets.iter().flat_map(|o| o.to_le_bytes()).collect()),
+            offsets: Buffer::from_vec(bytemuck::cast_slice::<u64, u8>(&offsets).to_vec()),
             strings: Buffer::from_vec(strings),
         }),
     ))
@@ -812,12 +838,7 @@ fn array_to_column(
 ) -> Result<(Buffer, Option<Bitmap>, Option<DictBuffers>)> {
     let validity = array.nulls().map(null_buffer_to_bitmap);
     let rows = array.len();
-    macro_rules! bytes_of {
-        ($arr:expr) => {{
-            let slice = $arr.values();
-            bytemuck::cast_slice::<_, u8>(slice).to_vec()
-        }};
-    }
+
     if dt == DataType::Bool {
         let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
         let mut bytes = vec![0u8; rows];
@@ -829,32 +850,83 @@ fn array_to_column(
     if dt == DataType::Utf8 {
         return utf8_dict_to_column(array, validity);
     }
-    let fixed = move |bytes: Vec<u8>| -> (Buffer, Option<Bitmap>, Option<DictBuffers>) {
-        (Buffer::zeroed_aligned_bytes(bytes, 8), validity, None)
-    };
+
     Ok(match dt {
         DataType::Bool | DataType::Utf8 => unreachable!("handled above"),
-        DataType::Int8 => fixed(bytes_of!(array.as_any().downcast_ref::<Int8Array>().unwrap())),
-        DataType::Int16 => fixed(bytes_of!(array.as_any().downcast_ref::<Int16Array>().unwrap())),
-        DataType::Int32 => fixed(bytes_of!(array.as_any().downcast_ref::<Int32Array>().unwrap())),
-        DataType::Date32 => fixed(bytes_of!(array.as_any().downcast_ref::<Date32Array>().unwrap())),
-        DataType::Int64 => fixed(bytes_of!(array.as_any().downcast_ref::<Int64Array>().unwrap())),
-        DataType::TimestampUs => {
-            fixed(bytes_of!(array
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap()))
-        }
-        DataType::Date64 => fixed(bytes_of!(array.as_any().downcast_ref::<Date64Array>().unwrap())),
-        DataType::UInt8 => fixed(bytes_of!(array.as_any().downcast_ref::<UInt8Array>().unwrap())),
-        DataType::UInt16 => fixed(bytes_of!(array.as_any().downcast_ref::<UInt16Array>().unwrap())),
-        DataType::UInt32 => fixed(bytes_of!(array.as_any().downcast_ref::<UInt32Array>().unwrap())),
-        DataType::UInt64 => fixed(bytes_of!(array.as_any().downcast_ref::<UInt64Array>().unwrap())),
-        DataType::Float32 => {
-            fixed(bytes_of!(array.as_any().downcast_ref::<Float32Array>().unwrap()))
-        }
-        DataType::Float64 => {
-            fixed(bytes_of!(array.as_any().downcast_ref::<Float64Array>().unwrap()))
-        }
+        DataType::Int8 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Int8Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::Int16 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Int16Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::Int32 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Int32Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::Date32 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Date32Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::Int64 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Int64Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::TimestampUs => (
+            Buffer::from_slice_copy(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .values(),
+            ),
+            validity,
+            None,
+        ),
+        DataType::Date64 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<Date64Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::UInt8 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<UInt8Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::UInt16 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<UInt16Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::UInt32 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<UInt32Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::UInt64 => (
+            Buffer::from_slice_copy(array.as_any().downcast_ref::<UInt64Array>().unwrap().values()),
+            validity,
+            None,
+        ),
+        DataType::Float32 => (
+            Buffer::from_slice_copy(
+                array.as_any().downcast_ref::<Float32Array>().unwrap().values(),
+            ),
+            validity,
+            None,
+        ),
+        DataType::Float64 => (
+            Buffer::from_slice_copy(
+                array.as_any().downcast_ref::<Float64Array>().unwrap().values(),
+            ),
+            validity,
+            None,
+        ),
     })
 }

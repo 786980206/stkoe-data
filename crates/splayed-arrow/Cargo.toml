@@ -16,6 +16,7 @@ arrow-buffer = "56"
 arrow-schema = "56"
 arrow-select = "56"
 bytemuck = "1"
+ahash = "0.8"
 
 [dev-dependencies]
 parquet = { version = "56", default-features = false, features = ["arrow"] }

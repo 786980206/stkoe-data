@@ -440,90 +440,131 @@ fn series_to_column(
         }
         PolarsDt::Int8 => {
             let ca = s.i8().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<i8> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::Int8, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Int8, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::Int16 => {
             let ca = s.i16().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<i16> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::Int16, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 2);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Int16, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::Int32 => {
             let ca = s.i32().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<i32> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::Int32, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 4);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Int32, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::Int64 => {
             let ca = s.i64().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<i64> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::Int64, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 8);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Int64, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::UInt8 => {
             let ca = s.u8().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<u8> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::UInt8, Buffer::from_vec(slice), validity, None))
+            let mut bytes = Vec::with_capacity(rows);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(slice.values().as_slice());
+            }
+            Ok((DataType::UInt8, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::UInt16 => {
             let ca = s.u16().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<u16> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::UInt16, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 2);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::UInt16, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::UInt32 => {
             let ca = s.u32().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<u32> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::UInt32, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 4);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::UInt32, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::UInt64 => {
             let ca = s.u64().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<u64> = (0..rows).map(|i| ca.get(i).unwrap_or(0)).collect();
-            Ok((DataType::UInt64, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 8);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::UInt64, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::Float32 => {
             let ca = s.f32().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<f32> = (0..rows).map(|i| ca.get(i).unwrap_or(0.0)).collect();
-            Ok((DataType::Float32, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 4);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Float32, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::Float64 => {
             let ca = s.f64().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let slice: Vec<f64> = (0..rows).map(|i| ca.get(i).unwrap_or(0.0)).collect();
-            Ok((DataType::Float64, Buffer::from_vec(bytemuck::cast_slice(&slice).to_vec()), validity, None))
+            let mut bytes = Vec::with_capacity(rows * 8);
+            for slice in ca.downcast_iter() {
+                bytes.extend_from_slice(bytemuck::cast_slice(slice.values().as_slice()));
+            }
+            Ok((DataType::Float64, Buffer::from_vec(bytes), validity, None))
         }
         PolarsDt::String => {
             let ca = s.str().map_err(|e| CoreError::Invalid(format!("{e}")))?;
-            let mut unique_map: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
-            let mut str_vals: Vec<Option<&str>> = Vec::with_capacity(rows);
-
-            for i in 0..rows {
-                if let Some(val) = ca.get(i) {
-                    str_vals.push(Some(val));
-                    unique_map.entry(val).or_insert(0);
-                } else {
-                    str_vals.push(None);
-                }
-            }
-
+            let mut map: ahash::AHashMap<String, u32> = ahash::AHashMap::new();
             let mut offsets: Vec<u64> = vec![0u64];
             let mut strings: Vec<u8> = Vec::new();
-            for (id, (text, entry)) in unique_map.iter_mut().enumerate() {
-                *entry = id as u32;
-                strings.extend_from_slice(text.as_bytes());
-                offsets.push(strings.len() as u64);
-            }
-
             let mut keys = Vec::with_capacity(rows);
-            for opt in str_vals {
-                match opt {
-                    Some(val) => keys.push(*unique_map.get(val).unwrap()),
-                    None => keys.push(0),
+
+            let mut last_str = String::new();
+            let mut has_last = false;
+            let mut last_id: u32 = 0;
+
+            for val_opt in ca.into_iter() {
+                match val_opt {
+                    Some(val) => {
+                        if has_last && last_str == val {
+                            keys.push(last_id);
+                            continue;
+                        }
+                        let id = match map.get(val) {
+                            Some(&id) => id,
+                            None => {
+                                let id = map.len() as u32;
+                                strings.extend_from_slice(val.as_bytes());
+                                offsets.push(strings.len() as u64);
+                                map.insert(val.to_string(), id);
+                                id
+                            }
+                        };
+                        last_str.clear();
+                        last_str.push_str(val);
+                        has_last = true;
+                        last_id = id;
+                        keys.push(id);
+                    }
+                    None => {
+                        keys.push(0);
+                        has_last = false;
+                    }
                 }
             }
 
             Ok((
                 DataType::Utf8,
-                Buffer::from_vec(keys.iter().flat_map(|k| k.to_le_bytes()).collect()),
+                Buffer::from_vec(bytemuck::cast_slice::<u32, u8>(&keys).to_vec()),
                 validity,
                 Some(DictBuffers {
-                    offsets: Buffer::from_vec(offsets.iter().flat_map(|o| o.to_le_bytes()).collect()),
+                    offsets: Buffer::from_vec(bytemuck::cast_slice::<u64, u8>(&offsets).to_vec()),
                     strings: Buffer::from_vec(strings),
                 }),
             ))
