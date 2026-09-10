@@ -2292,6 +2292,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "bytemuck",
+ "memmap2",
  "parquet",
  "splayed-arrow",
  "splayed-core",

@@ -149,8 +149,7 @@ def sink_splayed(
         raise TypeError(f"sink_splayed 需要 polars DataFrame 或 LazyFrame，实际收到: {type(data)}")
 
     arrow_table = df.to_arrow()
-    batches = arrow_table.to_batches()
-    if not batches:
+    if arrow_table.num_rows == 0:
         return
 
     path_str = str(path)
@@ -167,22 +166,19 @@ def sink_splayed(
                 break
 
     if not has_meta:
-        # 首次初始化建表并写入首个批次
+        # 首次初始化建表并写入完整数据
         writer = TableWriter.init(
             path_str,
-            batches[0],
+            arrow_table,
             scheme=scheme,
             compression=compression,
             max_parallelism=max_parallelism,
         )
-        for b in batches[1:]:
-            writer.write(b)
         writer.close()
     else:
         # 已存在表：打开并全量替换更新数据
         writer = TableWriter.open(path_str, max_parallelism=max_parallelism)
-        for b in batches:
-            writer.update(b)
+        writer.update(arrow_table)
         writer.close()
 
 
