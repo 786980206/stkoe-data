@@ -1175,7 +1175,11 @@ impl FieldHandle {
     }
 
     fn write_into_mmap(&mut self, offset: usize, data: &ColumnView) -> Result<(), CoreError> {
-        let width = self.data_type().size_of();
+        let width = if self.data_type() == DataType::Utf8 {
+            4
+        } else {
+            self.data_type().size_of()
+        };
         let has_validity = self.header.has_validity();
         if !has_validity {
             // 先校验后写入：无 validity 区的字段不接受含 NULL 的段
@@ -1239,7 +1243,11 @@ impl FieldHandle {
             self.working.as_mut().unwrap().validity =
                 Some(Bitmap::ones(self.header.row_count as usize));
         }
-        let width = self.data_type().size_of();
+        let width = if self.data_type() == DataType::Utf8 {
+            4
+        } else {
+            self.data_type().size_of()
+        };
         let work = self.working.as_mut().expect("compressed open materializes working");
         let mut null_delta: i64 = 0;
         let mut row = offset;
