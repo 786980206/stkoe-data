@@ -11,7 +11,7 @@ use splayed_format::{
 
 use crate::error::{map_io_path, CoreError, Mode};
 use crate::field_file::{
-    close_field_handle, create_field_file, delete_field_file, open_field_file, rename_field_file,
+    close_field_handle, create_field_file, delete_field_file, open_field_file,
     cast_field_file, compress_field_file, decompress_field_file, FieldChunkReader, FieldHandle,
     FieldInit, StreamValues,
 };
@@ -613,7 +613,25 @@ impl DatasetHandle {
             return Err(CoreError::AlreadyExists(self.field_path(new_name)));
         }
         self.fields.borrow_mut().remove(name);
-        rename_field_file(&self.field_path(name), new_name)?;
+        let old_path = self.field_path(name);
+        let new_path = self.field_path(new_name);
+        if let Some(p) = new_path.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        fs::rename(&old_path, &new_path).map_err(|e| map_io_path(&new_path, e))?;
+        // 清理因嵌套字段重命名后原路径可能遗留的空父目录
+        let mut cur = old_path.parent().map(|p| p.to_path_buf());
+        while let Some(parent) = cur {
+            if parent == self.root {
+                break;
+            }
+            if fs::read_dir(&parent).map(|mut it| it.next().is_none()).unwrap_or(false) {
+                let _ = fs::remove_dir(&parent);
+                cur = parent.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
         self.reload_schema();
         Ok(())
     }
@@ -1245,7 +1263,11 @@ pub fn create_dataset_from_view(
                 } else {
                     field_options.clone()
                 };
-                crate::field_file::create_field_file_from_view(&path.join(col_name), col_view, &fo)?;
+                let fp = path.join(col_name.replace('.', "/"));
+                if let Some(p) = fp.parent() {
+                    let _ = fs::create_dir_all(p);
+                }
+                crate::field_file::create_field_file_from_view(&fp, col_view, &fo)?;
             }
         } else {
             let mut buckets: Vec<Vec<(&str, DataType, &ColumnView<'_>)>> = vec![Vec::new(); p];
@@ -1264,7 +1286,11 @@ pub fn create_dataset_from_view(
                             } else {
                                 fo.clone()
                             };
-                            crate::field_file::create_field_file_from_view(&path.join(col_name), col_view, &fo)?;
+                            let fp = path.join(col_name.replace('.', "/"));
+                            if let Some(p) = fp.parent() {
+                                let _ = fs::create_dir_all(p);
+                            }
+                            crate::field_file::create_field_file_from_view(&fp, col_view, &fo)?;
                         }
                         Ok(())
                     }));

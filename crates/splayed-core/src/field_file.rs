@@ -356,6 +356,9 @@ pub fn create_field_file_from_view(
     if path.exists() {
         return Err(CoreError::AlreadyExists(path.to_path_buf()));
     }
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
+    }
     let data_type = column.data_type();
     let rows = column.length();
     let null_count = column.null_count();
@@ -760,6 +763,9 @@ pub fn create_field_file(
 ) -> Result<(), CoreError> {
     if path.exists() {
         return Err(CoreError::AlreadyExists(path.to_path_buf()));
+    }
+    if let Some(p) = path.parent() {
+        let _ = fs::create_dir_all(p);
     }
     if matches!(options.compression, Compression::None) {
         return create_field_file_plain(path, data_type, init);

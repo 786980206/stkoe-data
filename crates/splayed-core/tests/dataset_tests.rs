@@ -915,3 +915,77 @@ fn dataset_reader_writer_oop_lifecycle() {
 
     cleanup(&dir);
 }
+
+#[test]
+fn dataset_nested_dotted_fields_lifecycle() {
+    let dir = temp_dir("ds_nested_dots");
+    let root = dir.join("ds");
+
+    // 1. 构建包含多级嵌套 '.' 字段的数据
+    let base = make_data(&["AAPL", "GOOG"], &[1000, 2000], &[10.0, 20.0]);
+    let sym_col = base.column("sym").unwrap().clone();
+    let time_col = base.column("time").unwrap().clone();
+    let alpha_col = Column {
+        data_type: DataType::Float64,
+        values: Buffer::from_slice_copy(&[1.5f64, 2.5f64]),
+        validity: None,
+        dict: None,
+    };
+    let deep_col = Column {
+        data_type: DataType::Int32,
+        values: Buffer::from_slice_copy(&[42i32, 84i32]),
+        validity: None,
+        dict: None,
+    };
+    let data = Data::new(
+        Schema::new(vec![
+            FieldSchema::new("sym", DataType::Utf8),
+            FieldSchema::new("time", DataType::TimestampUs),
+            FieldSchema::new("factor.alpha", DataType::Float64),
+            FieldSchema::new("level1.level2.deep_val", DataType::Int32),
+        ]),
+        vec![sym_col, time_col, alpha_col, deep_col],
+    ).unwrap();
+
+    // 2. 初始化创建数据集：验证各级目录嵌套创建
+    splayed_core::init_dataset(&root, &data.as_view(), None).unwrap();
+
+    assert!(root.join("factor").is_dir(), "factor 必须是多级嵌套子目录");
+    assert!(root.join("factor").join("alpha").is_file(), "factor/alpha 必须存在且为文件");
+    assert!(root.join("level1").join("level2").is_dir(), "level1/level2 必须是多级嵌套子目录");
+    assert!(root.join("level1").join("level2").join("deep_val").is_file(), "level1/level2/deep_val 必须存在且为文件");
+
+    // 3. 打开并验证递归 Schema 构建与投影读取
+    let mut ds = splayed_core::open_dataset(&root, Mode::Write).unwrap();
+    let sch = ds.schema();
+    assert_eq!(sch.len(), 4);
+    assert!(sch.position("factor.alpha").is_some());
+    assert!(sch.position("level1.level2.deep_val").is_some());
+
+    let view = ds.read(0, 2, Some(&["factor.alpha"])).unwrap();
+    assert_eq!(view.columns.len(), 3); // sym, time + projected factor.alpha
+    let vals: &[f64] = bytemuck::cast_slice(view.column("factor.alpha").unwrap().segments()[0].fixed_bytes().unwrap());
+    assert_eq!(vals, &[1.5, 2.5]);
+
+    // 4. 重命名嵌套字段：factor.alpha -> factor.alpha_v2
+    ds.rename_dataset_field("factor.alpha", "factor.alpha_v2").unwrap();
+    assert!(!root.join("factor").join("alpha").exists());
+    assert!(root.join("factor").join("alpha_v2").is_file());
+    assert!(ds.schema().position("factor.alpha_v2").is_some());
+
+    // 5. 跨目录重命名：level1.level2.deep_val -> root_val
+    // 应该将文件移至根目录，并自动清理空的 level2 和 level1 子目录！
+    ds.rename_dataset_field("level1.level2.deep_val", "root_val").unwrap();
+    assert!(root.join("root_val").is_file());
+    assert!(!root.join("level1").join("level2").exists());
+    assert!(!root.join("level1").exists());
+    assert!(ds.schema().position("root_val").is_some());
+
+    // 6. 删除嵌套字段：清理 factor/alpha_v2，且清空后自动移除 factor 目录
+    ds.delete_dataset_field("factor.alpha_v2").unwrap();
+    assert!(!root.join("factor").exists());
+    assert!(ds.schema().position("factor.alpha_v2").is_none());
+
+    ds.close_dataset().unwrap();
+    cleanup(&dir);
+}
