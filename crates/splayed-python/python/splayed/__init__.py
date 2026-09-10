@@ -120,13 +120,18 @@ def sink_splayed(
     scheme: str = "none",
     compression: str = "zstd",
     max_parallelism: int | None = None,
+    mode: str = "auto",
 ) -> None:
     """
     将 Polars DataFrame 或 LazyFrame 导出写入 Splayed 存储。
 
     自动判定表物理存储状态：
-    - 若目标表不存在：自动调用 `TableWriter.init` 执行建表并写入首批数据；
-    - 若目标表已存在：自动调用 `TableWriter.open` 并通过 `.write()` 执行覆盖写入。
+    - 若目标表不存在：自动调用 `TableWriter.init` 执行建表并写入数据；
+    - 若目标表已存在：根据 `mode` 执行写入策略：
+        - 'auto': 优先尝试 `TableWriter.write`（享用 Mmap 极速原位覆盖与新特征列自愈）；
+                  若数据包含新标的或新时间跨度导致无法原位覆盖，自动回退到 `TableWriter.update`；
+        - 'write': 严格使用原位覆盖写（write），支持特征工程自动新增列与就地覆写，性能最高；
+        - 'update': 严格使用分区级全量替换/追加新分区（update）。
 
     参数:
         data: polars.DataFrame 或 polars.LazyFrame 对象。
@@ -134,6 +139,7 @@ def sink_splayed(
         scheme: 分区策略，可选 'none' | 'day' | 'month' | 'year'（仅建表时生效，默认 'none'）。
         compression: 压缩算法，可选 'zstd' | 'lz4' | 'none'（默认 'zstd'，对标 Parquet 压缩存储）。
         max_parallelism: 并发执行度。
+        mode: 写入模式，可选 'auto' | 'write' | 'update'（默认 'auto'）。
     """
     try:
         import polars as pl
@@ -176,9 +182,23 @@ def sink_splayed(
         )
         writer.close()
     else:
-        # 已存在表：打开并全量替换更新数据
+        # 已存在表：根据 mode 选择写入策略
         writer = TableWriter.open(path_str, max_parallelism=max_parallelism)
-        writer.update(arrow_table)
+        if mode == "write":
+            writer.write(arrow_table)
+        elif mode == "update":
+            writer.update(arrow_table)
+        elif mode == "auto":
+            try:
+                writer.write(arrow_table)
+            except ValueError as e:
+                err_msg = str(e)
+                if "locate" in err_msg or "does not exist" in err_msg or "NotFound" in err_msg:
+                    writer.update(arrow_table)
+                else:
+                    raise
+        else:
+            raise ValueError(f"未知的 mode: {mode}，支持 'auto' | 'write' | 'update'")
         writer.close()
 
 
@@ -199,6 +219,7 @@ def _register_polars_extensions():
                 scheme: str = "none",
                 compression: str = "zstd",
                 max_parallelism: int | None = None,
+                mode: str = "auto",
             ) -> None:
                 sink_splayed(
                     self._ldf,
@@ -206,6 +227,7 @@ def _register_polars_extensions():
                     scheme=scheme,
                     compression=compression,
                     max_parallelism=max_parallelism,
+                    mode=mode,
                 )
 
         @pl.api.register_dataframe_namespace("splayed")
@@ -219,6 +241,7 @@ def _register_polars_extensions():
                 scheme: str = "none",
                 compression: str = "zstd",
                 max_parallelism: int | None = None,
+                mode: str = "auto",
             ) -> None:
                 sink_splayed(
                     self._df,
@@ -226,24 +249,27 @@ def _register_polars_extensions():
                     scheme=scheme,
                     compression=compression,
                     max_parallelism=max_parallelism,
+                    mode=mode,
                 )
 
         # 2. 直接为 LazyFrame 和 DataFrame 打上原生链式方法 .sink_splayed(...)
         if not hasattr(pl.LazyFrame, "sink_splayed"):
-            pl.LazyFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None: sink_splayed(
+            pl.LazyFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None, mode="auto": sink_splayed(
                 self,
                 path,
                 scheme=scheme,
                 compression=compression,
                 max_parallelism=max_parallelism,
+                mode=mode,
             )
         if not hasattr(pl.DataFrame, "sink_splayed"):
-            pl.DataFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None: sink_splayed(
+            pl.DataFrame.sink_splayed = lambda self, path, scheme="none", compression="zstd", max_parallelism=None, mode="auto": sink_splayed(
                 self,
                 path,
                 scheme=scheme,
                 compression=compression,
                 max_parallelism=max_parallelism,
+                mode=mode,
             )
         if not hasattr(pl, "scan_splayed"):
             pl.scan_splayed = scan_splayed

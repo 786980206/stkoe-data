@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "splayed"
-version = "0.2.1"
+version = "0.2.2"
 description = "Fast columnar storage engine for financial time series via PyArrow"
 authors = [{ name = "windsing" }]
 license = { text = "MIT OR Apache-2.0" }

@@ -93,5 +93,38 @@ class TestSplayedPolars(unittest.TestCase):
         self.assertEqual(len(read_back), 2)
         self.assertEqual(list(read_back["sym"]), ["B", "C"])
 
+    def test_sink_mode_write_and_auto_healing(self):
+        tbl_path = os.path.join(self.temp_dir, "tbl_mode_write")
+        df1 = pl.DataFrame({
+            "sym": ["AAPL", "MSFT"],
+            "time": [100, 100],
+            "price": [10.0, 20.0],
+        })
+        df1.sink_splayed(tbl_path)
+
+        # 1. 用 mode="write" 增加新特征列 (缺列自愈)
+        df_new_col = pl.DataFrame({
+            "sym": ["AAPL", "MSFT"],
+            "time": [100, 100],
+            "factor_alpha": [0.5, 0.8],
+        })
+        df_new_col.sink_splayed(tbl_path, mode="write")
+        r1 = pl.scan_splayed(tbl_path).collect()
+        self.assertEqual(set(r1.columns), {"sym", "time", "price", "factor_alpha"})
+        self.assertEqual(list(r1["factor_alpha"]), [0.5, 0.8])
+        self.assertEqual(list(r1["price"]), [10.0, 20.0])
+
+        # 2. 用 mode="auto" 自动升级处理新增标的
+        df_new_sym = pl.DataFrame({
+            "sym": ["AAPL", "MSFT", "NVDA"],
+            "time": [100, 100, 100],
+            "price": [11.0, 21.0, 31.0],
+            "factor_alpha": [0.6, 0.9, 1.2],
+        })
+        df_new_sym.sink_splayed(tbl_path, mode="auto")
+        r2 = pl.scan_splayed(tbl_path).collect()
+        self.assertEqual(len(r2), 3)
+        self.assertEqual(set(r2["sym"]), {"AAPL", "MSFT", "NVDA"})
+
 if __name__ == "__main__":
     unittest.main()
