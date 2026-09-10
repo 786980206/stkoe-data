@@ -829,12 +829,7 @@ impl TableArrowReader {
 
         if partitions.len() == 1 {
             let part_name = &partitions[0];
-            let part_path = if scheme == splayed_table::PartitionScheme::None {
-                root.to_path_buf()
-            } else {
-                root.join(part_name)
-            };
-            let ds = splayed_core::open_dataset_with_schema(&part_path, splayed_core::Mode::Read, splayed_schema.clone())?;
+            let ds = self.inner.dataset_for(part_name)?;
             if predicate.is_none() {
                 let len = ds.logical_length();
                 if len > 0 {
@@ -857,6 +852,7 @@ impl TableArrowReader {
                 }
                 return Ok(results);
             }
+            return Ok(Vec::new());
         }
 
         // 多线程并发分区分文件读取（LPT 动态原子工作窃取，保持有序）

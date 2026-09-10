@@ -419,6 +419,10 @@ impl TableReader {
         ds.read(range.row_range.offset, range.row_range.length, projection)
     }
 
+    pub fn dataset_for(&self, partition: &str) -> Result<&splayed_core::dataset::DatasetHandle, splayed_core::CoreError> {
+        self.inner.dataset_for(partition)
+    }
+
     pub fn schema(&self) -> Result<splayed_format::Schema, splayed_core::CoreError> {
         self.inner.schema()
     }

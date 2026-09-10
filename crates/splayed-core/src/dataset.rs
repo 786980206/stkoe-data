@@ -245,7 +245,37 @@ impl DatasetHandle {
                 }
             }
         }
-        for name in &requested {
+        let missing: Vec<String> = {
+            let borrow = self.fields.borrow();
+            requested
+                .iter()
+                .filter(|name| !borrow.contains_key(name.as_str()))
+                .cloned()
+                .collect()
+        };
+        if missing.len() > 1 {
+            let root = &self.root;
+            let mode = self.mode;
+            let opened: Result<Vec<(String, Box<FieldHandle>)>, CoreError> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(missing.len());
+                for name in &missing {
+                    handles.push(s.spawn(move || {
+                        let path = root.join(name.replace('.', "/"));
+                        let handle = Box::new(crate::field_file::open_field_file(&path, mode)?);
+                        Ok::<_, CoreError>((name.clone(), handle))
+                    }));
+                }
+                let mut res = Vec::with_capacity(handles.len());
+                for h in handles {
+                    res.push(h.join().unwrap()?);
+                }
+                Ok(res)
+            });
+            let mut borrow = self.fields.borrow_mut();
+            for (name, handle) in opened? {
+                borrow.insert(name, handle);
+            }
+        } else if let Some(name) = missing.first() {
             DatasetHandle::ensure_field(&self.fields, &self.root, self.mode, name)?;
         }
         // ② META 零拷贝：sym RepeatDict 段（零物化）+ time 轴切片
